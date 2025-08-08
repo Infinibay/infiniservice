@@ -28,8 +28,30 @@ dirs = "5.0"
 # Configuration
 config = "0.14"
 
+# System monitoring and information
+sysinfo = "0.36"
+
+# Network monitoring and connections
+netstat2 = "0.11"
+
+# File system monitoring and notifications
+notify = "8.0"
+
+# File timestamp operations
+filetime = "0.2"
+
+# Image processing (for icon extraction)
+image = "0.25"
+
 [target.'cfg(windows)'.dependencies]
-# Windows-specific dependencies can be added here when needed
+# Windows API bindings for icon extraction and system operations
+winapi = { version = "0.3", features = [
+    "winuser", "shellapi", "commdlg", "processthreadsapi",
+    "psapi", "winnt", "handleapi", "fileapi", "errhandlingapi"
+] }
+
+# Windows service management
+windows-service = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 # Unix/Linux-specific dependencies can be added here when needed
