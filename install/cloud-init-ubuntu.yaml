@@ -1,0 +1,141 @@
+#cloud-config
+# Ubuntu Cloud-Init configuration for Infiniservice auto-installation
+
+# This configuration automatically installs and configures Infiniservice
+# during Ubuntu VM provisioning
+
+# Update package database
+package_update: true
+package_upgrade: false
+
+# Install required packages
+packages:
+  - curl
+  - wget
+  - systemd
+
+# Create infiniservice user
+users:
+  - name: infiniservice
+    system: true
+    shell: /bin/false
+    home: /opt/infiniservice
+    create_home: false
+
+# Write files
+write_files:
+  # Infiniservice installation script
+  - path: /tmp/install-infiniservice.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      
+      echo "🚀 Starting Infiniservice auto-installation via cloud-init..."
+      
+      # Wait for CD-ROM to be available
+      for i in {1..30}; do
+        if [ -d "/media/cdrom" ] || [ -d "/mnt/cdrom" ] || [ -e "/dev/sr1" ]; then
+          echo "✅ CD-ROM device found"
+          break
+        fi
+        echo "⏳ Waiting for CD-ROM device... ($i/30)"
+        sleep 2
+      done
+      
+      # Try to mount the installer CD-ROM
+      MOUNT_POINT="/mnt/infiniservice-installer"
+      mkdir -p "$MOUNT_POINT"
+      
+      # Try different CD-ROM devices
+      for device in /dev/sr1 /dev/sr2 /dev/cdrom1; do
+        if [ -e "$device" ]; then
+          echo "🔍 Trying to mount $device..."
+          if mount "$device" "$MOUNT_POINT" 2>/dev/null; then
+            echo "✅ Mounted installer from $device"
+            break
+          fi
+        fi
+      done
+      
+      # Check if installer is mounted
+      if [ -f "$MOUNT_POINT/infiniservice-linux/install-linux.sh" ]; then
+        echo "📦 Found Infiniservice installer"
+        
+        # Determine installation mode
+        MODE="normal"
+        if [ "$INFINISERVICE_MODE" = "ping-pong" ]; then
+          MODE="ping-pong"
+          echo "🏓 Installing in ping-pong test mode"
+        fi
+        
+        # Run installation
+        cd "$MOUNT_POINT"
+        ./autorun-linux.sh "$MODE"
+        
+        # Unmount installer
+        cd /
+        umount "$MOUNT_POINT" 2>/dev/null || true
+        rmdir "$MOUNT_POINT" 2>/dev/null || true
+        
+        echo "✅ Infiniservice installation completed"
+      else
+        echo "⚠️ Infiniservice installer not found on CD-ROM"
+        echo "   Manual installation required after VM setup"
+      fi
+      
+      # Clean up
+      rm -f /tmp/install-infiniservice.sh
+
+  # Environment configuration
+  - path: /etc/environment.d/infiniservice.conf
+    permissions: '0644'
+    content: |
+      # Infiniservice environment configuration
+      RUST_LOG=info
+      # INFINISERVICE_MODE=ping-pong  # Uncomment for ping-pong test mode
+
+# Run commands during first boot
+runcmd:
+  # Set up virtio-serial device permissions
+  - |
+    if [ -d "/dev/virtio-ports" ]; then
+      echo "✅ Virtio-serial devices found"
+      chmod 666 /dev/virtio-ports/* 2>/dev/null || true
+    else
+      echo "⚠️ No virtio-serial devices found"
+    fi
+  
+  # Install Infiniservice
+  - /tmp/install-infiniservice.sh
+  
+  # Enable and start the service (if installation succeeded)
+  - |
+    if systemctl list-unit-files | grep -q infiniservice; then
+      systemctl enable infiniservice
+      systemctl start infiniservice
+      echo "✅ Infiniservice service started"
+    fi
+
+# Final message
+final_message: |
+  🎉 Ubuntu VM setup completed!
+  
+  Infiniservice status:
+  - Check service: sudo systemctl status infiniservice
+  - View logs: sudo journalctl -u infiniservice -f
+  - Configuration: /opt/infiniservice/config.toml
+  
+  If Infiniservice is not installed, check:
+  - CD-ROM mount: ls /mnt/
+  - Installation logs: /var/log/cloud-init-output.log
+  
+  Manual installation:
+  1. Mount installer CD-ROM
+  2. Run: sudo ./autorun-linux.sh
+
+# Power state - keep running
+power_state:
+  mode: reboot
+  delay: 0
+  condition: false

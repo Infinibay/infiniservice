@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Windows Unattended Installation with Infiniservice Auto-Installation (DEBUG VERSION) -->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+    
+    <!-- Windows PE Phase -->
+    <settings pass="windowsPE">
+        <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <SetupUILanguage>
+                <UILanguage>en-US</UILanguage>
+            </SetupUILanguage>
+            <InputLocale>en-US</InputLocale>
+            <SystemLocale>en-US</SystemLocale>
+            <UILanguage>en-US</UILanguage>
+            <UserLocale>en-US</UserLocale>
+        </component>
+        
+        <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <DiskConfiguration>
+                <Disk wcm:action="add">
+                    <CreatePartitions>
+                        <CreatePartition wcm:action="add">
+                            <Order>1</Order>
+                            <Type>Primary</Type>
+                            <Extend>true</Extend>
+                        </CreatePartition>
+                    </CreatePartitions>
+                    <ModifyPartitions>
+                        <ModifyPartition wcm:action="add">
+                            <Active>true</Active>
+                            <Format>NTFS</Format>
+                            <Label>Windows</Label>
+                            <Order>1</Order>
+                            <PartitionID>1</PartitionID>
+                        </ModifyPartition>
+                    </ModifyPartitions>
+                    <DiskID>0</DiskID>
+                    <WillWipeDisk>true</WillWipeDisk>
+                </Disk>
+            </DiskConfiguration>
+            
+            <ImageInstall>
+                <OSImage>
+                    <InstallTo>
+                        <DiskID>0</DiskID>
+                        <PartitionID>1</PartitionID>
+                    </InstallTo>
+                </OSImage>
+            </ImageInstall>
+            
+            <UserData>
+                <AcceptEula>true</AcceptEula>
+                <FullName>Infinibay User</FullName>
+                <Organization>Infinibay</Organization>
+            </UserData>
+        </component>
+    </settings>
+
+    <!-- Specialize Phase -->
+    <settings pass="specialize">
+        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <InputLocale>en-US</InputLocale>
+            <SystemLocale>en-US</SystemLocale>
+            <UILanguage>en-US</UILanguage>
+            <UserLocale>en-US</UserLocale>
+        </component>
+        
+        <component name="Microsoft-Windows-Security-SPP-UX" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <SkipAutoActivation>true</SkipAutoActivation>
+        </component>
+    </settings>
+
+    <!-- OOBE System Phase -->
+    <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <InputLocale>en-US</InputLocale>
+            <SystemLocale>en-US</SystemLocale>
+            <UILanguage>en-US</UILanguage>
+            <UserLocale>en-US</UserLocale>
+        </component>
+        
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideLocalAccountScreen>true</HideLocalAccountScreen>
+                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <NetworkLocation>Work</NetworkLocation>
+                <ProtectYourPC>1</ProtectYourPC>
+            </OOBE>
+            
+            <UserAccounts>
+                <AdministratorPassword>
+                    <Value>UABhAHMAcwB3AG8AcgBkAEEAZABtAGkAbgBpAHMAdAByAGEAdABvAHIAUABhAHMAcwB3AG8AcgBkAA==</Value>
+                    <PlainText>false</PlainText>
+                </AdministratorPassword>
+                <LocalAccounts>
+                    <LocalAccount wcm:action="add">
+                        <Password>
+                            <Value>UABhAHMAcwB3AG8AcgBkAA==</Value>
+                            <PlainText>false</PlainText>
+                        </Password>
+                        <Group>Administrators</Group>
+                        <DisplayName>Infinibay User</DisplayName>
+                        <Name>infinibay</Name>
+                        <Description>Infinibay VM User</Description>
+                    </LocalAccount>
+                </LocalAccounts>
+            </UserAccounts>
+            
+            <AutoLogon>
+                <Password>
+                    <Value>UABhAHMAcwB3AG8AcgBkAA==</Value>
+                    <PlainText>false</PlainText>
+                </Password>
+                <Enabled>true</Enabled>
+                <LogonCount>1</LogonCount>
+                <Username>infinibay</Username>
+            </AutoLogon>
+            
+            <!-- First Logon Commands - Install Infiniservice with DEBUG VISIBILITY -->
+            <FirstLogonCommands>
+                <!-- IMPORTANT: Open debug console immediately -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /k "echo === INFINISERVICE INSTALLATION STARTING === &amp;&amp; echo. &amp;&amp; echo This window will show installation progress &amp;&amp; echo Press any key to begin... &amp;&amp; pause &amp;&amp; exit"</CommandLine>
+                    <Description>Show debug console</Description>
+                    <Order>1</Order>
+                    <RequiresUserInput>true</RequiresUserInput>
+                </SynchronousCommand>
+                
+                <!-- Create and initialize log -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /c "mkdir C:\Temp 2>nul &amp;&amp; echo [%DATE% %TIME%] === INFINISERVICE INSTALLATION LOG === > C:\Temp\infiniservice_install.log"</CommandLine>
+                    <Description>Initialize logging</Description>
+                    <Order>2</Order>
+                </SynchronousCommand>
+                
+                <!-- Simple test to verify commands are running -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /c "echo [%DATE% %TIME%] Test: Commands are executing >> C:\Temp\infiniservice_install.log &amp;&amp; echo Test successful > C:\Temp\test.txt"</CommandLine>
+                    <Description>Test command execution</Description>
+                    <Order>3</Order>
+                </SynchronousCommand>
+                
+                <!-- Try simple PowerShell command -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>powershell.exe -ExecutionPolicy Bypass -Command "Write-Output 'PowerShell test' | Out-File -FilePath 'C:\Temp\ps_test.txt'"</CommandLine>
+                    <Description>Test PowerShell</Description>
+                    <Order>4</Order>
+                </SynchronousCommand>
+                
+                <!-- List drives with simple command -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /c "wmic logicaldisk get size,freespace,caption >> C:\Temp\infiniservice_install.log"</CommandLine>
+                    <Description>List drives</Description>
+                    <Order>5</Order>
+                </SynchronousCommand>
+                
+                <!-- Try to find CD-ROM drives -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /c "echo [%DATE% %TIME%] Searching for CD-ROM drives... >> C:\Temp\infiniservice_install.log &amp;&amp; wmic cdrom get Drive,Name >> C:\Temp\infiniservice_install.log"</CommandLine>
+                    <Description>Find CD-ROM</Description>
+                    <Order>6</Order>
+                </SynchronousCommand>
+                
+                <!-- Check for installer on D: drive (common CD-ROM letter) -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /c "if exist D:\infiniservice-windows\install-windows.ps1 (echo [%DATE% %TIME%] Found installer on D: >> C:\Temp\infiniservice_install.log) else (echo [%DATE% %TIME%] No installer on D: >> C:\Temp\infiniservice_install.log)"</CommandLine>
+                    <Description>Check D: drive</Description>
+                    <Order>7</Order>
+                </SynchronousCommand>
+                
+                <!-- Check for installer on E: drive -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /c "if exist E:\infiniservice-windows\install-windows.ps1 (echo [%DATE% %TIME%] Found installer on E: >> C:\Temp\infiniservice_install.log) else (echo [%DATE% %TIME%] No installer on E: >> C:\Temp\infiniservice_install.log)"</CommandLine>
+                    <Description>Check E: drive</Description>
+                    <Order>8</Order>
+                </SynchronousCommand>
+                
+                <!-- Try to run the installer if found -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /c "if exist D:\infiniservice-windows\install-windows.ps1 (cd /d D:\infiniservice-windows &amp;&amp; powershell.exe -ExecutionPolicy Bypass -File install-windows.ps1 >> C:\Temp\infiniservice_install.log 2>&amp;1)"</CommandLine>
+                    <Description>Run installer from D:</Description>
+                    <Order>9</Order>
+                </SynchronousCommand>
+                
+                <!-- Open the log file to show results -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>notepad.exe C:\Temp\infiniservice_install.log</CommandLine>
+                    <Description>Show installation log</Description>
+                    <Order>10</Order>
+                </SynchronousCommand>
+                
+                <!-- Final pause to review -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /k "echo. &amp;&amp; echo === INSTALLATION ATTEMPT COMPLETE === &amp;&amp; echo. &amp;&amp; echo Check the Notepad window for details &amp;&amp; echo Press any key to close this window... &amp;&amp; pause &amp;&amp; exit"</CommandLine>
+                    <Description>Final pause</Description>
+                    <Order>11</Order>
+                    <RequiresUserInput>true</RequiresUserInput>
+                </SynchronousCommand>
+            </FirstLogonCommands>
+        </component>
+    </settings>
+</unattend>
