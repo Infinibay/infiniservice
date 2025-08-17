@@ -903,7 +903,7 @@ impl DataCollector {
     }
     
     fn collect_process_metrics(&self, limit: usize) -> Result<Vec<ProcessInfo>> {
-        let mut processes: Vec<ProcessInfo>;
+        let mut processes: Vec<ProcessInfo> = Vec::new();
         
         // Try to collect enhanced process information
         #[cfg(target_os = "linux")]

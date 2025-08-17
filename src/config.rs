@@ -24,7 +24,8 @@ impl Default for Config {
         Self {
             collection_interval: 30,
             virtio_serial_path: if cfg!(windows) {
-                PathBuf::from("\\\\.\\pipe\\virtio-serial")
+                // Empty path triggers auto-detection on Windows
+                PathBuf::new()
             } else {
                 PathBuf::from("/dev/virtio-ports/org.infinibay.0")
             },

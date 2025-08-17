@@ -180,16 +180,16 @@ impl VirtioSerial {
         // IMPORTANTE: Solo intentar paths que realmente podrían existir
         // Intentar diferentes formatos de paths que VirtIO podría usar
         let virtio_paths: Vec<std::path::PathBuf> = vec![
-            // Global objects - try these first as they're most likely configured
-            std::path::PathBuf::from("\\\\.\\Global\\org.infinibay.ping"),  // Primary Infinibay channel
-            std::path::PathBuf::from("\\\\.\\Global\\org.qemu.guest_agent.0"),
-            std::path::PathBuf::from("\\\\.\\Global\\com.redhat.spice.0"),
-            // Canales específicos como pipes
-            std::path::PathBuf::from("\\\\.\\pipe\\org.infinibay.ping"),
-            std::path::PathBuf::from("\\\\.\\pipe\\org.qemu.guest_agent.0"),
             // Dispositivo VirtIO directo (sin namespace)
             std::path::PathBuf::from("\\\\.\\VirtioSerial"),
             std::path::PathBuf::from("\\\\.\\VirtioSerial0"),
+            // Canales específicos como pipes
+            std::path::PathBuf::from("\\\\.\\pipe\\org.infinibay.ping"),
+            std::path::PathBuf::from("\\\\.\\pipe\\org.qemu.guest_agent.0"),
+            // Global objects (aunque el error sugiere que no existen como archivos)
+            std::path::PathBuf::from("\\\\.\\Global\\org.qemu.guest_agent.0"),
+            std::path::PathBuf::from("\\\\.\\Global\\org.infinibay.ping"),
+            std::path::PathBuf::from("\\\\.\\Global\\com.redhat.spice.0"),
         ];
         
         for path in &virtio_paths {
@@ -238,7 +238,7 @@ impl VirtioSerial {
                     if handle != INVALID_HANDLE_VALUE {
                         CloseHandle(handle);
                         info!("✅ Found working VirtIO Global device at: {}", path.display());
-                        return Ok(path.clone());  // Return immediately on success
+                        return Ok(path.clone());
                     } else if debug_mode {
                         use winapi::um::errhandlingapi::GetLastError;
                         let error = GetLastError();
@@ -448,7 +448,7 @@ impl VirtioSerial {
             std::path::PathBuf::from("\\\\.\\Global\\org.infinibay.ping"),
             std::path::PathBuf::from("\\\\.\\Global\\com.redhat.spice.0"),
             std::path::PathBuf::from("\\\\.\\pipe\\org.infinibay.ping"),
-            // Removed \\\\.\\pipe\\virtio-serial as it doesn't exist
+            std::path::PathBuf::from("\\\\.\\pipe\\virtio-serial"),
         ];
         
         for path in &named_pipes {
@@ -768,45 +768,6 @@ impl VirtioSerial {
 
     /// Check if virtio-serial device is available
     pub fn is_available(&self) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            let path_str = self.device_path.to_string_lossy();
-            
-            // Global objects need special handling - they're not files
-            if path_str.contains("Global") {
-                // Try to open it to check availability
-                use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
-                use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE};
-                use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-                use std::os::windows::ffi::OsStrExt;
-                use std::ffi::OsStr;
-                
-                let wide_path: Vec<u16> = OsStr::new(&*path_str)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                
-                unsafe {
-                    let handle = CreateFileW(
-                        wide_path.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
-                        0,
-                        std::ptr::null_mut(),
-                        OPEN_EXISTING,
-                        0,
-                        std::ptr::null_mut(),
-                    );
-                    
-                    if handle != INVALID_HANDLE_VALUE {
-                        CloseHandle(handle);
-                        return true;
-                    }
-                    return false;
-                }
-            }
-        }
-        
-        // For regular files and non-Windows systems
         self.device_path.exists()
     }
 

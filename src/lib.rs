@@ -8,5 +8,8 @@ pub mod collector;
 pub mod communication;
 pub mod service;
 
+#[cfg(target_os = "windows")]
+pub mod windows_com;
+
 pub use config::Config;
 pub use service::InfiniService;

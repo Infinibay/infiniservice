@@ -9,8 +9,9 @@ param(
 
 # Initialize logging
 $LogDir = "C:\Temp"
-$LogFile = Join-Path $LogDir "infiniservice_install.log"
-$ErrorLogFile = Join-Path $LogDir "infiniservice_install_error.log"
+$LogFile = Join-Path $LogDir "infiniservice_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$ErrorLogFile = Join-Path $LogDir "infiniservice_install_error_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$DebugLogFile = Join-Path $LogDir "infiniservice_install_debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
 # Create log directory if it doesn't exist
@@ -25,7 +26,8 @@ function Write-Log {
         [string]$Level = "INFO"
     )
     
-    $LogMessage = "[$Timestamp] [$Level] $Message"
+    $CurrentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    $LogMessage = "[$CurrentTime] [$Level] $Message"
     Add-Content -Path $LogFile -Value $LogMessage
     
     # Also write to console based on level
@@ -37,6 +39,10 @@ function Write-Log {
         "WARNING" { Write-Host $Message -ForegroundColor Yellow }
         "SUCCESS" { Write-Host $Message -ForegroundColor Green }
         "INFO" { Write-Host $Message -ForegroundColor Cyan }
+        "DEBUG" { 
+            Write-Host $Message -ForegroundColor Gray
+            Add-Content -Path $DebugLogFile -Value $LogMessage
+        }
         default { Write-Host $Message }
     }
 }
@@ -86,6 +92,31 @@ $DestExe = Join-Path $InstallPath "infiniservice.exe"
 
 Write-Log "Source executable: $SourceExe" "INFO"
 Write-Log "Destination executable: $DestExe" "INFO"
+
+# Log current directory contents for debugging
+Write-Log "Current directory ($PSScriptRoot) contents:" "DEBUG"
+Get-ChildItem $PSScriptRoot | ForEach-Object { 
+    Write-Log "  - $($_.Name) (Size: $($_.Length) bytes, Type: $($_.Mode))" "DEBUG" 
+}
+
+# Also check parent directory
+$ParentDir = Split-Path $PSScriptRoot -Parent
+Write-Log "Parent directory ($ParentDir) contents:" "DEBUG"
+Get-ChildItem $ParentDir -ErrorAction SilentlyContinue | ForEach-Object { 
+    Write-Log "  - $($_.Name) (Size: $($_.Length) bytes, Type: $($_.Mode))" "DEBUG" 
+}
+
+# Check C:\Temp\InfiniService if different from PSScriptRoot
+if ($PSScriptRoot -ne "C:\Temp\InfiniService") {
+    Write-Log "Checking C:\Temp\InfiniService directory:" "DEBUG"
+    if (Test-Path "C:\Temp\InfiniService") {
+        Get-ChildItem "C:\Temp\InfiniService" | ForEach-Object { 
+            Write-Log "  - $($_.Name) (Size: $($_.Length) bytes)" "DEBUG" 
+        }
+    } else {
+        Write-Log "  Directory C:\Temp\InfiniService does not exist" "DEBUG"
+    }
+}
 
 if (Test-Path $SourceExe) {
     try {
@@ -252,6 +283,26 @@ try {
     if (Test-Path $DestExe) {
         $ExeInfo = Get-Item $DestExe
         Write-Log "Executable exists - Size: $($ExeInfo.Length) bytes, LastWriteTime: $($ExeInfo.LastWriteTime)" "INFO"
+        
+        # Test if executable can run directly (for debugging)
+        Write-Log "Testing executable directly (non-service mode)..." "DEBUG"
+        try {
+            $TestProcess = Start-Process -FilePath $DestExe -ArgumentList "--version" -Wait -PassThru -NoNewWindow -RedirectStandardOutput "C:\Temp\infiniservice_test_output.txt" -RedirectStandardError "C:\Temp\infiniservice_test_error.txt"
+            Write-Log "Test execution exit code: $($TestProcess.ExitCode)" "DEBUG"
+            
+            if (Test-Path "C:\Temp\infiniservice_test_output.txt") {
+                $TestOutput = Get-Content "C:\Temp\infiniservice_test_output.txt"
+                Write-Log "Test output: $TestOutput" "DEBUG"
+            }
+            if (Test-Path "C:\Temp\infiniservice_test_error.txt") {
+                $TestError = Get-Content "C:\Temp\infiniservice_test_error.txt"
+                if ($TestError) {
+                    Write-Log "Test error output: $TestError" "WARNING"
+                }
+            }
+        } catch {
+            Write-Log "Could not test executable directly: $_" "WARNING"
+        }
     }
     
     $StartResult = Start-Service -Name $ServiceName -PassThru -ErrorAction Stop
@@ -384,8 +435,39 @@ Write-Log "=== INSTALLATION SUMMARY ===" "INFO"
 Write-Log "Installation path: $InstallPath" "INFO"
 Write-Log "Configuration file: $ConfigPath" "INFO"
 Write-Log "Uninstall script: $UninstallScript" "INFO"
-Write-Log "Log file: $LogFile" "INFO"
+Write-Log "Main log file: $LogFile" "INFO"
 Write-Log "Error log file: $ErrorLogFile" "INFO"
+Write-Log "Debug log file: $DebugLogFile" "INFO"
+
+# Log system information for debugging
+Write-Log "" "DEBUG"
+Write-Log "=== SYSTEM INFORMATION ===" "DEBUG"
+Write-Log "Windows Version: $(Get-WmiObject -Class Win32_OperatingSystem | Select-Object -ExpandProperty Version)" "DEBUG"
+Write-Log "Architecture: $env:PROCESSOR_ARCHITECTURE" "DEBUG"
+Write-Log "Available Memory: $((Get-WmiObject -Class Win32_OperatingSystem | Select-Object -ExpandProperty FreePhysicalMemory) / 1024) MB" "DEBUG"
+Write-Log "System Drive Free Space: $((Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object -ExpandProperty FreeSpace) / 1GB) GB" "DEBUG"
+
+# Check for VirtIO Serial driver
+Write-Log "" "DEBUG"
+Write-Log "=== VIRTIO SERIAL CHECK ===" "DEBUG"
+$VirtioDevices = Get-WmiObject -Class Win32_PnPEntity | Where-Object {$_.Name -like "*VirtIO*" -or $_.Name -like "*virtio*"}
+if ($VirtioDevices) {
+    foreach ($Device in $VirtioDevices) {
+        Write-Log "Found VirtIO device: $($Device.Name) - Status: $($Device.Status)" "DEBUG"
+    }
+} else {
+    Write-Log "No VirtIO devices found - this may cause communication issues" "WARNING"
+}
+
+# Check COM ports
+$ComPorts = Get-WmiObject -Class Win32_SerialPort
+if ($ComPorts) {
+    foreach ($Port in $ComPorts) {
+        Write-Log "COM Port: $($Port.DeviceID) - $($Port.Name)" "DEBUG"
+    }
+} else {
+    Write-Log "No COM ports detected" "DEBUG"
+}
 
 if ($FinalService -and $FinalService.Status -eq "Running") {
     Write-Log "🎉 Infiniservice installation completed successfully!" "SUCCESS"
