@@ -52,44 +52,6 @@ impl InfiniService {
         }
     }
 
-    pub fn new_with_ping_pong(config: Config, debug_mode: bool) -> Self {
-        let collector = DataCollector::new();
-        
-        if debug_mode {
-            debug!("Initializing InfiniService for ping-pong mode");
-            debug!("Configuration path: {:?}", config.virtio_serial_path);
-        }
-
-        // Try to auto-detect virtio-serial device if not specified
-        let communication = if config.virtio_serial_path.to_string_lossy().is_empty() {
-            if debug_mode {
-                debug!("Attempting to auto-detect virtio-serial device...");
-            }
-            match VirtioSerial::detect_device_path(debug_mode) {
-                Ok(device_path) => {
-                    info!("Auto-detected virtio-serial device for ping-pong: {:?}", device_path);
-                    VirtioSerial::new(device_path)
-                }
-                Err(e) => {
-                    warn!("Failed to auto-detect virtio-serial device: {}", e);
-                    if debug_mode {
-                        debug!("Detection error details: {:?}", e);
-                    }
-                    VirtioSerial::new(&config.virtio_serial_path)
-                }
-            }
-        } else {
-            info!("Using configured virtio-serial path: {:?}", config.virtio_serial_path);
-            VirtioSerial::new(&config.virtio_serial_path)
-        };
-
-        Self {
-            config,
-            collector: collector.expect("DataCollector should initialize"),
-            communication,
-            debug_mode,
-        }
-    }
     
     /// Initialize the service
     pub async fn initialize(&self) -> Result<()> {
@@ -130,15 +92,6 @@ impl InfiniService {
         }
     }
 
-    /// Run ping-pong test mode
-    pub async fn run_ping_pong(&mut self) -> Result<()> {
-        info!("Starting ping-pong test mode");
-
-        // Use a shorter interval for ping-pong testing
-        let ping_interval = 10; // 10 seconds
-
-        self.communication.run_ping_pong_test(ping_interval).await
-    }
     
     /// Collect data and send it to the host
     async fn collect_and_send(&mut self) -> Result<()> {

@@ -422,8 +422,8 @@ pub fn find_virtio_device_paths() -> Vec<PathBuf> {
         PathBuf::from(r"\\.\pipe\VirtioSerial"),
         PathBuf::from(r"\\.\Global\org.qemu.guest_agent.0"),
         PathBuf::from(r"\\.\pipe\org.qemu.guest_agent.0"),
-        PathBuf::from(r"\\.\Global\org.infinibay.ping"),
-        PathBuf::from(r"\\.\pipe\org.infinibay.ping"),
+        PathBuf::from(r"\\.\Global\org.infinibay.agent"),
+        PathBuf::from(r"\\.\pipe\org.infinibay.agent")
     ];
     
     for path in possible_paths {
@@ -616,7 +616,7 @@ pub fn diagnose_virtio_installation() -> Result<String> {
     diagnosis.push_str("\n=== Recommendations ===\n");
     diagnosis.push_str("If VirtIO Serial Driver is installed but not accessible:\n");
     diagnosis.push_str("1. Check VM XML configuration for virtio-serial channel\n");
-    diagnosis.push_str("2. Ensure channel has: <target type='virtio' name='org.infinibay.ping'/>\n");
+    diagnosis.push_str("2. Ensure channel has: <target type='virtio' name='org.infinibay.agent'/>\n");
     diagnosis.push_str("3. Try adding: <source mode='bind' path='/tmp/infinibay.sock'/>\n");
     diagnosis.push_str("4. Restart the VM after configuration changes\n");
     diagnosis.push_str("5. Consider using QEMU guest agent as alternative\n");

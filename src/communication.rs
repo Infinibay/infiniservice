@@ -1,41 +1,34 @@
 //! Communication module for virtio-serial interface
 
-use crate::collector::SystemInfo;
+use crate::collector::{SystemInfo, SystemMetrics};
 use anyhow::{Result, Context, anyhow};
-use log::{info, error, debug, warn};
-use serde::{Serialize, Deserialize};
+use log::{info, debug, warn};
+use serde::Serialize;
 use std::path::Path;
 use std::fs::OpenOptions;
-use std::io::{Write, BufRead, BufReader};
+use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use chrono::Utc;
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct PingMessage {
+// Message wrapper for metrics that matches backend expectations
+#[derive(Serialize, Debug)]
+struct MetricsMessage {
     #[serde(rename = "type")]
-    pub message_type: String,
-    pub timestamp: String,
-    #[serde(rename = "vmId")]
-    pub vm_id: String,
-    #[serde(rename = "sequenceNumber")]
-    pub sequence_number: Option<u64>,
+    message_type: String,
+    timestamp: String,
+    data: MetricsData,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct PongMessage {
-    #[serde(rename = "type")]
-    pub message_type: String,
-    pub timestamp: String,
-    #[serde(rename = "vmId")]
-    pub vm_id: String,
-    #[serde(rename = "sequenceNumber")]
-    pub sequence_number: Option<u64>,
+#[derive(Serialize, Debug)]
+struct MetricsData {
+    system: SystemMetrics,
 }
+
 
 pub struct VirtioSerial {
     device_path: std::path::PathBuf,
     vm_id: String,
-    sequence_number: u64,
 }
 
 impl VirtioSerial {
@@ -43,7 +36,6 @@ impl VirtioSerial {
         Self {
             device_path: device_path.as_ref().to_path_buf(),
             vm_id: Self::generate_vm_id(),
-            sequence_number: 0,
         }
     }
 
@@ -51,7 +43,6 @@ impl VirtioSerial {
         Self {
             device_path: device_path.as_ref().to_path_buf(),
             vm_id,
-            sequence_number: 0,
         }
     }
 
@@ -87,7 +78,8 @@ impl VirtioSerial {
         
         // Common virtio-serial device paths on Linux
         let possible_paths = [
-            "/dev/virtio-ports/org.infinibay.ping",
+            "/dev/virtio-ports/org.infinibay.agent",
+            "/dev/virtio-ports/org.qemu.guest_agent.0",
             "/dev/virtio-ports/com.redhat.spice.0",
             "/dev/vport0p1",
             "/dev/vport1p1",
@@ -181,11 +173,11 @@ impl VirtioSerial {
         // Intentar diferentes formatos de paths que VirtIO podría usar
         let virtio_paths: Vec<std::path::PathBuf> = vec![
             // Global objects - try these first as they're most likely configured
-            std::path::PathBuf::from("\\\\.\\Global\\org.infinibay.ping"),  // Primary Infinibay channel
+            std::path::PathBuf::from("\\\\.\\Global\\org.infinibay.agent"),  // Primary Infinibay channel
             std::path::PathBuf::from("\\\\.\\Global\\org.qemu.guest_agent.0"),
             std::path::PathBuf::from("\\\\.\\Global\\com.redhat.spice.0"),
             // Canales específicos como pipes
-            std::path::PathBuf::from("\\\\.\\pipe\\org.infinibay.ping"),
+            std::path::PathBuf::from("\\\\.\\pipe\\org.infinibay.agent"),
             std::path::PathBuf::from("\\\\.\\pipe\\org.qemu.guest_agent.0"),
             // Dispositivo VirtIO directo (sin namespace)
             std::path::PathBuf::from("\\\\.\\VirtioSerial"),
@@ -445,9 +437,9 @@ impl VirtioSerial {
         }
         // Use OS-specific string handling for named pipes
         let named_pipes: Vec<std::path::PathBuf> = vec![
-            std::path::PathBuf::from("\\\\.\\Global\\org.infinibay.ping"),
+            std::path::PathBuf::from("\\\\.\\Global\\org.infinibay.agent"),
             std::path::PathBuf::from("\\\\.\\Global\\com.redhat.spice.0"),
-            std::path::PathBuf::from("\\\\.\\pipe\\org.infinibay.ping"),
+            std::path::PathBuf::from("\\\\.\\pipe\\org.infinibay.agent"),
             // Removed \\\\.\\pipe\\virtio-serial as it doesn't exist
         ];
         
@@ -494,7 +486,7 @@ impl VirtioSerial {
         warn!("");
         warn!("To fix this issue:");
         warn!("1. Check the VM configuration for the virtio-serial channel name");
-        warn!("2. Ensure the channel has target type='virtio' and name='org.infinibay.ping'");
+        warn!("2. Ensure the channel has target type='virtio' and name='org.infinibay.agent'");
         warn!("3. Try reinstalling the VirtIO serial driver with the latest version");
         warn!("4. Check if the device appears under Ports (COM & LPT) after driver reinstall");
         warn!("");
@@ -590,131 +582,7 @@ impl VirtioSerial {
         Ok(())
     }
 
-    /// Send a ping message to the host
-    pub async fn send_ping(&mut self) -> Result<()> {
-        #[cfg(target_os = "windows")]
-        {
-            // Check device type and use appropriate method
-            let path_str = self.device_path.to_string_lossy();
-            if path_str.contains("Global") {
-                // For Global objects, use Windows API directly
-                return self.send_ping_windows_global().await;
-            } else if path_str.contains("COM") && !path_str.contains("pipe") {
-                // For COM ports, use serialport crate
-                return self.send_ping_windows_serialport().await;
-            }
-        }
-        self.sequence_number += 1;
-
-        let ping_message = PingMessage {
-            message_type: "ping".to_string(),
-            timestamp: Self::current_timestamp(),
-            vm_id: self.vm_id.clone(),
-            sequence_number: Some(self.sequence_number),
-        };
-
-        let message_json = serde_json::to_string(&ping_message)?;
-        debug!("🏓 Sending PING: {}", message_json);
-
-        // Open device and send message
-        #[cfg(target_os = "windows")]
-        let mut file = {
-            use std::os::windows::fs::OpenOptionsExt;
-            let path_str = self.device_path.to_string_lossy();
-            if path_str.contains("COM") && !path_str.contains("pipe") {
-                // COM port - no special flags needed for synchronous write
-                OpenOptions::new()
-                    .write(true)
-                    .open(&self.device_path)
-                    .with_context(|| format!("Failed to open COM port for writing: {}", self.device_path.display()))?
-            } else {
-                OpenOptions::new()
-                    .write(true)
-                    .open(&self.device_path)
-                    .with_context(|| format!("Failed to open device for writing: {}", self.device_path.display()))?
-            }
-        };
-        
-        #[cfg(not(target_os = "windows"))]
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&self.device_path)
-            .with_context(|| format!("Failed to open device for writing: {}", self.device_path.display()))?;
-
-        writeln!(file, "{}", message_json)
-            .with_context(|| "Failed to write ping message to device")?;
-
-        file.flush()
-            .with_context(|| "Failed to flush data to device")?;
-
-        info!("🏓 PING sent to host (sequence: {})", self.sequence_number);
-        Ok(())
-    }
-
-    /// Listen for pong messages from the host
-    pub async fn listen_for_pong(&self, timeout_secs: u64) -> Result<Option<PongMessage>> {
-        #[cfg(target_os = "windows")]
-        {
-            // Check if it's a COM port and use serialport if available  
-            let path_str = self.device_path.to_string_lossy();
-            if path_str.contains("COM") && !path_str.contains("pipe") {
-                return self.listen_for_pong_windows_serialport(timeout_secs).await;
-            }
-        }
-        debug!("Listening for PONG message...");
-
-        // Open device for reading
-        let file = OpenOptions::new()
-            .read(true)
-            .open(&self.device_path)
-            .with_context(|| format!("Failed to open device for reading: {}", self.device_path.display()))?;
-
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-
-        // Simple timeout implementation (in a real implementation, you'd use async timeout)
-        let start_time = std::time::Instant::now();
-
-        loop {
-            if start_time.elapsed().as_secs() > timeout_secs {
-                debug!("Timeout waiting for PONG message");
-                return Ok(None);
-            }
-
-            // Try to read a line (non-blocking would be better)
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    // EOF reached, wait a bit and try again
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    continue;
-                }
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        debug!("Received message: {}", trimmed);
-
-                        // Try to parse as JSON
-                        match serde_json::from_str::<PongMessage>(trimmed) {
-                            Ok(pong) => {
-                                if pong.message_type == "pong" {
-                                    info!("🏓 PONG received from host (sequence: {:?})", pong.sequence_number);
-                                    return Ok(Some(pong));
-                                }
-                            }
-                            Err(e) => {
-                                debug!("Failed to parse message as PONG: {}", e);
-                            }
-                        }
-                    }
-                    line.clear();
-                }
-                Err(e) => {
-                    warn!("Error reading from device: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-            }
-        }
-    }
+    
 
     fn current_timestamp() -> String {
         SystemTime::now()
@@ -728,8 +596,17 @@ impl VirtioSerial {
     pub async fn send_data(&self, data: &SystemInfo) -> Result<()> {
         debug!("Sending system data via virtio-serial");
 
-        let serialized = serde_json::to_string(data)
-            .with_context(|| "Failed to serialize system data")?;
+        // Wrap SystemInfo in the message format expected by backend
+        let metrics_message = MetricsMessage {
+            message_type: "metrics".to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            data: MetricsData {
+                system: data.metrics.clone(),
+            },
+        };
+
+        let serialized = serde_json::to_string(&metrics_message)
+            .with_context(|| "Failed to serialize metrics message")?;
 
         // Open device and send data
         #[cfg(target_os = "windows")]
@@ -809,234 +686,6 @@ impl VirtioSerial {
         // For regular files and non-Windows systems
         self.device_path.exists()
     }
-
-    /// Run ping-pong test loop
-    pub async fn run_ping_pong_test(&mut self, interval_secs: u64) -> Result<()> {
-        info!("Starting ping-pong test with {}s interval", interval_secs);
-
-        loop {
-            // Send ping
-            if let Err(e) = self.send_ping().await {
-                error!("Failed to send ping: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
-                continue;
-            }
-
-            // Wait for pong
-            match self.listen_for_pong(5).await {
-                Ok(Some(pong)) => {
-                    info!("✅ Ping-pong successful! Received: {:?}", pong);
-                }
-                Ok(None) => {
-                    warn!("⏰ Timeout waiting for pong response");
-                }
-                Err(e) => {
-                    error!("❌ Error listening for pong: {}", e);
-                }
-            }
-
-            // Wait before next ping
-            tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
-        }
-    }
-    
-    #[cfg(target_os = "windows")]
-    /// Send a ping message to Windows Global object (VirtIO device)
-    async fn send_ping_windows_global(&mut self) -> Result<()> {
-        use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
-        use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE};
-        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-        use std::os::windows::ffi::OsStrExt;
-        use std::ffi::OsStr;
-        use std::ptr;
-        
-        self.sequence_number += 1;
-
-        let ping_message = PingMessage {
-            message_type: "ping".to_string(),
-            timestamp: Self::current_timestamp(),
-            vm_id: self.vm_id.clone(),
-            sequence_number: Some(self.sequence_number),
-        };
-
-        let message_json = serde_json::to_string(&ping_message)?;
-        debug!("🏓 Sending PING to Global object: {}", message_json);
-
-        // Convert path to wide string for Windows API
-        let path_str = self.device_path.to_string_lossy();
-        let wide_path: Vec<u16> = OsStr::new(&*path_str)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        unsafe {
-            // Open the Global object with CreateFileW
-            let handle = CreateFileW(
-                wide_path.as_ptr(),
-                GENERIC_WRITE | GENERIC_READ,
-                0,
-                ptr::null_mut(),
-                OPEN_EXISTING,
-                0,
-                ptr::null_mut(),
-            );
-
-            if handle == INVALID_HANDLE_VALUE {
-                use winapi::um::errhandlingapi::GetLastError;
-                let error = GetLastError();
-                return Err(anyhow!("Failed to open Global object {}: Win32 error {}", path_str, error));
-            }
-
-            // Write the message
-            use winapi::um::fileapi::WriteFile;
-            let data = format!("{}\r\n", message_json);
-            let bytes = data.as_bytes();
-            let mut bytes_written = 0;
-
-            let success = WriteFile(
-                handle,
-                bytes.as_ptr() as *const _,
-                bytes.len() as u32,
-                &mut bytes_written,
-                ptr::null_mut(),
-            );
-
-            // Close handle
-            CloseHandle(handle);
-
-            if success == 0 {
-                use winapi::um::errhandlingapi::GetLastError;
-                let error = GetLastError();
-                return Err(anyhow!("Failed to write to Global object: Win32 error {}", error));
-            }
-
-            info!("🏓 PING sent to host via Global object (sequence: {})", self.sequence_number);
-            Ok(())
-        }
-    }
-    
-    #[cfg(target_os = "windows")]
-    /// Send a ping message using serialport crate (Windows-specific)
-    async fn send_ping_windows_serialport(&mut self) -> Result<()> {
-        use serialport::SerialPort;
-        
-        self.sequence_number += 1;
-
-        let ping_message = PingMessage {
-            message_type: "ping".to_string(),
-            timestamp: Self::current_timestamp(),
-            vm_id: self.vm_id.clone(),
-            sequence_number: Some(self.sequence_number),
-        };
-
-        let message_json = serde_json::to_string(&ping_message)?;
-        debug!("🏓 Sending PING via serialport: {}", message_json);
-
-        // Extract COM port name from path like \\.\COM3
-        let path_str = self.device_path.to_string_lossy();
-        let port_name = if path_str.starts_with("\\\\.\\")
-            { &path_str[4..] } else { &path_str };
-        
-        // Open serial port with appropriate settings
-        let mut port = serialport::new(port_name, 9600)
-            .timeout(std::time::Duration::from_millis(1000))
-            .data_bits(serialport::DataBits::Eight)
-            .parity(serialport::Parity::None)
-            .stop_bits(serialport::StopBits::One)
-            .flow_control(serialport::FlowControl::None)
-            .open()
-            .with_context(|| format!("Failed to open COM port: {}", port_name))?;
-
-        // Write message with CRLF line ending
-        let data = format!("{}\r\n", message_json);
-        port.write_all(data.as_bytes())
-            .with_context(|| "Failed to write ping message to COM port")?;
-        
-        port.flush()
-            .with_context(|| "Failed to flush COM port")?;
-
-        info!("🏓 PING sent to host via {} (sequence: {})", port_name, self.sequence_number);
-        Ok(())
-    }
-    
-    #[cfg(target_os = "windows")]
-    /// Listen for pong messages using serialport crate (Windows-specific)
-    async fn listen_for_pong_windows_serialport(&self, timeout_secs: u64) -> Result<Option<PongMessage>> {
-        use serialport::SerialPort;
-        use std::io::Read;
-        
-        debug!("Listening for PONG message via serialport...");
-
-        // Extract COM port name from path
-        let path_str = self.device_path.to_string_lossy();
-        let port_name = if path_str.starts_with("\\\\.\\")
-            { &path_str[4..] } else { &path_str };
-        
-        // Open serial port for reading
-        let mut port = serialport::new(port_name, 9600)
-            .timeout(std::time::Duration::from_millis(100)) // Short timeout for non-blocking reads
-            .data_bits(serialport::DataBits::Eight)
-            .parity(serialport::Parity::None)
-            .stop_bits(serialport::StopBits::One)
-            .flow_control(serialport::FlowControl::None)
-            .open()
-            .with_context(|| format!("Failed to open COM port for reading: {}", port_name))?;
-
-        let mut buffer = [0u8; 1024];
-        let mut message_buffer = String::new();
-        let start_time = std::time::Instant::now();
-
-        loop {
-            if start_time.elapsed().as_secs() > timeout_secs {
-                debug!("Timeout waiting for PONG message");
-                return Ok(None);
-            }
-
-            match port.read(&mut buffer) {
-                Ok(0) => {
-                    // No data available, wait a bit
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    continue;
-                }
-                Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buffer[..n]);
-                    message_buffer.push_str(&chunk);
-                    
-                    // Check if we have complete lines
-                    while let Some(newline_pos) = message_buffer.find('\n') {
-                        let line = message_buffer[..newline_pos].trim().to_string();
-                        message_buffer = message_buffer[newline_pos + 1..].to_string();
-                        
-                        if !line.is_empty() {
-                            debug!("Received message via serialport: {}", line);
-                            
-                            match serde_json::from_str::<PongMessage>(&line) {
-                                Ok(pong) => {
-                                    if pong.message_type == "pong" {
-                                        info!("🏓 PONG received from host via {} (sequence: {:?})", 
-                                              port_name, pong.sequence_number);
-                                        return Ok(Some(pong));
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("Failed to parse message as PONG: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                    // Timeout is expected with short timeout setting
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-                Err(e) => {
-                    debug!("Error reading from COM port: {}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1044,45 +693,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    #[test]
-    fn test_ping_message_serialization() {
-        let ping = PingMessage {
-            message_type: "ping".to_string(),
-            timestamp: "1234567890".to_string(),
-            vm_id: "test-vm-123".to_string(),
-            sequence_number: Some(5),
-        };
 
-        let json = serde_json::to_string(&ping).expect("Should serialize ping message");
-        assert!(json.contains("\"type\":\"ping\""));
-        assert!(json.contains("\"vmId\":\"test-vm-123\""));
-        assert!(json.contains("\"sequenceNumber\":5"));
-
-        let deserialized: PingMessage = serde_json::from_str(&json).expect("Should deserialize ping message");
-        assert_eq!(ping.message_type, deserialized.message_type);
-        assert_eq!(ping.vm_id, deserialized.vm_id);
-        assert_eq!(ping.sequence_number, deserialized.sequence_number);
-    }
-
-    #[test]
-    fn test_pong_message_serialization() {
-        let pong = PongMessage {
-            message_type: "pong".to_string(),
-            timestamp: "1234567890".to_string(),
-            vm_id: "test-vm-456".to_string(),
-            sequence_number: Some(10),
-        };
-
-        let json = serde_json::to_string(&pong).expect("Should serialize pong message");
-        assert!(json.contains("\"type\":\"pong\""));
-        assert!(json.contains("\"vmId\":\"test-vm-456\""));
-        assert!(json.contains("\"sequenceNumber\":10"));
-
-        let deserialized: PongMessage = serde_json::from_str(&json).expect("Should deserialize pong message");
-        assert_eq!(pong.message_type, deserialized.message_type);
-        assert_eq!(pong.vm_id, deserialized.vm_id);
-        assert_eq!(pong.sequence_number, deserialized.sequence_number);
-    }
 
     #[test]
     fn test_virtio_serial_initialization() {
@@ -1091,7 +702,6 @@ mod tests {
         
         assert_eq!(virtio.device_path, device_path);
         assert!(!virtio.vm_id.is_empty());
-        assert_eq!(virtio.sequence_number, 0);
     }
 
     #[test]
@@ -1102,7 +712,6 @@ mod tests {
         
         assert_eq!(virtio.device_path, device_path);
         assert_eq!(virtio.vm_id, vm_id);
-        assert_eq!(virtio.sequence_number, 0);
     }
 
     #[test]
@@ -1220,27 +829,5 @@ mod tests {
         let serialized = serde_json::to_string(&system_info).expect("Should serialize");
         assert!(serialized.contains("\"timestamp\":1234567890"));
         assert!(serialized.contains("\"usage_percent\":50.0"));
-    }
-
-    #[test]
-    fn test_message_structure_compatibility() {
-        // Test that our message structures are compatible with the expected format
-        
-        // Test ping message JSON structure
-        let ping = PingMessage {
-            message_type: "ping".to_string(),
-            timestamp: "1234567890".to_string(),
-            vm_id: "vm-123".to_string(),
-            sequence_number: Some(1),
-        };
-        
-        let json = serde_json::to_string(&ping).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        
-        // Check JSON field names match expected API
-        assert_eq!(value["type"], "ping");
-        assert_eq!(value["vmId"], "vm-123");
-        assert_eq!(value["sequenceNumber"], 1);
-        assert_eq!(value["timestamp"], "1234567890");
     }
 }

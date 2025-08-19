@@ -1,27 +1,75 @@
-use log::{info, error, debug, warn};
+use log::{info, error, debug};
 use infiniservice::{Config, InfiniService};
 use std::env;
 
 #[cfg(target_os = "windows")]
 use infiniservice::windows_com::diagnose_virtio_installation;
 
+#[cfg(target_os = "windows")]
+use windows_service::{
+    define_windows_service,
+    service_dispatcher,
+    service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    },
+    service_control_handler::{self, ServiceControlHandlerResult},
+};
+
+#[cfg(target_os = "windows")]
+use std::time::Duration;
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
+
+#[cfg(target_os = "windows")]
+static SERVICE_NAME: &str = "Infiniservice";
+
+#[cfg(target_os = "windows")]
+define_windows_service!(ffi_service_main, service_main);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
     
+    // On Windows, check if we're running as a service
+    #[cfg(target_os = "windows")]
+    {
+        // If no arguments are provided and we're on Windows, assume we're running as a service
+        // Windows services are typically started without command-line arguments
+        if args.len() == 1 && !args.contains(&"--console".to_string()) {
+            // Try to run as Windows service
+            info!("Attempting to run as Windows service...");
+            match service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    // If we can't start as a service, continue as console app
+                    eprintln!("Failed to start as Windows service: {:?}", e);
+                    eprintln!("Running in console mode instead. Use --help for options.");
+                }
+            }
+        }
+    }
+    
+    // Check for version flag
+    if args.contains(&"--version".to_string()) || args.contains(&"-v".to_string()) {
+        println!("infiniservice {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    
     // Check for help flag
     if args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
         println!("Infiniservice - VM Data Collection Service");
+        println!("Version: {}", env!("CARGO_PKG_VERSION"));
         println!("\nUsage: {} [OPTIONS]\n", args[0]);
         println!("Options:");
         println!("  --help, -h        Show this help message");
+        println!("  --version, -v     Show version information");
+        println!("  --console         Run in console mode (Windows only)");
         println!("  --debug           Enable debug logging");
         println!("  --diagnose, --diag  Run VirtIO device diagnostics (Windows)");
-        println!("  --ping-pong       Run in ping-pong test mode");
         println!("  --device <path>   Manually specify device path");
         println!("\nEnvironment Variables:");
-        println!("  INFINISERVICE_MODE=ping-pong  Run in ping-pong mode");
         println!("  INFINIBAY_VM_ID=<id>          Set VM identifier");
         println!("  INFINISERVICE_DEVICE=<path>   Manually specify device path");
         println!("  RUST_LOG=<level>              Set log level (error|warn|info|debug)");
@@ -124,10 +172,6 @@ async fn main() -> anyhow::Result<()> {
         info!("🔍 Running in DEBUG mode - enhanced logging enabled");
     }
 
-    // Check for ping-pong mode
-    let ping_pong_mode = args.contains(&"--ping-pong".to_string()) ||
-                        args.contains(&"ping-pong".to_string()) ||
-                        env::var("INFINISERVICE_MODE").unwrap_or_default() == "ping-pong";
 
     // Load configuration
     let mut config = Config::load()?;
@@ -147,33 +191,152 @@ async fn main() -> anyhow::Result<()> {
         debug!("  Architecture: {}", std::env::consts::ARCH);
     }
 
-    if ping_pong_mode {
-        info!("🏓 Starting in PING-PONG test mode");
+    info!("📊 Starting in data collection mode");
 
-        // Create service for ping-pong testing
-        let mut service = InfiniService::new_with_ping_pong(config, debug_mode);
-        service.initialize().await?;
+    // Create and initialize service
+    let mut service = InfiniService::new(config, debug_mode);
+    service.initialize().await?;
 
-        // Run ping-pong test
-        info!("Starting ping-pong test...");
-        if let Err(e) = service.run_ping_pong().await {
-            error!("Ping-pong test error: {}", e);
-            return Err(e);
-        }
-    } else {
-        info!("📊 Starting in normal data collection mode");
-
-        // Create and initialize service
-        let mut service = InfiniService::new(config, debug_mode);
-        service.initialize().await?;
-
-        // Run the service
-        info!("Starting main service loop...");
-        if let Err(e) = service.run().await {
-            error!("Service error: {}", e);
-            return Err(e);
-        }
+    // Run the service
+    info!("Starting main service loop...");
+    if let Err(e) = service.run().await {
+        error!("Service error: {}", e);
+        return Err(e);
     }
 
     Ok(())
+}
+
+// Windows service implementation
+#[cfg(target_os = "windows")]
+fn service_main(_arguments: Vec<OsString>) {
+    // Initialize logging for service mode
+    if env::var("RUST_LOG").is_err() {
+        env::set_var("RUST_LOG", "info");
+    }
+    env_logger::init();
+    
+    info!("Infiniservice Windows service starting...");
+    
+    // Create a channel to communicate with the service control handler
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    
+    // Define the service control handler
+    let shutdown_tx_clone = shutdown_tx.clone();
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        match control_event {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                info!("Received stop/shutdown signal");
+                // Send shutdown signal
+                let _ = shutdown_tx_clone.try_send(());
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+    
+    // Register the service control handler
+    let status_handle = match service_control_handler::register(SERVICE_NAME, event_handler) {
+        Ok(handle) => handle,
+        Err(e) => {
+            error!("Failed to register service control handler: {:?}", e);
+            return;
+        }
+    };
+    
+    // Report that the service is running
+    let _ = status_handle.set_service_status(ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    });
+    
+    // Run the actual service in a Tokio runtime
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("Failed to create Tokio runtime: {:?}", e);
+            let _ = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(1),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            });
+            return;
+        }
+    };
+    
+    runtime.block_on(async {
+        // Load configuration
+        let config = match Config::load() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                error!("Failed to load configuration: {:?}", e);
+                let _ = status_handle.set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: ServiceState::Stopped,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: ServiceExitCode::Win32(1),
+                    checkpoint: 0,
+                    wait_hint: Duration::default(),
+                    process_id: None,
+                });
+                return;
+            }
+        };
+        
+        info!("Configuration loaded: collection interval = {}s", config.collection_interval);
+        
+        // Create and initialize the service
+        let mut service = InfiniService::new(config, false);
+        if let Err(e) = service.initialize().await {
+            error!("Failed to initialize service: {:?}", e);
+            let _ = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(1),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            });
+            return;
+        }
+        
+        info!("Service initialized successfully");
+        
+        // Run the service in the current task (not spawned)
+        // Use tokio::select! to handle both the service and shutdown signal
+        tokio::select! {
+            result = service.run() => {
+                if let Err(e) = result {
+                    error!("Service error: {:?}", e);
+                }
+            }
+            _ = shutdown_rx.recv() => {
+                info!("Shutdown signal received, stopping service...");
+            }
+        }
+        
+        // Report that the service is stopped
+        let _ = status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        });
+        
+        info!("Service stopped");
+    });
 }
