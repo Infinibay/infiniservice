@@ -3,7 +3,7 @@
 //! Provides detailed operating system detection including distribution,
 //! version, architecture, and available package managers.
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::process::Command;

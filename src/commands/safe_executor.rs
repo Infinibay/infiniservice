@@ -229,7 +229,12 @@ impl SafeCommandExecutor {
                 if let Ok(output) = output {
                     if output.status.success() {
                         let stdout = String::from_utf8_lossy(&output.stdout);
-                        return Ok((stdout.to_string(), String::new(), None));
+                        let packages = self.parse_winget_list(&stdout);
+                        return Ok((
+                            format!("Found {} packages", packages.len()),
+                            String::new(),
+                            Some(json!({ "packages": packages }))
+                        ));
                     }
                 }
                 
@@ -243,22 +248,40 @@ impl SafeCommandExecutor {
                     .context("Failed to list packages")?;
                 
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                let packages = serde_json::from_str(&stdout).ok();
+                let packages = if let Ok(json_data) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                    // Convert PowerShell output to our format
+                    let formatted = self.format_powershell_packages(json_data);
+                    Some(json!({ "packages": formatted }))
+                } else {
+                    None
+                };
                 Ok((stdout.to_string(), String::new(), packages))
             },
             OsType::Linux => {
-                // Determine package manager
-                let cmd = if self.os_info.available_package_managers.iter().any(|p| matches!(p, crate::os_detection::PackageManager::Apt)) {
-                    Command::new("dpkg").args(&["-l"]).output()
+                // Determine package manager and get formatted output
+                let packages = if self.os_info.available_package_managers.iter().any(|p| matches!(p, crate::os_detection::PackageManager::Apt)) {
+                    let output = Command::new("dpkg")
+                        .args(&["-l"])
+                        .output()
+                        .context("Failed to list packages")?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    self.parse_dpkg_list(&stdout)
                 } else if self.os_info.available_package_managers.iter().any(|p| matches!(p, crate::os_detection::PackageManager::Yum | crate::os_detection::PackageManager::Dnf)) {
-                    Command::new("rpm").args(&["-qa"]).output()
+                    let output = Command::new("rpm")
+                        .args(&["-qa", "--queryformat", "%{NAME}|%{VERSION}|%{SUMMARY}\n"])
+                        .output()
+                        .context("Failed to list packages")?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    self.parse_rpm_list(&stdout)
                 } else {
                     return Err(anyhow!("No supported package manager found"));
                 };
                 
-                let output = cmd.context("Failed to list packages")?;
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Ok((stdout.to_string(), String::new(), None))
+                Ok((
+                    format!("Found {} packages", packages.len()),
+                    String::new(),
+                    Some(json!({ "packages": packages }))
+                ))
             },
             _ => Err(anyhow!("Unsupported OS for package listing")),
         }
@@ -441,28 +464,43 @@ impl SafeCommandExecutor {
                     .context("Failed to search packages")?;
                 
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                Ok((stdout.to_string(), String::new(), None))
+                let packages = self.parse_winget_search(&stdout);
+                Ok((
+                    format!("Found {} packages matching '{}'", packages.len(), query),
+                    String::new(),
+                    Some(json!({ "packages": packages }))
+                ))
             },
             OsType::Linux => {
-                let output = if self.os_info.available_package_managers.iter().any(|p| matches!(p, crate::os_detection::PackageManager::Apt)) {
-                    Command::new("apt-cache")
+                let packages = if self.os_info.available_package_managers.iter().any(|p| matches!(p, crate::os_detection::PackageManager::Apt)) {
+                    let output = Command::new("apt-cache")
                         .args(&["search", query])
                         .output()
-                } else if self.os_info.available_package_managers.iter().any(|p| matches!(p, crate::os_detection::PackageManager::Yum)) {
-                    Command::new("yum")
+                        .context("Failed to search packages")?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    self.parse_apt_search(&stdout)
+                } else if self.os_info.available_package_managers.iter().any(|p| matches!(p, crate::os_detection::PackageManager::Yum | crate::os_detection::PackageManager::Dnf)) {
+                    let cmd = if self.os_info.available_package_managers.iter().any(|p| matches!(p, crate::os_detection::PackageManager::Dnf)) {
+                        "dnf"
+                    } else {
+                        "yum"
+                    };
+                    
+                    let output = Command::new(cmd)
                         .args(&["search", query])
                         .output()
-                } else if self.os_info.available_package_managers.iter().any(|p| matches!(p, crate::os_detection::PackageManager::Dnf)) {
-                    Command::new("dnf")
-                        .args(&["search", query])
-                        .output()
+                        .context("Failed to search packages")?;
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    self.parse_yum_search(&stdout)
                 } else {
                     return Err(anyhow!("No supported package manager found"));
                 };
                 
-                let output = output.context("Failed to search packages")?;
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Ok((stdout.to_string(), String::new(), None))
+                Ok((
+                    format!("Found {} packages matching '{}'", packages.len(), query),
+                    String::new(),
+                    Some(json!({ "packages": packages }))
+                ))
             },
             _ => Err(anyhow!("Unsupported OS for package search")),
         }
@@ -588,5 +626,198 @@ impl SafeCommandExecutor {
             String::new(),
             Some(json!(data)),
         ))
+    }
+
+    // ===== Package Output Parsers =====
+
+    /// Parse winget list output
+    fn parse_winget_list(&self, output: &str) -> Vec<serde_json::Value> {
+        let mut packages = Vec::new();
+        let lines: Vec<&str> = output.lines().collect();
+        
+        // Skip header lines and find the start of the package list
+        let mut start_idx = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("---") {
+                start_idx = i + 1;
+                break;
+            }
+        }
+        
+        // Parse each package line
+        for line in lines.iter().skip(start_idx) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            
+            // winget output is typically: Name    Id    Version    Available    Source
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                packages.push(json!({
+                    "name": parts[0],
+                    "version": parts[2],
+                    "id": parts[1],
+                    "installed": true,
+                    "source": parts.get(4).unwrap_or(&"").to_string()
+                }));
+            }
+        }
+        
+        packages
+    }
+
+    /// Parse winget search output
+    fn parse_winget_search(&self, output: &str) -> Vec<serde_json::Value> {
+        let mut packages = Vec::new();
+        let lines: Vec<&str> = output.lines().collect();
+        
+        // Skip header lines
+        let mut start_idx = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("---") {
+                start_idx = i + 1;
+                break;
+            }
+        }
+        
+        for line in lines.iter().skip(start_idx) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                packages.push(json!({
+                    "name": parts[0],
+                    "version": parts[2],
+                    "id": parts[1],
+                    "installed": false,
+                    "source": parts.get(3).unwrap_or(&"").to_string()
+                }));
+            }
+        }
+        
+        packages
+    }
+
+    /// Format PowerShell package output
+    fn format_powershell_packages(&self, data: serde_json::Value) -> Vec<serde_json::Value> {
+        let mut packages = Vec::new();
+        
+        if let Some(array) = data.as_array() {
+            for item in array {
+                packages.push(json!({
+                    "name": item["Name"].as_str().unwrap_or(""),
+                    "version": item["Version"].as_str().unwrap_or(""),
+                    "source": item["Source"].as_str().unwrap_or(""),
+                    "installed": true
+                }));
+            }
+        } else if data.is_object() {
+            // Single package
+            packages.push(json!({
+                "name": data["Name"].as_str().unwrap_or(""),
+                "version": data["Version"].as_str().unwrap_or(""),
+                "source": data["Source"].as_str().unwrap_or(""),
+                "installed": true
+            }));
+        }
+        
+        packages
+    }
+
+    /// Parse dpkg -l output
+    fn parse_dpkg_list(&self, output: &str) -> Vec<serde_json::Value> {
+        let mut packages = Vec::new();
+        
+        for line in output.lines() {
+            // dpkg -l format: ii  package-name  version  architecture  description
+            if line.starts_with("ii ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    packages.push(json!({
+                        "name": parts[1],
+                        "version": parts[2],
+                        "installed": true,
+                        "description": parts.get(4..).map(|p| p.join(" ")).unwrap_or_default()
+                    }));
+                }
+            }
+        }
+        
+        packages
+    }
+
+    /// Parse rpm list output
+    fn parse_rpm_list(&self, output: &str) -> Vec<serde_json::Value> {
+        let mut packages = Vec::new();
+        
+        for line in output.lines() {
+            // Format: name|version|description
+            let parts: Vec<&str> = line.split('|').collect();
+            if parts.len() >= 2 {
+                packages.push(json!({
+                    "name": parts[0],
+                    "version": parts[1],
+                    "description": parts.get(2).unwrap_or(&""),
+                    "installed": true
+                }));
+            }
+        }
+        
+        packages
+    }
+
+    /// Parse apt-cache search output
+    fn parse_apt_search(&self, output: &str) -> Vec<serde_json::Value> {
+        let mut packages = Vec::new();
+        
+        for line in output.lines() {
+            // Format: package-name - description
+            if let Some(dash_pos) = line.find(" - ") {
+                let name = &line[..dash_pos];
+                let description = &line[dash_pos + 3..];
+                packages.push(json!({
+                    "name": name.trim(),
+                    "description": description.trim(),
+                    "installed": false
+                }));
+            }
+        }
+        
+        packages
+    }
+
+    /// Parse yum/dnf search output
+    fn parse_yum_search(&self, output: &str) -> Vec<serde_json::Value> {
+        let mut packages = Vec::new();
+        let mut current_name = String::new();
+        
+        for line in output.lines() {
+            let line = line.trim();
+            
+            // Skip headers and separators
+            if line.is_empty() || line.contains("==") || line.contains("Matched:") {
+                continue;
+            }
+            
+            // Package lines format: package-name.arch : description
+            if line.contains(" : ") {
+                let parts: Vec<&str> = line.split(" : ").collect();
+                if parts.len() == 2 {
+                    // Remove architecture suffix if present
+                    current_name = parts[0].split('.').next().unwrap_or(parts[0]).to_string();
+                    packages.push(json!({
+                        "name": current_name.clone(),
+                        "description": parts[1],
+                        "installed": false
+                    }));
+                }
+            }
+        }
+        
+        packages
     }
 }
