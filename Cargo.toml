@@ -47,6 +47,12 @@ filetime = "0.2"
 # Image processing (for icon extraction)
 image = "0.25"
 
+# Hostname detection
+hostname = "0.3"
+
+# Command execution
+subprocess = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # Windows API bindings for icon extraction and system operations
 winapi = { version = "0.3", features = [
@@ -62,9 +68,20 @@ windows-service = "0.8"
 # Windows performance counters
 wmi = "0.13"
 
+# Windows system APIs
+windows = { version = "0.58", features = [
+    "Win32_System_Services",
+    "Win32_System_ProcessStatus",
+    "Win32_Foundation",
+    "Win32_System_Threading"
+] }
+
 # Serial port communication for Windows VirtIO
 serialport = "4.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Process and system metrics for Linux
 procfs = "0.17"
+
+# Unix process and signal handling
+nix = { version = "0.29", features = ["signal", "process"] }

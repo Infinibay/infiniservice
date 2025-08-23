@@ -1,12 +1,13 @@
-//! Communication module for virtio-serial interface
+//! Communication module for virtio-serial interface with bidirectional command support
 
 use crate::collector::{SystemInfo, SystemMetrics};
+use crate::commands::{IncomingMessage, CommandResponse};
 use anyhow::{Result, Context, anyhow};
 use log::{info, debug, warn};
 use serde::Serialize;
 use std::path::Path;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Write, BufRead, BufReader};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use chrono::Utc;
@@ -608,6 +609,21 @@ impl VirtioSerial {
         let serialized = serde_json::to_string(&metrics_message)
             .with_context(|| "Failed to serialize metrics message")?;
 
+        self.send_raw_message(&serialized).await
+    }
+    
+    /// Send a command response to the host
+    pub async fn send_command_response(&self, response: &CommandResponse) -> Result<()> {
+        debug!("Sending command response: id={}, success={}", response.id, response.success);
+        
+        let serialized = serde_json::to_string(&response)
+            .with_context(|| "Failed to serialize command response")?;
+        
+        self.send_raw_message(&serialized).await
+    }
+    
+    /// Send raw message to the device
+    async fn send_raw_message(&self, message: &str) -> Result<()> {
         // Open device and send data
         #[cfg(target_os = "windows")]
         let mut file = {
@@ -633,14 +649,93 @@ impl VirtioSerial {
             .open(&self.device_path)
             .with_context(|| format!("Failed to open device for data transmission: {}", self.device_path.display()))?;
 
-        writeln!(file, "{}", serialized)
-            .with_context(|| "Failed to write system data to device")?;
+        writeln!(file, "{}", message)
+            .with_context(|| "Failed to write message to device")?;
 
         file.flush()
-            .with_context(|| "Failed to flush system data to device")?;
+            .with_context(|| "Failed to flush message to device")?;
 
-        info!("System data sent successfully");
+        debug!("Message sent successfully");
         Ok(())
+    }
+    
+    /// Read incoming commands from the device
+    pub async fn read_command(&self) -> Result<Option<IncomingMessage>> {
+        debug!("Attempting to read command from virtio-serial");
+        
+        // Open device for reading
+        #[cfg(target_os = "windows")]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            let path_str = self.device_path.to_string_lossy();
+            if path_str.contains("COM") && !path_str.contains("pipe") {
+                OpenOptions::new()
+                    .read(true)
+                    .open(&self.device_path)
+                    .with_context(|| format!("Failed to open COM port for reading: {}", self.device_path.display()))?
+            } else {
+                OpenOptions::new()
+                    .read(true)
+                    .open(&self.device_path)
+                    .with_context(|| format!("Failed to open device for reading: {}", self.device_path.display()))?
+            }
+        };
+        
+        #[cfg(not(target_os = "windows"))]
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&self.device_path)
+            .with_context(|| format!("Failed to open device for reading: {}", self.device_path.display()))?;
+        
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        
+        // Try to read a line (non-blocking would be better but requires more complex setup)
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                // No data available
+                Ok(None)
+            },
+            Ok(_) => {
+                // Parse the incoming message
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                
+                debug!("Received message: {}", trimmed);
+                
+                match serde_json::from_str::<IncomingMessage>(trimmed) {
+                    Ok(msg) => {
+                        match &msg {
+                            IncomingMessage::SafeCommand(cmd) => {
+                                info!("Received safe command: id={}, type={:?}", cmd.id, cmd.command_type);
+                            },
+                            IncomingMessage::UnsafeCommand(cmd) => {
+                                warn!("⚠️ Received UNSAFE command: id={}, command={}", cmd.id, cmd.raw_command);
+                            },
+                            IncomingMessage::Metrics => {
+                                debug!("Received metrics request");
+                            }
+                        }
+                        Ok(Some(msg))
+                    },
+                    Err(e) => {
+                        warn!("Failed to parse incoming message: {}", e);
+                        debug!("Raw message was: {}", trimmed);
+                        Ok(None)
+                    }
+                }
+            },
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    // No data available (non-blocking read)
+                    Ok(None)
+                } else {
+                    Err(anyhow!("Failed to read from device: {}", e))
+                }
+            }
+        }
     }
 
     /// Check if virtio-serial device is available
