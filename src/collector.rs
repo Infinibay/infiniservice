@@ -379,18 +379,19 @@ impl DataCollector {
     }
     
     fn collect_memory_metrics(&self) -> Result<MemoryMetrics> {
-        let total_memory = self.system.total_memory();
-        let used_memory = self.system.used_memory();
-        let available_memory = self.system.available_memory();
+        // sysinfo returns memory values in bytes, convert to KB
+        let total_memory = self.system.total_memory() / 1024;
+        let used_memory = self.system.used_memory() / 1024;
+        let available_memory = self.system.available_memory() / 1024;
         
         let swap_total = if self.system.total_swap() > 0 {
-            Some(self.system.total_swap())
+            Some(self.system.total_swap() / 1024)
         } else {
             None
         };
         
         let swap_used = if self.system.used_swap() > 0 {
-            Some(self.system.used_swap())
+            Some(self.system.used_swap() / 1024)
         } else {
             None
         };
@@ -923,7 +924,7 @@ impl DataCollector {
                         executable_path: process.exe().map(|p| p.to_string_lossy().to_string()),
                         command_line: Some(process.cmd().iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(" ")),
                         cpu_usage_percent: process.cpu_usage(),
-                        memory_usage_kb: process.memory(),
+                        memory_usage_kb: process.memory() / 1024,  // Convert bytes to KB
                         status: format!("{:?}", process.status()),
                         start_time: Some(process.start_time()),
                     }
