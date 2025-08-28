@@ -85,9 +85,26 @@ if ! command -v x86_64-w64-mingw32-gcc &> /dev/null; then
 fi
 
 if command -v x86_64-w64-mingw32-gcc &> /dev/null; then
+    # Use additional flags to reduce false positives
+    export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-s"
     if build_target "x86_64-pc-windows-gnu" "$WINDOWS_DIR" "infiniservice.exe"; then
         cp "target/x86_64-pc-windows-gnu/release/infiniservice.exe" "$WINDOWS_DIR/"
+        
+        # Additional stripping to reduce false positives
+        if command -v x86_64-w64-mingw32-strip &> /dev/null; then
+            x86_64-w64-mingw32-strip "$WINDOWS_DIR/infiniservice.exe"
+            echo -e "${GREEN}✓ Binary stripped to reduce AV false positives${NC}"
+        fi
         echo -e "${GREEN}✓ Windows binary deployed to ${WINDOWS_DIR}/infiniservice.exe${NC}"
+        
+        # Offer to sign the executable
+        if [ -f "./sign-windows.sh" ]; then
+            echo ""
+            read -p "¿Deseas firmar digitalmente el ejecutable de Windows? [y/N]: " sign_exe
+            if [[ $sign_exe =~ ^[Yy]$ ]]; then
+                ./sign-windows.sh
+            fi
+        fi
     else
         echo -e "${YELLOW}⚠ Windows build skipped due to errors${NC}"
     fi

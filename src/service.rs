@@ -14,6 +14,8 @@ pub struct InfiniService {
     communication: VirtioSerial,
     command_executor: CommandExecutor,
     debug_mode: bool,
+    virtio_connected: bool,
+    last_virtio_retry: Option<std::time::Instant>,
 }
 
 impl InfiniService {
@@ -56,22 +58,50 @@ impl InfiniService {
             communication,
             command_executor,
             debug_mode,
+            virtio_connected: false,
+            last_virtio_retry: None,
         }
     }
 
     
     /// Initialize the service
-    pub async fn initialize(&self) -> Result<()> {
+    pub async fn initialize(&mut self) -> Result<()> {
         info!("Initializing Infiniservice...");
         
         // Check if virtio-serial is available
         if !self.communication.is_available() {
-            warn!("Virtio-serial device not available at {:?}", self.config.virtio_serial_path);
-            warn!("Service will continue but data transmission may fail");
+            if self.config.require_virtio {
+                return Err(anyhow::anyhow!(
+                    "VirtIO device is required but not available at {:?}. Use --no-virtio to run without it.",
+                    self.config.virtio_serial_path
+                ));
+            } else {
+                warn!("Virtio-serial device not available at {:?}", self.config.virtio_serial_path);
+                warn!("Service will continue in degraded mode - some features may be limited");
+            }
         }
         
-        // Connect to virtio-serial
-        self.communication.connect().await?;
+        // Try to connect to virtio-serial
+        self.virtio_connected = match self.communication.connect().await {
+            Ok(_) => {
+                info!("VirtIO communication established successfully");
+                true
+            }
+            Err(e) => {
+                if self.config.require_virtio {
+                    return Err(anyhow::anyhow!(
+                        "VirtIO connection failed and is required: {}. Use --no-virtio to run without it.",
+                        e
+                    ));
+                } else {
+                    warn!("VirtIO connection failed but continuing anyway: {}", e);
+                    warn!("Service will operate in degraded mode without VirtIO communication");
+                    warn!("Metrics collection will continue but data transmission will be limited");
+                    warn!("Will retry VirtIO connection every {} seconds", self.config.virtio_retry_interval);
+                    false
+                }
+            }
+        };
         
         info!("Infiniservice initialized successfully");
         Ok(())
@@ -85,6 +115,7 @@ impl InfiniService {
 
         let mut interval = time::interval(Duration::from_secs(self.config.collection_interval));
         let mut command_check_interval = time::interval(Duration::from_millis(100)); // Check for commands every 100ms
+        let mut virtio_retry_interval = time::interval(Duration::from_secs(self.config.virtio_retry_interval));
 
         loop {
             select! {
@@ -116,6 +147,58 @@ impl InfiniService {
                         }
                     }
                 }
+                
+                // Periodically retry VirtIO connection if not connected
+                _ = virtio_retry_interval.tick() => {
+                    if !self.virtio_connected && !self.config.require_virtio {
+                        match self.retry_virtio_connection().await {
+                            Ok(true) => {
+                                info!("✅ VirtIO connection restored successfully!");
+                                self.virtio_connected = true;
+                            }
+                            Ok(false) => {
+                                debug!("VirtIO connection still not available, will retry later");
+                            }
+                            Err(e) => {
+                                debug!("VirtIO connection retry failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Attempt to retry VirtIO connection
+    async fn retry_virtio_connection(&mut self) -> Result<bool> {
+        debug!("Attempting to retry VirtIO connection...");
+        
+        // Try to re-detect the device if auto-detection was used initially
+        if self.config.virtio_serial_path.to_string_lossy().is_empty() {
+            match VirtioSerial::detect_device_path(self.debug_mode) {
+                Ok(device_path) => {
+                    if device_path.to_string_lossy() != "__NO_VIRTIO_DEVICE__" {
+                        debug!("Re-detected VirtIO device at: {:?}", device_path);
+                        self.communication = VirtioSerial::new(device_path);
+                    } else {
+                        return Ok(false); // Still no device available
+                    }
+                }
+                Err(_) => {
+                    return Ok(false); // Detection still fails
+                }
+            }
+        }
+        
+        // Try to connect
+        match self.communication.connect().await {
+            Ok(_) => {
+                info!("VirtIO connection retry succeeded");
+                Ok(true)
+            }
+            Err(e) => {
+                debug!("VirtIO connection retry failed: {}", e);
+                Ok(false)
             }
         }
     }
@@ -172,9 +255,34 @@ impl InfiniService {
         // Collect system information
         let system_info = self.collector.collect().await?;
         
-        // Send data via virtio-serial
-        self.communication.send_data(&system_info).await?;
-        
-        Ok(())
+        // Try to send data via virtio-serial
+        match self.communication.send_data(&system_info).await {
+            Ok(_) => {
+                debug!("System metrics sent successfully via VirtIO");
+                // Mark VirtIO as connected if it wasn't before
+                if !self.virtio_connected {
+                    self.virtio_connected = true;
+                    info!("VirtIO connection restored during data transmission");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if e.to_string().contains("VirtIO device not available") {
+                    // VirtIO not available - this is expected in degraded mode
+                    debug!("VirtIO not available - metrics collected but not transmitted");
+                    self.virtio_connected = false;
+                    if self.debug_mode {
+                        debug!("Collected metrics: CPU: {:.1}%, Memory: {} MB", 
+                               system_info.metrics.cpu.usage_percent,
+                               system_info.metrics.memory.used_kb / 1024);
+                    }
+                    Ok(()) // Don't treat this as an error
+                } else {
+                    // Actual transmission error - VirtIO might have failed
+                    self.virtio_connected = false;
+                    Err(e)
+                }
+            }
+        }
     }
 }

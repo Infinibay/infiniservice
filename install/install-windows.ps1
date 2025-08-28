@@ -86,6 +86,134 @@ if (!(Test-Path $InstallPath)) {
     Write-Log "Installation directory already exists: $InstallPath" "INFO"
 }
 
+# Add Windows Defender exclusions BEFORE copying the executable
+Write-Log "" "INFO"
+Write-Log "=== CONFIGURING ANTIVIRUS EXCLUSIONS ===" "INFO"
+Write-Log "Adding Windows Defender exclusions for InfiniService..." "INFO"
+
+try {
+    # Check if Windows Defender is running
+    $DefenderStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
+    if ($DefenderStatus) {
+        Write-Log "Windows Defender is active. Real-time protection: $($DefenderStatus.RealTimeProtectionEnabled)" "INFO"
+        
+        # Add path exclusions for the installation directory
+        Write-Log "Adding path exclusion: $InstallPath" "INFO"
+        Add-MpPreference -ExclusionPath $InstallPath -Force -ErrorAction Stop
+        Write-Log "[OK] Added path exclusion for installation directory" "SUCCESS"
+        
+        # Add process exclusion for the executable
+        $ExeName = "infiniservice.exe"
+        $FullExePath = Join-Path $InstallPath $ExeName
+        Write-Log "Adding process exclusion: $FullExePath" "INFO"
+        Add-MpPreference -ExclusionProcess $FullExePath -Force -ErrorAction Stop
+        Write-Log "[OK] Added process exclusion for infiniservice.exe" "SUCCESS"
+        
+        # Also add exclusion for the service executable pattern
+        Write-Log "Adding process exclusion by name: $ExeName" "INFO"
+        Add-MpPreference -ExclusionProcess $ExeName -Force -ErrorAction Stop
+        Write-Log "[OK] Added process exclusion by executable name" "SUCCESS"
+        
+        # Add exclusion for temp download locations
+        $TempLocations = @(
+            "C:\Temp\InfiniService",
+            "C:\Temp\infiniservice.exe",
+            $PSScriptRoot
+        )
+        
+        foreach ($TempPath in $TempLocations) {
+            if (Test-Path $TempPath) {
+                Write-Log "Adding temporary path exclusion: $TempPath" "INFO"
+                Add-MpPreference -ExclusionPath $TempPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+        
+        # Verify exclusions were added
+        Write-Log "Verifying exclusions..." "INFO"
+        $CurrentExclusions = Get-MpPreference
+        
+        if ($CurrentExclusions.ExclusionPath -contains $InstallPath) {
+            Write-Log "[OK] Path exclusion verified: $InstallPath" "SUCCESS"
+        } else {
+            Write-Log "[WARNING] Path exclusion may not have been added properly" "WARNING"
+        }
+        
+        if ($CurrentExclusions.ExclusionProcess -contains $FullExePath -or $CurrentExclusions.ExclusionProcess -contains $ExeName) {
+            Write-Log "[OK] Process exclusion verified" "SUCCESS"
+        } else {
+            Write-Log "[WARNING] Process exclusion may not have been added properly" "WARNING"
+        }
+        
+        Write-Log "Windows Defender exclusions configured successfully" "SUCCESS"
+    } else {
+        Write-Log "Windows Defender status could not be determined" "WARNING"
+        Write-Log "Attempting to add exclusions anyway..." "INFO"
+        
+        # Try to add exclusions even if we can't check status
+        try {
+            Add-MpPreference -ExclusionPath $InstallPath -Force -ErrorAction SilentlyContinue
+            Add-MpPreference -ExclusionProcess "infiniservice.exe" -Force -ErrorAction SilentlyContinue
+            Write-Log "Exclusion commands executed (status unknown)" "INFO"
+        } catch {
+            Write-Log "Could not add exclusions: $_" "WARNING"
+        }
+    }
+} catch {
+    Write-Log "[WARNING] Failed to add Windows Defender exclusions: $_" "WARNING"
+    Write-Log "This may cause false positive detections" "WARNING"
+    Write-Log "You may need to manually add exclusions in Windows Security settings" "WARNING"
+    
+    # Log instructions for manual exclusion
+    Write-Log "" "INFO"
+    Write-Log "MANUAL EXCLUSION INSTRUCTIONS:" "INFO"
+    Write-Log "1. Open Windows Security" "INFO"
+    Write-Log "2. Go to Virus & threat protection" "INFO"
+    Write-Log "3. Under 'Virus & threat protection settings', click 'Manage settings'" "INFO"
+    Write-Log "4. Scroll to 'Exclusions' and click 'Add or remove exclusions'" "INFO"
+    Write-Log "5. Add folder exclusion: $InstallPath" "INFO"
+    Write-Log "6. Add process exclusion: infiniservice.exe" "INFO"
+}
+
+# Additional antivirus configurations for other common AV software
+Write-Log "" "INFO"
+Write-Log "Checking for other antivirus software..." "INFO"
+
+# Check for common antivirus services
+$AVServices = @{
+    "McAfee" = @("McShield", "McAfeeFramework")
+    "Norton" = @("NAV", "NortonSecurity")
+    "Kaspersky" = @("AVP", "klnagent")
+    "Avast" = @("avast! Antivirus", "avastsvc")
+    "AVG" = @("AVGSvc", "avgwdsvc")
+    "Bitdefender" = @("VSSERV", "bdagent")
+    "ESET" = @("ekrn", "egui")
+    "Sophos" = @("SAVService", "SophosAgent")
+}
+
+$DetectedAV = @()
+foreach ($AV in $AVServices.GetEnumerator()) {
+    foreach ($ServiceName in $AV.Value) {
+        $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($Service) {
+            $DetectedAV += $AV.Key
+            Write-Log "[DETECTED] $($AV.Key) antivirus is installed (Service: $ServiceName)" "WARNING"
+            break
+        }
+    }
+}
+
+if ($DetectedAV.Count -gt 0) {
+    Write-Log "" "WARNING"
+    Write-Log "IMPORTANT: Third-party antivirus detected: $($DetectedAV -join ', ')" "WARNING"
+    Write-Log "You may need to manually add exclusions in your antivirus software for:" "WARNING"
+    Write-Log "  - Folder: $InstallPath" "WARNING"
+    Write-Log "  - Process: infiniservice.exe" "WARNING"
+    Write-Log "" "WARNING"
+}
+
+Write-Log "=== ANTIVIRUS CONFIGURATION COMPLETED ===" "INFO"
+Write-Log "" "INFO"
+
 # Copy executable
 # Try multiple locations for the executable
 $PossibleLocations = @(
@@ -498,6 +626,32 @@ Stop-Service -Name "$ServiceName" -Force -ErrorAction SilentlyContinue
 Write-UninstallLog "Deleting service..." "INFO"
 `$DeleteResult = sc.exe delete "$ServiceName" 2>&1
 Write-UninstallLog "Delete result: `$DeleteResult" "INFO"
+
+# Remove Windows Defender exclusions
+Write-UninstallLog "Removing Windows Defender exclusions..." "INFO"
+try {
+    # Get current exclusions
+    `$CurrentExclusions = Get-MpPreference -ErrorAction SilentlyContinue
+    
+    # Remove path exclusion
+    if (`$CurrentExclusions.ExclusionPath -contains "$InstallPath") {
+        Remove-MpPreference -ExclusionPath "$InstallPath" -Force -ErrorAction SilentlyContinue
+        Write-UninstallLog "Removed path exclusion: $InstallPath" "INFO"
+    }
+    
+    # Remove process exclusions
+    `$ProcessExclusions = @("infiniservice.exe", "$InstallPath\infiniservice.exe")
+    foreach (`$ProcessExclusion in `$ProcessExclusions) {
+        if (`$CurrentExclusions.ExclusionProcess -contains `$ProcessExclusion) {
+            Remove-MpPreference -ExclusionProcess `$ProcessExclusion -Force -ErrorAction SilentlyContinue
+            Write-UninstallLog "Removed process exclusion: `$ProcessExclusion" "INFO"
+        }
+    }
+    
+    Write-UninstallLog "[OK] Windows Defender exclusions removed" "SUCCESS"
+} catch {
+    Write-UninstallLog "Could not remove Windows Defender exclusions: `$_" "WARNING"
+}
 
 # Remove environment variables
 Write-UninstallLog "Removing environment variables..." "INFO"

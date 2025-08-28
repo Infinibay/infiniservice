@@ -140,6 +140,49 @@ impl VirtioSerial {
         Err(anyhow!("No virtio-serial device found on Linux"))
     }
 
+    /// Helper function to try opening a Windows device using CreateFileW
+    /// Returns Ok(true) if device can be opened, Ok(false) if it exists but can't be opened, Err(error_code) on error
+    #[cfg(target_os = "windows")]
+    fn try_open_windows_device(device_path: &str, debug_mode: bool) -> Result<bool, u32> {
+        use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
+        use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE};
+        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+        use winapi::um::errhandlingapi::GetLastError;
+        use std::os::windows::ffi::OsStrExt;
+        use std::ffi::OsStr;
+        
+        let wide_path: Vec<u16> = OsStr::new(device_path)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        
+        unsafe {
+            let handle = CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0, // No sharing for exclusive access
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            
+            if handle != INVALID_HANDLE_VALUE {
+                CloseHandle(handle);
+                if debug_mode {
+                    debug!("Successfully opened and verified device: {}", device_path);
+                }
+                Ok(true)
+            } else {
+                let error_code = GetLastError();
+                if debug_mode {
+                    debug!("Failed to open device {}: Win32 error {}", device_path, error_code);
+                }
+                Err(error_code)
+            }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     fn detect_windows_device(debug_mode: bool) -> Result<std::path::PathBuf> {
         use crate::windows_com::{find_virtio_com_port, enumerate_com_ports, try_open_com_port, 
@@ -165,22 +208,25 @@ impl VirtioSerial {
             }
         }
         
+        // Track fallback options in case primary methods fail
+        let mut fallback_com_ports: Vec<std::path::PathBuf> = Vec::new();
+        let mut access_denied_paths: Vec<std::path::PathBuf> = Vec::new();
+        
         // Method 1: First try VirtIO named pipes (most likely to work with proper VM config)
         if debug_mode {
             debug!("Method 1: Trying VirtIO named pipes and global objects...");
         }
         
-        // IMPORTANTE: Solo intentar paths que realmente podrían existir
-        // Intentar diferentes formatos de paths que VirtIO podría usar
+        // VirtIO paths ordered by likelihood of success
         let virtio_paths: Vec<std::path::PathBuf> = vec![
             // Global objects - try these first as they're most likely configured
             std::path::PathBuf::from("\\\\.\\Global\\org.infinibay.agent"),  // Primary Infinibay channel
             std::path::PathBuf::from("\\\\.\\Global\\org.qemu.guest_agent.0"),
             std::path::PathBuf::from("\\\\.\\Global\\com.redhat.spice.0"),
-            // Canales específicos como pipes
+            // Named pipes as alternatives
             std::path::PathBuf::from("\\\\.\\pipe\\org.infinibay.agent"),
             std::path::PathBuf::from("\\\\.\\pipe\\org.qemu.guest_agent.0"),
-            // Dispositivo VirtIO directo (sin namespace)
+            // Direct VirtIO devices (without namespace)
             std::path::PathBuf::from("\\\\.\\VirtioSerial"),
             std::path::PathBuf::from("\\\\.\\VirtioSerial0"),
         ];
@@ -192,57 +238,53 @@ impl VirtioSerial {
             
             let path_str = path.to_string_lossy();
             
-            // Los Global objects en Windows necesitan tratamiento especial
-            // NO son archivos, son objetos del kernel
+            // Global objects in Windows need special handling
+            // They are NOT files, they are kernel objects
             if path_str.contains("Global") {
-                // Para QEMU Guest Agent, intentar conectar via socket TCP local
+                // For QEMU Guest Agent, try alternative connection method
                 if path_str.contains("guest_agent") {
-                    // QEMU GA normalmente escucha en un socket local
-                    info!("Detectado QEMU Guest Agent - intentando conexión alternativa");
-                    // Por ahora, marcamos como encontrado y manejamos diferente después
+                    info!("Detected QEMU Guest Agent path - marking for alternative connection");
+                    // Mark as found but note it needs special handling
                     return Ok(path.clone());
                 }
                 
-                // Para otros Global objects, intentar con CreateFile pero con flags diferentes
-                use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
-                use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE};
-                use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-                use winapi::um::winbase::FILE_FLAG_OVERLAPPED;
-                use std::os::windows::ffi::OsStrExt;
-                use std::ffi::OsStr;
-                
-                let wide_path: Vec<u16> = OsStr::new(&*path_str)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                
-                unsafe {
-                    // Intentar abrir con diferentes combinaciones de flags
-                    let handle = CreateFileW(
-                        wide_path.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
-                        0, // Sin compartir
-                        std::ptr::null_mut(),
-                        OPEN_EXISTING,
-                        FILE_FLAG_OVERLAPPED, // Agregar flag de overlapped
-                        std::ptr::null_mut(),
-                    );
-                    
-                    if handle != INVALID_HANDLE_VALUE {
-                        CloseHandle(handle);
+                // For other Global objects, try opening with CreateFile
+                match Self::try_open_windows_device(&path_str, debug_mode) {
+                    Ok(true) => {
                         info!("✅ Found working VirtIO Global device at: {}", path.display());
                         return Ok(path.clone());  // Return immediately on success
-                    } else if debug_mode {
-                        use winapi::um::errhandlingapi::GetLastError;
-                        let error = GetLastError();
-                        debug!("Cannot open Global object {}: Win32 error {}", path.display(), error);
+                    }
+                    Ok(false) => {
+                        // Device not accessible, continue to next
+                        continue;
+                    }
+                    Err(error_code) => {
+                        if debug_mode {
+                            debug!("Cannot open Global object {}: Win32 error {}", path.display(), error_code);
+                        }
                         
-                        // Error 2 = File not found - el path no existe
-                        // Error 5 = Access denied - existe pero no tenemos permisos
-                        if error == 2 {
-                            debug!("  -> El path no existe en el sistema");
-                        } else if error == 5 {
-                            debug!("  -> Acceso denegado (puede necesitar permisos de administrador)");
+                        // Handle specific error conditions
+                        match error_code {
+                            2 => {
+                                // ERROR_FILE_NOT_FOUND - path doesn't exist
+                                if debug_mode {
+                                    debug!("  -> Path does not exist in the system");
+                                }
+                            }
+                            5 => {
+                                // ERROR_ACCESS_DENIED - exists but needs admin privileges or proper VM configuration
+                                warn!("Access denied to VirtIO Global object: {}", path.display());
+                                warn!("This may indicate:");
+                                warn!("  1. The service needs administrator privileges");
+                                warn!("  2. The VM needs proper VirtIO channel configuration");
+                                warn!("  3. Windows needs VirtIO driver reinstallation");
+                                access_denied_paths.push(path.clone());
+                            }
+                            _ => {
+                                if debug_mode {
+                                    debug!("  -> Unexpected error code: {}", error_code);
+                                }
+                            }
                         }
                     }
                 }
@@ -261,6 +303,10 @@ impl VirtioSerial {
                     Err(e) => {
                         if debug_mode {
                             debug!("Cannot open {}: {}", path.display(), e);
+                        }
+                        // Check if it's an access denied error
+                        if e.raw_os_error() == Some(5) {
+                            access_denied_paths.push(path.clone());
                         }
                     }
                 }
@@ -320,11 +366,12 @@ impl VirtioSerial {
                 // Try to open it to verify it's accessible
                 if let Err(e) = try_open_com_port(&port_info.port_name) {
                     warn!("Found VirtIO port {} but cannot open it: {}", port_info.port_name, e);
+                    // Add to fallback options instead of failing
+                    fallback_com_ports.push(port_info.device_path.clone());
                 } else {
                     info!("Successfully verified access to {}", port_info.port_name);
+                    return Ok(port_info.device_path);
                 }
-                
-                return Ok(port_info.device_path);
             }
             Err(e) => {
                 if debug_mode {
@@ -418,10 +465,13 @@ impl VirtioSerial {
             match try_open_com_port(&com_port) {
                 Ok(_) => {
                     info!("Found available COM port: {}", device_path.display());
-                    // For the first 4 COM ports, assume they might be virtio
+                    // For the first 4 COM ports, assume they might be virtio and return immediately
                     if i <= 4 {
                         warn!("Using {} as potential virtio-serial port", com_port);
                         return Ok(device_path);
+                    } else {
+                        // Add higher numbered ports as fallbacks
+                        fallback_com_ports.push(device_path);
                     }
                 }
                 Err(e) => {
@@ -460,85 +510,141 @@ impl VirtioSerial {
             }
         }
         
-        // Last resort: List all available COM ports for debugging
-        warn!("No virtio-serial device found. Available COM ports:");
-        if let Ok(ports) = enumerate_com_ports() {
-            for port in ports {
-                warn!("  - {} ({}): {}", port.port_name, port.friendly_name, port.hardware_id);
-                if debug_mode {
-                    debug!("    Full hardware ID: {}", port.hardware_id);
-                    debug!("    Can open: {:?}", try_open_com_port(&port.port_name).is_ok());
+        // Try fallback options if we found any
+        if !fallback_com_ports.is_empty() {
+            warn!("=== Attempting Fallback COM Ports ===");
+            warn!("Primary VirtIO detection failed, trying fallback options...");
+            
+            for fallback_path in &fallback_com_ports {
+                warn!("Attempting fallback: {}", fallback_path.display());
+                // Try to use the fallback path (may not work but gives user a chance)
+                if let Some(port_name) = fallback_path.file_name() {
+                    if let Some(port_str) = port_name.to_str() {
+                        if let Ok(_) = try_open_com_port(port_str) {
+                            warn!("✅ Fallback COM port {} is accessible, using it", port_str);
+                            return Ok(fallback_path.clone());
+                        }
+                    }
                 }
             }
         }
         
-        // Additional diagnostic information
+        // If access denied paths exist, suggest resolution
+        if !access_denied_paths.is_empty() {
+            warn!("=== Access Denied Paths Found ===");
+            warn!("The following VirtIO paths exist but are not accessible:");
+            for path in &access_denied_paths {
+                warn!("  - {}", path.display());
+            }
+            warn!("This suggests the VirtIO devices are present but need:");
+            warn!("  1. Administrator privileges to access");
+            warn!("  2. Proper VM configuration with channel names");
+            warn!("  3. VirtIO driver reinstallation or configuration");
+            warn!("");
+        }
+
+        // Last resort: List all available COM ports for debugging
+        warn!("=== Available COM Ports (for debugging) ===");
+        if let Ok(ports) = enumerate_com_ports() {
+            if ports.is_empty() {
+                warn!("No COM ports found on the system");
+            } else {
+                for port in ports {
+                    warn!("  - {} ({}): {}", port.port_name, port.friendly_name, port.hardware_id);
+                    if debug_mode {
+                        debug!("    Full hardware ID: {}", port.hardware_id);
+                        debug!("    Can open: {:?}", try_open_com_port(&port.port_name).is_ok());
+                    }
+                }
+            }
+        }
+        
+        // Enhanced diagnostic information
         warn!("=== VirtIO Device Detection Summary ===");
-        warn!("No accessible VirtIO serial device found.");
+        warn!("No directly accessible VirtIO serial device found.");
         warn!("");
-        warn!("Based on your Device Manager screenshot, the VirtIO Serial Driver IS installed");
-        warn!("(Device: PCI\\VEN_1AF4&DEV_1043&SUBSYS_11001AF4&REV_01)");
+        warn!("Based on typical configurations, the VirtIO Serial Driver may be installed");
+        warn!("but requires additional configuration. This can happen when:");
         warn!("");
-        warn!("However, this device is not appearing as a COM port.");
-        warn!("This can happen when:");
-        warn!("1. The VirtIO serial device is configured but not exposed as a COM port");
-        warn!("2. The device needs a specific channel name configured in the VM XML");
-        warn!("3. Windows needs additional configuration to expose the device");
+        warn!("🔧 Configuration Issues:");
+        warn!("  1. VM XML missing virtio-serial channel configuration");
+        warn!("  2. Channel name mismatch (should be 'org.infinibay.agent' or similar)");
+        warn!("  3. VirtIO device not exposed as accessible COM port");
         warn!("");
-        warn!("To fix this issue:");
-        warn!("1. Check the VM configuration for the virtio-serial channel name");
-        warn!("2. Ensure the channel has target type='virtio' and name='org.infinibay.agent'");
-        warn!("3. Try reinstalling the VirtIO serial driver with the latest version");
-        warn!("4. Check if the device appears under Ports (COM & LPT) after driver reinstall");
+        warn!("🔐 Permission Issues:");
+        warn!("  4. Service needs administrator privileges");
+        warn!("  5. Windows security policies blocking device access");
         warn!("");
-        warn!("You can also try manually specifying the device path with --device flag");
+        warn!("🔨 Driver Issues:");
+        warn!("  6. VirtIO driver needs reinstallation");
+        warn!("  7. Missing or outdated VirtIO guest tools");
+        warn!("");
+        warn!("💡 Solutions to try:");
+        warn!("  • Run the service as Administrator");
+        warn!("  • Check VM configuration for virtio-serial channels");
+        warn!("  • Reinstall VirtIO drivers from latest ISO");
+        warn!("  • Use --device flag to manually specify device path");
+        warn!("  • Enable debug mode with --debug for more details");
+        
+        // Don't completely fail - return a warning result that allows the service to continue
+        // This allows the service to start and retry periodically
+        warn!("");
+        warn!("⚠️  CONTINUING WITHOUT VIRTIO - Service will retry periodically");
+        warn!("The service will continue running and attempt to reconnect every few minutes.");
+        warn!("Some features may be limited without VirtIO communication.");
         warn!("========================================");
         
-        Err(anyhow!("No accessible virtio-serial device found. See log output above for diagnostic information."))
+        // Return a "mock" path that indicates no VirtIO found but allows service to continue
+        Ok(std::path::PathBuf::from("__NO_VIRTIO_DEVICE__"))
     }
     
     /// Initialize connection to virtio-serial device
     pub async fn connect(&self) -> Result<()> {
+        let path_str = self.device_path.to_string_lossy();
+        
+        // Check if this is the special "no device" marker
+        if path_str == "__NO_VIRTIO_DEVICE__" {
+            warn!("VirtIO device not available - operating in degraded mode");
+            warn!("Some communication features will be limited");
+            return Err(anyhow!("VirtIO device not available"));
+        }
+        
         info!("Connecting to virtio-serial device: {}", self.device_path.display());
 
         // Test if we can open the device for writing
         #[cfg(target_os = "windows")]
         {
-            let path_str = self.device_path.to_string_lossy();
-            
             // Check device type and handle accordingly
             if path_str.contains("Global") {
                 // Test if we can actually open the Global object
-                use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
-                use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE};
-                use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-                use std::os::windows::ffi::OsStrExt;
-                use std::ffi::OsStr;
-                
-                let wide_path: Vec<u16> = OsStr::new(&*path_str)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                
-                unsafe {
-                    let handle = CreateFileW(
-                        wide_path.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                        std::ptr::null_mut(),
-                        OPEN_EXISTING,
-                        0,
-                        std::ptr::null_mut(),
-                    );
-                    
-                    if handle == INVALID_HANDLE_VALUE {
-                        use winapi::um::errhandlingapi::GetLastError;
-                        let error = GetLastError();
-                        return Err(anyhow!("Failed to open Global object {}: Win32 error {}", path_str, error));
+                match Self::try_open_windows_device(&path_str, false) {
+                    Ok(true) => {
+                        // Device is accessible
                     }
-                    
-                    // Close the test handle
-                    CloseHandle(handle);
+                    Ok(false) => {
+                        return Err(anyhow!("VirtIO Global object exists but cannot be opened: {}. Check permissions and VM configuration.", path_str));
+                    }
+                    Err(error_code) => {
+                        // Provide specific guidance based on error code
+                        match error_code {
+                            5 => {
+                                warn!("Access denied to VirtIO Global object: {}", path_str);
+                                warn!("This typically means:");
+                                warn!("  1. The service needs to run as Administrator");
+                                warn!("  2. The VirtIO device needs proper VM configuration");
+                                warn!("  3. Windows security policies are blocking access");
+                                return Err(anyhow!("Access denied to VirtIO Global object (Win32 error 5). Try running as Administrator or check VM configuration."));
+                            }
+                            2 => {
+                                warn!("VirtIO Global object not found: {}", path_str);
+                                warn!("This may indicate the VM configuration is incomplete or the device path has changed.");
+                                return Err(anyhow!("VirtIO Global object not found (Win32 error 2). Check VM virtio-serial configuration."));
+                            }
+                            _ => {
+                                return Err(anyhow!("Failed to open VirtIO Global object {}: Win32 error {}. Check VM configuration and driver installation.", path_str, error_code));
+                            }
+                        }
+                    }
                 }
                 
                 debug!("Global VirtIO device verified: {}", path_str);
@@ -549,38 +655,58 @@ impl VirtioSerial {
                 use std::os::windows::fs::OpenOptionsExt;
                 use winapi::um::winbase::FILE_FLAG_OVERLAPPED;
                 
-                let _file = OpenOptions::new()
+                match OpenOptions::new()
                     .write(true)
                     .read(true)
                     .custom_flags(FILE_FLAG_OVERLAPPED)
                     .open(&self.device_path)
-                    .with_context(|| format!("Failed to open COM port: {}", self.device_path.display()))?;
-                
-                info!("COM port connection established successfully");
+                {
+                    Ok(_) => {
+                        info!("COM port connection established successfully");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if let Some(5) = e.raw_os_error() {
+                            warn!("Access denied to COM port: {}", self.device_path.display());
+                            warn!("Try running as Administrator or check if another application is using the port");
+                        }
+                        return Err(anyhow!("Failed to open COM port {}: {}. Check if port is available and accessible.", self.device_path.display(), e));
+                    }
+                }
             } else {
                 // It's a named pipe or other device
-                let _file = OpenOptions::new()
+                match OpenOptions::new()
                     .write(true)
                     .read(true)
                     .open(&self.device_path)
-                    .with_context(|| format!("Failed to open device: {}", self.device_path.display()))?;
-                
-                info!("Device connection established successfully");
+                {
+                    Ok(_) => {
+                        info!("Device connection established successfully");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("Failed to open device {}: {}. Check device availability and permissions.", self.device_path.display(), e));
+                    }
+                }
             }
         }
         
         #[cfg(not(target_os = "windows"))]
         {
-            let _file = OpenOptions::new()
+            match OpenOptions::new()
                 .write(true)
                 .read(true)
                 .open(&self.device_path)
-                .with_context(|| format!("Failed to open virtio-serial device: {}", self.device_path.display()))?;
-
-            info!("Virtio-serial connection established successfully");
+            {
+                Ok(_) => {
+                    info!("Virtio-serial connection established successfully");
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(anyhow!("Failed to open virtio-serial device {}: {}. Check device permissions and availability.", self.device_path.display(), e));
+                }
+            }
         }
-        
-        Ok(())
     }
 
     
@@ -624,11 +750,19 @@ impl VirtioSerial {
     
     /// Send raw message to the device
     async fn send_raw_message(&self, message: &str) -> Result<()> {
+        let path_str = self.device_path.to_string_lossy();
+        
+        // Check if VirtIO is available
+        if path_str == "__NO_VIRTIO_DEVICE__" {
+            debug!("VirtIO not available - message not sent: {}", message);
+            return Err(anyhow!("VirtIO device not available for communication"));
+        }
+        
         // Open device and send data
         #[cfg(target_os = "windows")]
         let mut file = {
             use std::os::windows::fs::OpenOptionsExt;
-            let path_str = self.device_path.to_string_lossy();
+            
             if path_str.contains("COM") && !path_str.contains("pipe") {
                 // COM port - no special flags needed for synchronous write
                 OpenOptions::new()
@@ -661,13 +795,20 @@ impl VirtioSerial {
     
     /// Read incoming commands from the device
     pub async fn read_command(&self) -> Result<Option<IncomingMessage>> {
+        let path_str = self.device_path.to_string_lossy();
+        
+        // Check if VirtIO is available
+        if path_str == "__NO_VIRTIO_DEVICE__" {
+            // Don't spam debug logs when VirtIO is not available
+            return Ok(None);
+        }
+        
         debug!("Attempting to read command from virtio-serial");
         
         // Open device for reading
         #[cfg(target_os = "windows")]
         let file = {
             use std::os::windows::fs::OpenOptionsExt;
-            let path_str = self.device_path.to_string_lossy();
             if path_str.contains("COM") && !path_str.contains("pipe") {
                 OpenOptions::new()
                     .read(true)
@@ -740,40 +881,21 @@ impl VirtioSerial {
 
     /// Check if virtio-serial device is available
     pub fn is_available(&self) -> bool {
+        let path_str = self.device_path.to_string_lossy();
+        
+        // Check if this is the special "no device" marker
+        if path_str == "__NO_VIRTIO_DEVICE__" {
+            return false;
+        }
+        
         #[cfg(target_os = "windows")]
         {
-            let path_str = self.device_path.to_string_lossy();
-            
             // Global objects need special handling - they're not files
             if path_str.contains("Global") {
                 // Try to open it to check availability
-                use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
-                use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE};
-                use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-                use std::os::windows::ffi::OsStrExt;
-                use std::ffi::OsStr;
-                
-                let wide_path: Vec<u16> = OsStr::new(&*path_str)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                
-                unsafe {
-                    let handle = CreateFileW(
-                        wide_path.as_ptr(),
-                        GENERIC_READ | GENERIC_WRITE,
-                        0,
-                        std::ptr::null_mut(),
-                        OPEN_EXISTING,
-                        0,
-                        std::ptr::null_mut(),
-                    );
-                    
-                    if handle != INVALID_HANDLE_VALUE {
-                        CloseHandle(handle);
-                        return true;
-                    }
-                    return false;
+                match Self::try_open_windows_device(&path_str, false) {
+                    Ok(true) => return true,
+                    Ok(false) | Err(_) => return false,
                 }
             }
         }

@@ -69,15 +69,20 @@ async fn main() -> anyhow::Result<()> {
         println!("  --debug           Enable debug logging");
         println!("  --diagnose, --diag  Run VirtIO device diagnostics (Windows)");
         println!("  --device <path>   Manually specify device path");
+        println!("  --require-virtio  Require VirtIO device to run (exit if not found)");
+        println!("  --no-virtio       Allow service to run without VirtIO device");
         println!("\nEnvironment Variables:");
         println!("  INFINIBAY_VM_ID=<id>          Set VM identifier");
         println!("  INFINISERVICE_DEVICE=<path>   Manually specify device path");
+        println!("  INFINISERVICE_REQUIRE_VIRTIO=<true|false>  Require VirtIO device");
         println!("  RUST_LOG=<level>              Set log level (error|warn|info|debug)");
         return Ok(());
     }
     
     let debug_mode = args.contains(&"--debug".to_string());
     let diagnose_mode = args.contains(&"--diagnose".to_string()) || args.contains(&"--diag".to_string());
+    let require_virtio = args.contains(&"--require-virtio".to_string());
+    let no_virtio = args.contains(&"--no-virtio".to_string());
     
     // Parse --device parameter
     let mut device_path_override: Option<String> = None;
@@ -96,6 +101,19 @@ async fn main() -> anyhow::Result<()> {
             info!("Device path override from environment: {}", path);
         }
     }
+    
+    // Determine VirtIO requirement setting
+    let virtio_required = if require_virtio {
+        true
+    } else if no_virtio {
+        false
+    } else {
+        // Check environment variable
+        env::var("INFINISERVICE_REQUIRE_VIRTIO")
+            .unwrap_or_default()
+            .parse::<bool>()
+            .unwrap_or(false) // Default to not required
+    };
     
     // Initialize logging with debug level if --debug flag is present
     if debug_mode {
@@ -183,10 +201,20 @@ async fn main() -> anyhow::Result<()> {
         info!("Using device path override: {}", device_path);
     }
     
+    // Apply VirtIO requirement setting
+    config.require_virtio = virtio_required;
+    if config.require_virtio {
+        info!("VirtIO device is REQUIRED - service will exit if not found");
+    } else {
+        info!("VirtIO device is optional - service will continue without it if needed");
+    }
+    
     if debug_mode {
         debug!("Full configuration:");
         debug!("  Collection interval: {}s", config.collection_interval);
         debug!("  Virtio serial path: {:?}", config.virtio_serial_path);
+        debug!("  VirtIO required: {}", config.require_virtio);
+        debug!("  VirtIO retry interval: {}s", config.virtio_retry_interval);
         debug!("  System: {}", std::env::consts::OS);
         debug!("  Architecture: {}", std::env::consts::ARCH);
     }

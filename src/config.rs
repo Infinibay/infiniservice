@@ -17,6 +17,13 @@ pub struct Config {
     
     /// Service name/identifier
     pub service_name: String,
+    
+    /// Whether VirtIO is required for the service to run
+    /// If false, the service will continue running even without VirtIO
+    pub require_virtio: bool,
+    
+    /// Interval for retrying VirtIO connection (in seconds)
+    pub virtio_retry_interval: u64,
 }
 
 impl Default for Config {
@@ -31,6 +38,8 @@ impl Default for Config {
             },
             log_level: "info".to_string(),
             service_name: "infiniservice".to_string(),
+            require_virtio: false, // Allow service to run without VirtIO by default
+            virtio_retry_interval: 300, // Retry every 5 minutes
         }
     }
 }
