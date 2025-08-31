@@ -16,6 +16,12 @@ pub mod service_control;
 pub mod package_management;
 pub mod process_control;
 
+// Auto-check modules
+pub mod autochecks;
+pub mod windows_updates;
+pub mod windows_defender;
+pub mod application_inventory;
+
 /// Incoming message types from the host
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
@@ -94,6 +100,39 @@ pub enum SafeCommandType {
     // System information
     SystemInfo,
     OsInfo,
+    
+    // Auto-check commands (Windows-specific mostly)
+    CheckWindowsUpdates,
+    GetUpdateHistory { days: Option<u32> },
+    GetPendingUpdates,
+    
+    // Windows Defender commands
+    CheckWindowsDefender,
+    GetDefenderStatus,
+    RunDefenderQuickScan,
+    GetThreatHistory,
+    
+    // Application Inventory commands
+    GetInstalledApplicationsWMI,
+    CheckApplicationUpdates,
+    GetApplicationDetails { app_id: String },
+    
+    // Health check commands
+    CheckDiskSpace { 
+        warning_threshold: Option<f32>,
+        critical_threshold: Option<f32>
+    },
+    CheckResourceOptimization {
+        evaluation_window_days: Option<u32>
+    },
+    RunHealthCheck { check_name: String },
+    RunAllHealthChecks,
+    
+    // Disk cleanup operations
+    DiskCleanup {
+        drive: String,
+        targets: Vec<String>
+    },
 }
 
 /// Service control parameters

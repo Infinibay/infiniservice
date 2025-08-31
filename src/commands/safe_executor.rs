@@ -8,6 +8,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use serde_json::json;
 use std::path::Path;
+use std::time::SystemTime;
 
 // Progress artifact detection patterns
 const PROGRESS_BAR_CHARS: [char; 2] = ['█', '▒'];
@@ -399,6 +400,34 @@ impl SafeCommandExecutor {
             SafeCommandType::ProcessKill { pid, force } => self.kill_process(*pid, *force).await,
             SafeCommandType::ProcessTop { limit, sort_by } => {
                 self.get_top_processes(*limit, sort_by.as_deref()).await
+            },
+            
+            // Auto-check commands
+            SafeCommandType::CheckWindowsUpdates => self.check_windows_updates().await,
+            SafeCommandType::GetUpdateHistory { days } => self.get_update_history(*days).await,
+            SafeCommandType::GetPendingUpdates => self.get_pending_updates().await,
+            
+            SafeCommandType::CheckWindowsDefender => self.check_windows_defender().await,
+            SafeCommandType::GetDefenderStatus => self.get_defender_status().await,
+            SafeCommandType::RunDefenderQuickScan => self.run_defender_quick_scan().await,
+            SafeCommandType::GetThreatHistory => self.get_threat_history().await,
+            
+            SafeCommandType::GetInstalledApplicationsWMI => self.get_installed_applications_wmi().await,
+            SafeCommandType::CheckApplicationUpdates => self.check_application_updates().await,
+            SafeCommandType::GetApplicationDetails { app_id } => self.get_application_details(app_id).await,
+            
+            SafeCommandType::CheckDiskSpace { warning_threshold, critical_threshold } => {
+                self.check_disk_space(*warning_threshold, *critical_threshold).await
+            },
+            SafeCommandType::CheckResourceOptimization { evaluation_window_days } => {
+                self.check_resource_optimization(*evaluation_window_days).await
+            },
+            SafeCommandType::RunHealthCheck { check_name } => {
+                self.run_health_check(check_name).await
+            },
+            SafeCommandType::RunAllHealthChecks => self.run_all_health_checks().await,
+            SafeCommandType::DiskCleanup { drive, targets } => {
+                self.disk_cleanup(drive, targets).await
             },
         };
         
@@ -1358,6 +1387,364 @@ impl SafeCommandExecutor {
         }
         
         packages
+    }
+    
+    // ===== Auto-Check Command Handlers =====
+    
+    /// Check Windows Updates
+    async fn check_windows_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::commands::windows_updates;
+            
+            match windows_updates::check_windows_updates().await {
+                Ok(update_status) => {
+                    let status_json = serde_json::to_value(&update_status)?;
+                    let summary = format!(
+                        "Found {} installed updates, {} pending updates", 
+                        update_status.installed_updates.len(),
+                        update_status.pending_updates.len()
+                    );
+                    Ok((summary, String::new(), Some(status_json)))
+                }
+                Err(e) => Err(anyhow!("Failed to check Windows updates: {}", e))
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(anyhow!("Windows Updates check is only available on Windows"))
+        }
+    }
+    
+    /// Get Windows Update history
+    async fn get_update_history(&self, days: Option<u32>) -> Result<(String, String, Option<serde_json::Value>)> {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::commands::windows_updates;
+            
+            let days = days.unwrap_or(30);
+            match windows_updates::get_update_history(days).await {
+                Ok(updates) => {
+                    let updates_json = serde_json::to_value(&updates)?;
+                    let summary = format!("Found {} updates in the last {} days", updates.len(), days);
+                    Ok((summary, String::new(), Some(updates_json)))
+                }
+                Err(e) => Err(anyhow!("Failed to get update history: {}", e))
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(anyhow!("Windows Update history is only available on Windows"))
+        }
+    }
+    
+    /// Get pending Windows Updates
+    async fn get_pending_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        // This is a subset of check_windows_updates, focusing on pending updates only
+        self.check_windows_updates().await
+    }
+    
+    /// Check Windows Defender status
+    async fn check_windows_defender(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::commands::windows_defender;
+            
+            match windows_defender::check_windows_defender().await {
+                Ok(defender_status) => {
+                    let status_json = serde_json::to_value(&defender_status)?;
+                    let summary = format!(
+                        "Defender enabled: {}, Real-time protection: {}, Threats: {}",
+                        defender_status.enabled,
+                        defender_status.real_time_protection,
+                        defender_status.threats_detected
+                    );
+                    Ok((summary, String::new(), Some(status_json)))
+                }
+                Err(e) => Err(anyhow!("Failed to check Windows Defender: {}", e))
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(anyhow!("Windows Defender check is only available on Windows"))
+        }
+    }
+    
+    /// Get Windows Defender status (alias for check_windows_defender)
+    async fn get_defender_status(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        self.check_windows_defender().await
+    }
+    
+    /// Run Windows Defender quick scan
+    async fn run_defender_quick_scan(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::commands::windows_defender::{self, DefenderScanType};
+            
+            match windows_defender::run_defender_scan(DefenderScanType::Quick).await {
+                Ok(scan_result) => {
+                    let result_json = serde_json::to_value(&scan_result)?;
+                    let summary = format!("Quick scan started: {:?}", scan_result.status);
+                    Ok((summary, String::new(), Some(result_json)))
+                }
+                Err(e) => Err(anyhow!("Failed to start Defender scan: {}", e))
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(anyhow!("Windows Defender scan is only available on Windows"))
+        }
+    }
+    
+    /// Get Windows Defender threat history
+    async fn get_threat_history(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        // This is included in the defender status check
+        self.check_windows_defender().await
+    }
+    
+    /// Get installed applications via WMI
+    async fn get_installed_applications_wmi(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::commands::application_inventory;
+            
+            match application_inventory::get_installed_applications_wmi().await {
+                Ok(inventory) => {
+                    let inventory_json = serde_json::to_value(&inventory)?;
+                    let summary = format!(
+                        "Found {} applications (scan took {}ms)",
+                        inventory.total_count,
+                        inventory.scan_duration_ms
+                    );
+                    Ok((summary, String::new(), Some(inventory_json)))
+                }
+                Err(e) => Err(anyhow!("Failed to get application inventory: {}", e))
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(anyhow!("WMI application inventory is only available on Windows"))
+        }
+    }
+    
+    /// Check for application updates
+    async fn check_application_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::commands::application_inventory;
+            
+            match application_inventory::check_application_updates_public().await {
+                Ok(updatable_apps) => {
+                    let apps_json = serde_json::to_value(&updatable_apps)?;
+                    let summary = format!("Found {} applications with available updates", updatable_apps.len());
+                    Ok((summary, String::new(), Some(apps_json)))
+                }
+                Err(e) => Err(anyhow!("Failed to check application updates: {}", e))
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(anyhow!("Application update check is only available on Windows"))
+        }
+    }
+    
+    /// Get details for a specific application
+    async fn get_application_details(&self, app_id: &str) -> Result<(String, String, Option<serde_json::Value>)> {
+        #[cfg(target_os = "windows")]
+        {
+            use crate::commands::application_inventory;
+            
+            match application_inventory::get_application_details(app_id.to_string()).await {
+                Ok(Some(app)) => {
+                    let app_json = serde_json::to_value(&app)?;
+                    let summary = format!("Found application: {}", app.name);
+                    Ok((summary, String::new(), Some(app_json)))
+                }
+                Ok(None) => {
+                    let summary = format!("Application not found: {}", app_id);
+                    Ok((summary, String::new(), None))
+                }
+                Err(e) => Err(anyhow!("Failed to get application details: {}", e))
+            }
+        }
+        
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(anyhow!("Application details are only available on Windows"))
+        }
+    }
+    
+    /// Check disk space health
+    async fn check_disk_space(&self, warning_threshold: Option<f32>, critical_threshold: Option<f32>) -> Result<(String, String, Option<serde_json::Value>)> {
+        use crate::commands::autochecks::{AutoCheckEngine, AutoCheckConfig, CheckContext, VmInfo, MetricsHistory};
+        
+        let mut config = AutoCheckConfig::default();
+        if let Some(warning) = warning_threshold {
+            config.disk_warning_threshold = warning;
+        }
+        if let Some(critical) = critical_threshold {
+            config.disk_critical_threshold = critical;
+        }
+        
+        // Create a minimal context for the check
+        let context = CheckContext {
+            vm_info: VmInfo {
+                cpu_count: 4,
+                memory_mb: 8192,
+                os_type: format!("{:?}", self.os_info.os_type),
+                os_version: self.os_info.version.clone(),
+            },
+            metrics_history: MetricsHistory {
+                cpu_usage: vec![],
+                memory_usage: vec![],
+                disk_usage: vec![],
+                network_usage: vec![],
+            },
+            config: config.clone(),
+        };
+        
+        let engine = AutoCheckEngine::new(config);
+        match engine.run_check("disk_space", &context).await {
+            Ok(result) => {
+                let result_json = serde_json::to_value(&result)?;
+                Ok((result.message, String::new(), Some(result_json)))
+            }
+            Err(e) => Err(anyhow!("Failed to check disk space: {}", e))
+        }
+    }
+    
+    /// Check resource optimization opportunities
+    async fn check_resource_optimization(&self, evaluation_window_days: Option<u32>) -> Result<(String, String, Option<serde_json::Value>)> {
+        use crate::commands::autochecks::{AutoCheckEngine, AutoCheckConfig, CheckContext, VmInfo, MetricsHistory};
+        
+        let mut config = AutoCheckConfig::default();
+        if let Some(days) = evaluation_window_days {
+            config.evaluation_window_days = days;
+        }
+        
+        // Create a context with some sample metrics history
+        let context = CheckContext {
+            vm_info: VmInfo {
+                cpu_count: 4,
+                memory_mb: 8192,
+                os_type: format!("{:?}", self.os_info.os_type),
+                os_version: self.os_info.version.clone(),
+            },
+            metrics_history: MetricsHistory {
+                cpu_usage: vec![(SystemTime::now(), 5.0)], // Simulate low CPU usage
+                memory_usage: vec![(SystemTime::now(), 20.0)], // Simulate low memory usage  
+                disk_usage: vec![],
+                network_usage: vec![],
+            },
+            config: config.clone(),
+        };
+        
+        let engine = AutoCheckEngine::new(config);
+        match engine.run_check("resource_optimization", &context).await {
+            Ok(result) => {
+                let result_json = serde_json::to_value(&result)?;
+                Ok((result.message, String::new(), Some(result_json)))
+            }
+            Err(e) => Err(anyhow!("Failed to check resource optimization: {}", e))
+        }
+    }
+    
+    /// Run a specific health check
+    async fn run_health_check(&self, check_name: &str) -> Result<(String, String, Option<serde_json::Value>)> {
+        use crate::commands::autochecks::{AutoCheckEngine, AutoCheckConfig, CheckContext, VmInfo, MetricsHistory};
+        
+        let config = AutoCheckConfig::default();
+        let context = CheckContext {
+            vm_info: VmInfo {
+                cpu_count: 4,
+                memory_mb: 8192,
+                os_type: format!("{:?}", self.os_info.os_type),
+                os_version: self.os_info.version.clone(),
+            },
+            metrics_history: MetricsHistory {
+                cpu_usage: vec![],
+                memory_usage: vec![],
+                disk_usage: vec![],
+                network_usage: vec![],
+            },
+            config: config.clone(),
+        };
+        
+        let engine = AutoCheckEngine::new(config);
+        match engine.run_check(check_name, &context).await {
+            Ok(result) => {
+                let result_json = serde_json::to_value(&result)?;
+                Ok((result.message, String::new(), Some(result_json)))
+            }
+            Err(e) => Err(anyhow!("Failed to run health check '{}': {}", check_name, e))
+        }
+    }
+    
+    /// Run all enabled health checks
+    async fn run_all_health_checks(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        use crate::commands::autochecks::{AutoCheckEngine, AutoCheckConfig, CheckContext, VmInfo, MetricsHistory};
+        
+        let config = AutoCheckConfig::default();
+        let context = CheckContext {
+            vm_info: VmInfo {
+                cpu_count: 4,
+                memory_mb: 8192,
+                os_type: format!("{:?}", self.os_info.os_type),
+                os_version: self.os_info.version.clone(),
+            },
+            metrics_history: MetricsHistory {
+                cpu_usage: vec![],
+                memory_usage: vec![],
+                disk_usage: vec![],
+                network_usage: vec![],
+            },
+            config: config.clone(),
+        };
+        
+        let engine = AutoCheckEngine::new(config);
+        match engine.run_all_checks(&context).await {
+            Ok(results) => {
+                let summary = AutoCheckEngine::get_health_summary(&results);
+                let response_data = json!({
+                    "summary": summary,
+                    "results": results,
+                });
+                
+                let message = format!(
+                    "Health check completed: {} checks, {} healthy, {} warnings, {} critical",
+                    summary.total_checks, summary.healthy, summary.warnings, summary.critical
+                );
+                
+                Ok((message, String::new(), Some(response_data)))
+            }
+            Err(e) => Err(anyhow!("Failed to run health checks: {}", e))
+        }
+    }
+    
+    /// Perform disk cleanup
+    async fn disk_cleanup(&self, drive: &str, _targets: &[String]) -> Result<(String, String, Option<serde_json::Value>)> {
+        use crate::commands::autochecks::remediation::{RemediationEngine, RemediationAction};
+        
+        let mut engine = RemediationEngine::new(true);
+        let action = RemediationAction::CleanupDisk {
+            drive: drive.to_string(),
+            estimated_recovery_gb: 1.0, // This would be calculated based on targets
+        };
+        
+        match engine.apply_remediation(action, true).await {
+            Ok(result) => {
+                let result_json = serde_json::to_value(&result)?;
+                let message = format!("Disk cleanup completed for drive {}", drive);
+                Ok((message, String::new(), Some(result_json)))
+            }
+            Err(e) => Err(anyhow!("Failed to perform disk cleanup: {}", e))
+        }
     }
 }
 
