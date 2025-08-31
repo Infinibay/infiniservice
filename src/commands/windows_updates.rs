@@ -9,9 +9,9 @@ use std::time::SystemTime;
 use log::{debug, warn, info};
 
 #[cfg(target_os = "windows")]
-use wmi::{COMLibrary, WMIConnection, Variant};
+use wmi::{COMLibrary, WMIConnection};
 #[cfg(target_os = "windows")]
-use windows::core::*;
+use windows::core::BSTR;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::UpdateAgent::*;
 #[cfg(target_os = "windows")]
@@ -64,42 +64,49 @@ pub struct UpdateStatus {
 /// Check Windows Updates using WMI and COM API
 #[cfg(target_os = "windows")]
 pub async fn check_windows_updates() -> Result<UpdateStatus> {
-    let com_lib = COMLibrary::new()
-        .context("Failed to initialize COM library")?;
-    
-    let wmi_conn = WMIConnection::new(com_lib.clone())
-        .context("Failed to create WMI connection")?;
-    
     info!("Checking Windows Updates via WMI and COM API");
     
-    // Query installed updates via WMI
-    let installed_updates = get_installed_updates(&wmi_conn).await
-        .unwrap_or_else(|e| {
-            warn!("Failed to get installed updates: {}", e);
-            Vec::new()
-        });
+    // Collect all WMI data in a separate scope
+    let (installed_updates, update_agent_version, reboot_required, automatic_updates_enabled) = {
+        let com_lib = COMLibrary::new()
+            .context("Failed to initialize COM library")?;
+        
+        let wmi_conn = WMIConnection::new(com_lib.clone())
+            .context("Failed to create WMI connection")?;
+        
+        // Query installed updates via WMI
+        let installed_updates = get_installed_updates(&wmi_conn)
+            .unwrap_or_else(|e| {
+                warn!("Failed to get installed updates: {}", e);
+                Vec::new()
+            });
+        
+        // Query Windows Update Agent status
+        let update_agent_version = get_update_agent_version(&wmi_conn)
+            .unwrap_or_else(|e| {
+                warn!("Failed to get update agent version: {}", e);
+                None
+            });
+        
+        // Check if reboot is required
+        let reboot_required = check_reboot_required(&wmi_conn)
+            .unwrap_or(false);
+        
+        // Check automatic updates setting
+        let automatic_updates_enabled = check_automatic_updates(&wmi_conn)
+            .unwrap_or(false);
+        
+        // Return all data before scope ends, dropping com_lib and wmi_conn
+        (installed_updates, update_agent_version, reboot_required, automatic_updates_enabled)
+    };
     
-    // Query Windows Update Agent status
-    let update_agent_version = get_update_agent_version(&wmi_conn).await
-        .unwrap_or_else(|e| {
-            warn!("Failed to get update agent version: {}", e);
-            None
-        });
-    
+    // Now do async operations - com_lib and wmi_conn are out of scope
     // Check for pending updates using COM interface
     let pending_updates = check_pending_updates_com().await
         .unwrap_or_else(|e| {
             warn!("Failed to check pending updates: {}", e);
             Vec::new()
         });
-    
-    // Check if reboot is required
-    let reboot_required = check_reboot_required(&wmi_conn).await
-        .unwrap_or(false);
-    
-    // Check automatic updates setting
-    let automatic_updates_enabled = check_automatic_updates(&wmi_conn).await
-        .unwrap_or(false);
     
     Ok(UpdateStatus {
         installed_updates,
@@ -113,7 +120,7 @@ pub async fn check_windows_updates() -> Result<UpdateStatus> {
 
 /// Get installed updates from Win32_QuickFixEngineering
 #[cfg(target_os = "windows")]
-async fn get_installed_updates(wmi_conn: &WMIConnection) -> Result<Vec<WindowsUpdate>> {
+fn get_installed_updates(wmi_conn: &WMIConnection) -> Result<Vec<WindowsUpdate>> {
     debug!("Querying installed Windows updates");
     
     let updates: Vec<WindowsUpdate> = wmi_conn
@@ -126,7 +133,7 @@ async fn get_installed_updates(wmi_conn: &WMIConnection) -> Result<Vec<WindowsUp
 
 /// Get Windows Update Agent version
 #[cfg(target_os = "windows")]
-async fn get_update_agent_version(wmi_conn: &WMIConnection) -> Result<Option<String>> {
+fn get_update_agent_version(wmi_conn: &WMIConnection) -> Result<Option<String>> {
     debug!("Querying Windows Update Agent version");
     
     let versions: Vec<UpdateAgentStatus> = wmi_conn
@@ -143,42 +150,45 @@ async fn check_pending_updates_com() -> Result<Vec<PendingUpdate>> {
     
     unsafe {
         // Initialize COM
-        CoInitializeEx(None, COINIT_MULTITHREADED)
-            .context("Failed to initialize COM")?;
+        let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if hr.is_err() {
+            return Err(anyhow!("Failed to initialize COM: {:?}", hr));
+        }
         
         // Create Update Session
         let update_session: IUpdateSession = CoCreateInstance(
             &UpdateSession,
             None,
             CLSCTX_INPROC_SERVER,
-        ).context("Failed to create UpdateSession")?;
+        ).map_err(|e| anyhow!("Failed to create UpdateSession: {:?}", e))?;
         
         // Create Update Searcher
         let searcher = update_session.CreateUpdateSearcher()
-            .context("Failed to create UpdateSearcher")?;
+            .map_err(|e| anyhow!("Failed to create UpdateSearcher: {:?}", e))?;
         
         // Search for updates that are not installed
-        let search_result = searcher.Search(w!("IsInstalled=0 and Type='Software'"))
-            .context("Failed to search for updates")?;
+        let search_criteria = BSTR::from("IsInstalled=0 and Type='Software'");
+        let search_result = searcher.Search(&search_criteria)
+            .map_err(|e| anyhow!("Failed to search for updates: {:?}", e))?;
         
         let updates = search_result.Updates()
-            .context("Failed to get updates collection")?;
+            .map_err(|e| anyhow!("Failed to get updates collection: {:?}", e))?;
         
         let count = updates.Count()
-            .context("Failed to get updates count")?;
+            .map_err(|e| anyhow!("Failed to get updates count: {:?}", e))?;
         
         info!("Found {} pending updates", count);
         
         let mut pending = Vec::new();
         
         for i in 0..count {
-            match updates.Item(i) {
+            match updates.get_Item(i) {
                 Ok(update) => {
                     let title = update.Title()
                         .map(|s| s.to_string())
                         .unwrap_or_default();
                     
-                    let severity = if update.IsMandatory().unwrap_or(false) {
+                    let severity = if update.IsMandatory().map(|v| v.as_bool()).unwrap_or(false) {
                         "Critical".to_string()
                     } else {
                         match update.MsrcSeverity() {
@@ -187,7 +197,9 @@ async fn check_pending_updates_com() -> Result<Vec<PendingUpdate>> {
                         }
                     };
                     
-                    let size_mb = (update.MaxDownloadSize().unwrap_or(0) / 1_048_576) as u32;
+                    // MaxDownloadSize returns DECIMAL, but we'll skip size for now
+                    // as proper DECIMAL conversion would require additional implementation
+                    let size_mb = 0u32; // Size information not available in current implementation
                     
                     let categories = get_update_categories(&update).unwrap_or_default();
                     let kb_article_ids = get_kb_article_ids(&update).unwrap_or_default();
@@ -221,7 +233,7 @@ fn get_update_categories(update: &IUpdate) -> Result<Vec<String>> {
             Ok(cats) => {
                 let count = cats.Count().unwrap_or(0);
                 for i in 0..count {
-                    if let Ok(category) = cats.Item(i) {
+                    if let Ok(category) = cats.get_Item(i) {
                         if let Ok(name) = category.Name() {
                             categories.push(name.to_string());
                         }
@@ -245,7 +257,7 @@ fn get_kb_article_ids(update: &IUpdate) -> Result<Vec<String>> {
             Ok(ids) => {
                 let count = ids.Count().unwrap_or(0);
                 for i in 0..count {
-                    if let Ok(id) = ids.Item(i) {
+                    if let Ok(id) = ids.get_Item(i) {
                         kb_ids.push(id.to_string());
                     }
                 }
@@ -259,7 +271,7 @@ fn get_kb_article_ids(update: &IUpdate) -> Result<Vec<String>> {
 
 /// Check if reboot is required using registry
 #[cfg(target_os = "windows")]
-async fn check_reboot_required(wmi_conn: &WMIConnection) -> Result<bool> {
+fn check_reboot_required(wmi_conn: &WMIConnection) -> Result<bool> {
     // Check common registry keys that indicate pending reboot
     let registry_queries = vec![
         "SELECT * FROM Win32_Registry WHERE Hive='HKEY_LOCAL_MACHINE' AND KeyPath='SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired'",
@@ -282,7 +294,7 @@ async fn check_reboot_required(wmi_conn: &WMIConnection) -> Result<bool> {
 
 /// Check if automatic updates are enabled
 #[cfg(target_os = "windows")]
-async fn check_automatic_updates(wmi_conn: &WMIConnection) -> Result<bool> {
+fn check_automatic_updates(wmi_conn: &WMIConnection) -> Result<bool> {
     debug!("Checking automatic updates configuration");
     
     // Try to query the Windows Update Agent settings via WMI

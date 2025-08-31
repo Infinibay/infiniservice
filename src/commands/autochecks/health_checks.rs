@@ -349,18 +349,18 @@ impl HealthCheck for WindowsDefenderCheck {
         
         match windows_defender::get_defender_status().await {
             Ok(defender_status) => {
-                let mut issues = Vec::new();
+                let mut issues: Vec<String> = Vec::new();
                 let mut status = HealthStatus::Healthy;
                 
                 // Check if Defender is enabled
                 if !defender_status.enabled {
-                    issues.push("Windows Defender is disabled");
+                    issues.push("Windows Defender is disabled".to_string());
                     status = HealthStatus::Critical;
                 }
                 
                 // Check real-time protection
                 if !defender_status.real_time_protection {
-                    issues.push("Real-time protection is disabled");
+                    issues.push("Real-time protection is disabled".to_string());
                     if status != HealthStatus::Critical {
                         status = HealthStatus::Warning;
                     }
@@ -368,7 +368,7 @@ impl HealthCheck for WindowsDefenderCheck {
                 
                 // Check signature age
                 if defender_status.signature_age_days > 7 {
-                    issues.push("Antivirus signatures are outdated");
+                    issues.push("Antivirus signatures are outdated".to_string());
                     if status == HealthStatus::Healthy {
                         status = HealthStatus::Warning;
                     }
@@ -376,7 +376,7 @@ impl HealthCheck for WindowsDefenderCheck {
                 
                 // Check recent threats
                 if defender_status.threats_detected > 0 {
-                    issues.push(&format!("{} threats detected recently", defender_status.threats_detected));
+                    issues.push(format!("{} threats detected recently", defender_status.threats_detected));
                     if status == HealthStatus::Healthy {
                         status = HealthStatus::Info;
                     }

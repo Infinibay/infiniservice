@@ -14,6 +14,12 @@ use wmi::{COMLibrary, WMIConnection};
 use windows::core::*;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Registry::*;
+#[cfg(target_os = "windows")]
+use winapi::shared::winerror::ERROR_SUCCESS;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::WIN32_ERROR;
+#[cfg(target_os = "windows")]
+use windows::core::PWSTR;
 
 /// Application information from Win32_Product (MSI-installed applications)
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -253,7 +259,7 @@ unsafe fn scan_registry_path(path: &str) -> Result<Vec<Application>> {
         &mut key_handle,
     );
     
-    if result != ERROR_SUCCESS {
+    if result != WIN32_ERROR(ERROR_SUCCESS) {
         return Err(anyhow!("Failed to open registry key: {}", path));
     }
     
@@ -265,15 +271,15 @@ unsafe fn scan_registry_path(path: &str) -> Result<Vec<Application>> {
         let result = RegEnumKeyExW(
             key_handle,
             index,
-            &mut subkey_name,
+            PWSTR::from_raw(subkey_name.as_mut_ptr()),
             &mut subkey_len,
             None,
-            None,
+            PWSTR::null(),
             None,
             None,
         );
         
-        if result != ERROR_SUCCESS {
+        if result != WIN32_ERROR(ERROR_SUCCESS) {
             break;
         }
         
@@ -309,7 +315,7 @@ unsafe fn read_application_from_registry(parent_key: HKEY, subkey_name: &str) ->
         &mut app_key,
     );
     
-    if result != ERROR_SUCCESS {
+    if result != WIN32_ERROR(ERROR_SUCCESS) {
         return Ok(None);
     }
     
@@ -366,7 +372,7 @@ unsafe fn read_registry_string(key: HKEY, value_name: &str) -> Result<String> {
         Some(&mut data_size),
     );
     
-    if result != ERROR_SUCCESS || data_type != REG_SZ {
+    if result != WIN32_ERROR(ERROR_SUCCESS) || data_type != REG_SZ {
         return Err(anyhow!("Registry value not found or wrong type"));
     }
     
@@ -381,7 +387,7 @@ unsafe fn read_registry_string(key: HKEY, value_name: &str) -> Result<String> {
         Some(&mut data_size),
     );
     
-    if result != ERROR_SUCCESS {
+    if result != WIN32_ERROR(ERROR_SUCCESS) {
         return Err(anyhow!("Failed to read registry value"));
     }
     
@@ -410,7 +416,7 @@ unsafe fn read_registry_dword(key: HKEY, value_name: &str) -> Result<u32> {
         Some(&mut data_size),
     );
     
-    if result != ERROR_SUCCESS || data_type != REG_DWORD {
+    if result != WIN32_ERROR(ERROR_SUCCESS) || data_type != REG_DWORD {
         return Err(anyhow!("Registry DWORD value not found"));
     }
     

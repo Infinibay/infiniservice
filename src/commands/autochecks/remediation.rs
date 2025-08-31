@@ -2,12 +2,12 @@
 //!
 //! This module provides the remediation engine that can apply fixes for detected
 //! issues, with rollback support and approval workflows.
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::{SystemTime, Duration};
-use log::{debug, info, error};
+use log::{debug, info, error, warn};
 
 /// Remediation actions that can be taken
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -361,14 +361,12 @@ impl RemediationEngine {
         info!("Starting disk cleanup for drive: {}", drive);
         
         let start_time = std::time::Instant::now();
-        let mut cleaned_items = Vec::new();
+        let mut cleaned_items: Vec<String> = Vec::new();
         let mut total_freed_bytes = 0u64;
         
         #[cfg(target_os = "windows")]
         {
             use std::process::Command;
-            use std::path::Path;
-            use std::fs;
             
             // Try to run Windows Disk Cleanup utility first
             let drive_letter = drive.chars().next().unwrap_or('C');
@@ -387,7 +385,7 @@ impl RemediationEngine {
                 Ok(output) => {
                     if output.status.success() {
                         info!("Windows Disk Cleanup utility completed");
-                        cleaned_items.push("Windows Disk Cleanup");
+                        cleaned_items.push("Windows Disk Cleanup".to_string());
                     } else {
                         warn!("Windows Disk Cleanup utility failed: {}", 
                               String::from_utf8_lossy(&output.stderr));
