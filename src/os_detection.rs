@@ -713,37 +713,26 @@ impl OsInfo {
 }
 
 /// Global OS info cache
-static mut OS_INFO_CACHE: Option<OsInfo> = None;
-static OS_INFO_INIT: std::sync::Once = std::sync::Once::new();
+static OS_INFO_CACHE: std::sync::OnceLock<OsInfo> = std::sync::OnceLock::new();
 
 /// Get cached OS information (initialized once)
 pub fn get_os_info() -> &'static OsInfo {
-    unsafe {
-        OS_INFO_INIT.call_once(|| {
-            match OsInfo::detect() {
-                Ok(info) => {
-                    info!("Detected OS: {:?} - {}", info.os_type, info.version);
-                    debug!("Available package managers: {:?}", info.available_package_managers);
-                    OS_INFO_CACHE = Some(info);
-                },
-                Err(e) => {
-                    log::error!("Failed to detect OS info: {}", e);
-                    OS_INFO_CACHE = Some(OsInfo {
-                        os_type: OsType::Unknown,
-                        version: "unknown".to_string(),
-                        kernel_version: None,
-                        architecture: std::env::consts::ARCH.to_string(),
-                        hostname: "unknown".to_string(),
-                        linux_distro: None,
-                        windows_edition: None,
-                        available_package_managers: vec![],
-                        default_shell: ShellType::Sh,
-                    });
-                }
+    OS_INFO_CACHE.get_or_init(|| {
+        OsInfo::detect().unwrap_or_else(|e| {
+            eprintln!("Failed to detect OS info: {}", e);
+            OsInfo {
+                os_type: OsType::Unknown,
+                version: "Unknown".to_string(),
+                kernel_version: None,
+                architecture: "Unknown".to_string(),
+                hostname: "Unknown".to_string(),
+                linux_distro: None,
+                windows_edition: None,
+                available_package_managers: vec![],
+                default_shell: ShellType::Sh,
             }
-        });
-        OS_INFO_CACHE.as_ref().unwrap()
-    }
+        })
+    })
 }
 
 #[cfg(test)]

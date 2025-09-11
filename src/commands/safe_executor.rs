@@ -3,7 +3,7 @@
 use super::{SafeCommandRequest, SafeCommandType, CommandResponse, ServiceOperation, create_response};
 use crate::os_detection::{get_os_info, OsType};
 use anyhow::{Result, anyhow, Context};
-use log::debug;
+use log::{debug, warn};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use serde_json::json;
@@ -415,6 +415,10 @@ impl SafeCommandExecutor {
             SafeCommandType::GetInstalledApplicationsWMI => self.get_installed_applications_wmi().await,
             SafeCommandType::CheckApplicationUpdates => self.check_application_updates().await,
             SafeCommandType::GetApplicationDetails { app_id } => self.get_application_details(app_id).await,
+            SafeCommandType::CheckSpecificAppUpdates { app_id } => self.check_specific_app_updates(app_id).await,
+            SafeCommandType::EstimateUpdateSize { app_id } => self.estimate_update_size(app_id).await,
+            SafeCommandType::GetAvailableUpdates => self.get_available_updates().await,
+            SafeCommandType::GetSecurityUpdates => self.get_security_updates().await,
             
             SafeCommandType::CheckDiskSpace { warning_threshold, critical_threshold } => {
                 self.check_disk_space(*warning_threshold, *critical_threshold).await
@@ -1532,51 +1536,235 @@ impl SafeCommandExecutor {
         }
     }
     
-    /// Check for application updates
+    /// Check for application updates across all platforms
     async fn check_application_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "windows")]
-        {
-            use crate::commands::application_inventory;
-            
-            match application_inventory::check_application_updates_public().await {
-                Ok(updatable_apps) => {
-                    let apps_json = serde_json::to_value(&updatable_apps)?;
-                    let summary = format!("Found {} applications with available updates", updatable_apps.len());
-                    Ok((summary, String::new(), Some(apps_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to check application updates: {}", e))
-            }
-        }
+        use crate::commands::application_inventory;
         
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(anyhow!("Application update check is only available on Windows"))
+        debug!("Starting comprehensive application update check");
+        
+        match application_inventory::check_application_updates_public().await {
+            Ok(updatable_apps) => {
+                let total_apps = updatable_apps.len();
+                let security_updates = updatable_apps.iter()
+                    .filter(|app| app.is_security_update.unwrap_or(false))
+                    .count();
+                
+                // Create detailed summary with update information
+                let mut summary_parts = vec![
+                    format!("Found {} applications with available updates", total_apps)
+                ];
+                
+                if security_updates > 0 {
+                    summary_parts.push(format!("{} security updates available", security_updates));
+                }
+                
+                // Group by update source for better overview
+                let mut source_counts = std::collections::HashMap::new();
+                for app in &updatable_apps {
+                    if let Some(ref source) = app.update_source {
+                        *source_counts.entry(source.clone()).or_insert(0) += 1;
+                    }
+                }
+                
+                if !source_counts.is_empty() {
+                    let source_summary: Vec<String> = source_counts.iter()
+                        .map(|(source, count)| format!("{}: {}", source, count))
+                        .collect();
+                    summary_parts.push(format!("Sources: {}", source_summary.join(", ")));
+                }
+                
+                let summary = summary_parts.join(" | ");
+                
+                // Include metadata about the check
+                let response_data = serde_json::json!({
+                    "applications": updatable_apps,
+                    "summary": {
+                        "total_updates": total_apps,
+                        "security_updates": security_updates,
+                        "sources": source_counts,
+                        "last_check": chrono::Utc::now().to_rfc3339()
+                    }
+                });
+                
+                debug!("Application update check completed: {} updates found", total_apps);
+                Ok((summary, String::new(), Some(response_data)))
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to check application updates: {}", e);
+                warn!("{}", error_msg);
+                Err(anyhow!(error_msg))
+            }
         }
     }
     
-    /// Get details for a specific application
+    /// Get details for a specific application with update checking
     async fn get_application_details(&self, app_id: &str) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "windows")]
-        {
-            use crate::commands::application_inventory;
-            
-            match application_inventory::get_application_details(app_id.to_string()).await {
-                Ok(Some(app)) => {
-                    let app_json = serde_json::to_value(&app)?;
-                    let summary = format!("Found application: {}", app.name);
-                    Ok((summary, String::new(), Some(app_json)))
+        use crate::commands::application_inventory;
+        
+        debug!("Getting application details with update check for: {}", app_id);
+        
+        // Try to get application details with real-time update checking
+        match application_inventory::check_specific_app_updates(app_id.to_string()).await {
+            Ok(Some(app)) => {
+                let mut summary_parts = vec![format!("Found application: {}", app.name)];
+                
+                // Add update information to summary
+                if app.can_update {
+                    if let Some(ref available_version) = app.update_available {
+                        summary_parts.push(format!("Update available: {}", available_version));
+                    }
+                    if let Some(ref source) = app.update_source {
+                        summary_parts.push(format!("Source: {}", source));
+                    }
+                    if app.is_security_update == Some(true) {
+                        summary_parts.push("🔒 Security update".to_string());
+                    }
+                } else {
+                    summary_parts.push("Up to date".to_string());
                 }
-                Ok(None) => {
-                    let summary = format!("Application not found: {}", app_id);
-                    Ok((summary, String::new(), None))
-                }
-                Err(e) => Err(anyhow!("Failed to get application details: {}", e))
+                
+                let summary = summary_parts.join(" | ");
+                
+                // Enhanced response data with update metadata
+                let response_data = serde_json::json!({
+                    "application": app,
+                    "metadata": {
+                        "has_update": app.can_update,
+                        "is_security_update": app.is_security_update.unwrap_or(false),
+                        "last_checked": app.last_update_check,
+                        "update_source": app.update_source
+                    }
+                });
+                
+                Ok((summary, String::new(), Some(response_data)))
+            }
+            Ok(None) => {
+                let summary = format!("Application not found: {}", app_id);
+                Ok((summary, String::new(), None))
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to get application details: {}", e);
+                warn!("{}", error_msg);
+                Err(anyhow!(error_msg))
             }
         }
+    }
+    
+    /// Check updates for a specific application
+    async fn check_specific_app_updates(&self, app_id: &str) -> Result<(String, String, Option<serde_json::Value>)> {
+        use crate::commands::application_inventory;
         
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(anyhow!("Application details are only available on Windows"))
+        debug!("Checking updates for specific application: {}", app_id);
+        
+        match application_inventory::check_specific_app_updates(app_id.to_string()).await {
+            Ok(Some(app)) => {
+                if app.can_update {
+                    let summary = format!("Update available for {}: {} -> {}", 
+                                         app.name, 
+                                         app.version.as_deref().unwrap_or("unknown"),
+                                         app.update_available.as_deref().unwrap_or("latest"));
+                    Ok((summary, String::new(), Some(serde_json::to_value(&app)?)))
+                } else {
+                    let summary = format!("No updates available for {}", app.name);
+                    Ok((summary, String::new(), Some(serde_json::to_value(&app)?)))
+                }
+            }
+            Ok(None) => {
+                let summary = format!("Application not found: {}", app_id);
+                Ok((summary, String::new(), None))
+            }
+            Err(e) => Err(anyhow!("Failed to check updates for {}: {}", app_id, e))
+        }
+    }
+    
+    /// Estimate update size for a specific application
+    async fn estimate_update_size(&self, app_id: &str) -> Result<(String, String, Option<serde_json::Value>)> {
+        use crate::commands::application_inventory;
+        
+        debug!("Estimating update size for: {}", app_id);
+        
+        match application_inventory::estimate_update_size(app_id.to_string()).await {
+            Ok(Some(size_bytes)) => {
+                let size_mb = size_bytes as f64 / 1024.0 / 1024.0;
+                let summary = format!("Update size for {}: {:.2} MB", app_id, size_mb);
+                let response_data = serde_json::json!({
+                    "app_id": app_id,
+                    "size_bytes": size_bytes,
+                    "size_mb": size_mb,
+                    "formatted_size": format!("{:.2} MB", size_mb)
+                });
+                Ok((summary, String::new(), Some(response_data)))
+            }
+            Ok(None) => {
+                let summary = format!("No update size information available for {}", app_id);
+                Ok((summary, String::new(), None))
+            }
+            Err(e) => Err(anyhow!("Failed to estimate update size for {}: {}", app_id, e))
+        }
+    }
+    
+    /// Get all available updates
+    async fn get_available_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        use crate::commands::application_inventory;
+        
+        debug!("Getting all available updates");
+        
+        match application_inventory::get_available_updates().await {
+            Ok(updatable_apps) => {
+                let total_size: u64 = updatable_apps.iter()
+                    .filter_map(|app| app.update_size_bytes)
+                    .sum();
+                    
+                let total_size_mb = total_size as f64 / 1024.0 / 1024.0;
+                
+                let summary = if updatable_apps.is_empty() {
+                    "No updates available".to_string()
+                } else {
+                    format!("{} updates available (Total: {:.2} MB)", updatable_apps.len(), total_size_mb)
+                };
+                
+                let response_data = serde_json::json!({
+                    "updates": updatable_apps,
+                    "summary": {
+                        "count": updatable_apps.len(),
+                        "total_size_bytes": total_size,
+                        "total_size_mb": total_size_mb
+                    }
+                });
+                
+                Ok((summary, String::new(), Some(response_data)))
+            }
+            Err(e) => Err(anyhow!("Failed to get available updates: {}", e))
+        }
+    }
+    
+    /// Get security updates only
+    async fn get_security_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        use crate::commands::application_inventory;
+        
+        debug!("Getting security updates only");
+        
+        match application_inventory::get_available_updates().await {
+            Ok(all_updates) => {
+                let security_updates: Vec<_> = all_updates.into_iter()
+                    .filter(|app| app.is_security_update.unwrap_or(false))
+                    .collect();
+                
+                let summary = if security_updates.is_empty() {
+                    "No security updates available".to_string()
+                } else {
+                    format!("🔒 {} security updates available", security_updates.len())
+                };
+                
+                let response_data = serde_json::json!({
+                    "security_updates": security_updates,
+                    "count": security_updates.len(),
+                    "priority": "high"
+                });
+                
+                Ok((summary, String::new(), Some(response_data)))
+            }
+            Err(e) => Err(anyhow!("Failed to get security updates: {}", e))
         }
     }
     

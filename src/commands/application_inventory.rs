@@ -71,6 +71,13 @@ pub struct Application {
     pub install_location: Option<String>,
     pub size_mb: Option<u64>,
     pub registry_key: Option<String>,
+    
+    // New update-related fields
+    pub update_available: Option<String>, // Available version if update exists
+    pub update_source: Option<String>,    // Source of the update (Windows Update, Store, APT, etc.)
+    pub last_update_check: Option<SystemTime>, // When we last checked for updates
+    pub update_size_bytes: Option<u64>,   // Size of the update in bytes
+    pub is_security_update: Option<bool>, // Whether the available update is security-related
 }
 
 /// Application inventory summary
@@ -186,6 +193,12 @@ async fn get_msi_applications(wmi_conn: &WMIConnection) -> Result<Vec<Applicatio
                 install_location: product.install_location,
                 size_mb: None, // Could be queried separately
                 registry_key: product.identifying_number,
+                // New fields initialized as None
+                update_available: None,
+                update_source: None,
+                last_update_check: None,
+                update_size_bytes: None,
+                is_security_update: None,
             })
         })
         .collect();
@@ -213,6 +226,12 @@ async fn get_store_applications(wmi_conn: &WMIConnection) -> Result<Vec<Applicat
                 install_location: None,
                 size_mb: None,
                 registry_key: app.program_id,
+                // New fields initialized as None
+                update_available: None,
+                update_source: None,
+                last_update_check: None,
+                update_size_bytes: None,
+                is_security_update: None,
             })
         })
         .collect();
@@ -350,6 +369,12 @@ unsafe fn read_application_from_registry(parent_key: HKEY, subkey_name: &str) ->
             install_location,
             size_mb,
             registry_key: Some(subkey_name.to_string()),
+            // New fields initialized as None
+            update_available: None,
+            update_source: None,
+            last_update_check: None,
+            update_size_bytes: None,
+            is_security_update: None,
         }))
     } else {
         Ok(None)
@@ -437,26 +462,61 @@ fn deduplicate_applications(mut applications: Vec<Application>) -> Vec<Applicati
     applications
 }
 
-/// Check for application updates (simplified implementation)
+/// Check for application updates using platform-specific update checkers
 async fn check_application_updates(applications: &mut [Application]) -> Result<()> {
-    debug!("Checking application update availability");
+    debug!("Checking application update availability using native update checkers");
     
-    // This is a simplified implementation
-    // In a real implementation, we would:
-    // 1. Check Windows Update for available app updates
-    // 2. Query Microsoft Store for app updates
-    // 3. Check with package managers like Chocolatey, Scoop, etc.
+    use super::update_checker_factory::{UpdateCheckerFactory, UpdateConfigManager};
     
-    for app in applications.iter_mut() {
-        // For now, mark store apps as updatable
-        if app.install_type == "Store" {
-            app.can_update = true;
-        } else {
-            // Could implement more sophisticated update checking here
-            app.can_update = false;
+    // Create coordinator using factory with bulk update configuration
+    let config = UpdateConfigManager::get_bulk_update_config();
+    let mut coordinator = match UpdateCheckerFactory::create_coordinator(Some(config)).await {
+        Ok(coordinator) => coordinator,
+        Err(e) => {
+            warn!("Failed to create update coordinator: {}", e);
+            return Ok(()); // Don't fail the entire inventory if update checking fails
+        }
+    };
+    
+    // Check updates for all applications
+    let update_results = match coordinator.check_multiple_updates(applications).await {
+        Ok(results) => results,
+        Err(e) => {
+            warn!("Failed to check application updates: {}", e);
+            return Ok(()); // Don't fail the entire inventory if update checking fails
+        }
+    };
+    
+    // Apply update information to applications
+    for (app_name, update_info) in update_results {
+        if let Some(app) = applications.iter_mut().find(|a| a.name == app_name) {
+            if let Some(info) = update_info {
+                let available_version = info.available_version.clone();
+                
+                app.can_update = true;
+                app.update_available = Some(info.available_version);
+                app.update_source = Some(info.update_source);
+                app.last_update_check = Some(info.last_checked);
+                app.update_size_bytes = info.update_size_bytes;
+                app.is_security_update = Some(info.is_security_update);
+                
+                debug!("Found update for {}: {} -> {}", 
+                       app.name, 
+                       app.version.as_deref().unwrap_or("unknown"),
+                       available_version);
+            } else {
+                app.can_update = false;
+                app.last_update_check = Some(std::time::SystemTime::now());
+            }
         }
     }
     
+    // Clean up checkers
+    if let Err(e) = coordinator.cleanup().await {
+        warn!("Failed to cleanup update checkers: {}", e);
+    }
+    
+    debug!("Application update checking completed");
     Ok(())
 }
 
@@ -478,11 +538,23 @@ pub async fn get_application_details(app_id: String) -> Result<Option<Applicatio
 }
 
 /// Check for application updates (public interface)
-#[cfg(target_os = "windows")]
 pub async fn check_application_updates_public() -> Result<Vec<Application>> {
     debug!("Checking for application updates");
     
-    let inventory = get_installed_applications_wmi().await?;
+    #[cfg(target_os = "windows")]
+    let mut inventory = get_installed_applications_wmi().await?;
+    
+    #[cfg(not(target_os = "windows"))]
+    let mut inventory = ApplicationInventory {
+        total_count: 0,
+        applications: Vec::new(),
+        last_scan: SystemTime::now(),
+        scan_duration_ms: 0,
+        by_install_type: std::collections::HashMap::new(),
+    };
+    
+    // Check for updates using our new implementation
+    check_application_updates(&mut inventory.applications).await?;
     
     let updatable_apps = inventory.applications
         .into_iter()
@@ -492,20 +564,74 @@ pub async fn check_application_updates_public() -> Result<Vec<Application>> {
     Ok(updatable_apps)
 }
 
-/// Non-Windows implementations (stubs)
+/// Check updates for a specific application by ID or name
+pub async fn check_specific_app_updates(app_identifier: String) -> Result<Option<Application>> {
+    debug!("Checking updates for specific application: {}", app_identifier);
+    
+    use super::update_checker_factory::UpdateCheckerFactory;
+    
+    // First find the application
+    let app = get_application_details(app_identifier.clone()).await?;
+    
+    if let Some(mut app) = app {
+        // Create coordinator optimized for single app checks
+        let mut coordinator = match UpdateCheckerFactory::create_single_app_coordinator().await {
+            Ok(coordinator) => coordinator,
+            Err(e) => {
+                warn!("Failed to create coordinator for single app check: {}", e);
+                return Ok(Some(app));
+            }
+        };
+        
+        if let Ok(Some(update_info)) = coordinator.check_app_update(&app).await {
+            app.can_update = true;
+            app.update_available = Some(update_info.available_version);
+            app.update_source = Some(update_info.update_source);
+            app.last_update_check = Some(update_info.last_checked);
+            app.update_size_bytes = update_info.update_size_bytes;
+            app.is_security_update = Some(update_info.is_security_update);
+        } else {
+            app.can_update = false;
+            app.last_update_check = Some(SystemTime::now());
+        }
+        
+        coordinator.cleanup().await.ok();
+        
+        Ok(Some(app))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Get estimated update size for a specific application
+pub async fn estimate_update_size(app_identifier: String) -> Result<Option<u64>> {
+    debug!("Estimating update size for: {}", app_identifier);
+    
+    if let Some(app) = check_specific_app_updates(app_identifier).await? {
+        Ok(app.update_size_bytes)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Get all applications with available updates
+pub async fn get_available_updates() -> Result<Vec<Application>> {
+    debug!("Getting all available updates");
+    
+    check_application_updates_public().await
+}
+
+/// Non-Windows implementations
 #[cfg(not(target_os = "windows"))]
 pub async fn get_installed_applications_wmi() -> Result<ApplicationInventory> {
-    Err(anyhow!("Application inventory via WMI is only available on Windows"))
+    Err(anyhow!("WMI application inventory is only available on Windows. Use Linux package managers for application listing."))
 }
 
 #[cfg(not(target_os = "windows"))]
 pub async fn get_application_details(_app_id: String) -> Result<Option<Application>> {
-    Err(anyhow!("Application details via WMI is only available on Windows"))
-}
-
-#[cfg(not(target_os = "windows"))]
-pub async fn check_application_updates_public() -> Result<Vec<Application>> {
-    Err(anyhow!("Application update check is only available on Windows"))
+    // On non-Windows systems, we could implement package manager lookups here
+    warn!("get_application_details not yet implemented for this platform");
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -524,6 +650,11 @@ mod tests {
             install_location: Some("C:\\Program Files\\Test".to_string()),
             size_mb: Some(100),
             registry_key: Some("TEST001".to_string()),
+            update_available: None,
+            update_source: None,
+            last_update_check: None,
+            update_size_bytes: None,
+            is_security_update: None,
         };
 
         let json = serde_json::to_string(&app).unwrap();
@@ -544,6 +675,11 @@ mod tests {
                 install_location: None,
                 size_mb: None,
                 registry_key: None,
+                update_available: None,
+                update_source: None,
+                last_update_check: None,
+                update_size_bytes: None,
+                is_security_update: None,
             },
             Application {
                 name: "Test App".to_string(),
@@ -555,6 +691,11 @@ mod tests {
                 install_location: None,
                 size_mb: None,
                 registry_key: None,
+                update_available: None,
+                update_source: None,
+                last_update_check: None,
+                update_size_bytes: None,
+                is_security_update: None,
             },
         ];
 

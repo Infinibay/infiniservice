@@ -22,6 +22,16 @@ pub mod windows_updates;
 pub mod windows_defender;
 pub mod application_inventory;
 
+// Update checking modules
+pub mod update_checker;
+pub mod update_checker_factory;
+
+#[cfg(target_os = "windows")]
+pub mod windows_update_checker;
+
+#[cfg(target_os = "linux")]
+pub mod linux_update_checker;
+
 /// Incoming message types from the host
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
@@ -116,6 +126,10 @@ pub enum SafeCommandType {
     GetInstalledApplicationsWMI,
     CheckApplicationUpdates,
     GetApplicationDetails { app_id: String },
+    CheckSpecificAppUpdates { app_id: String },
+    EstimateUpdateSize { app_id: String },
+    GetAvailableUpdates,
+    GetSecurityUpdates,
     
     // Health check commands
     CheckDiskSpace { 
@@ -216,7 +230,7 @@ pub type CommandResult<T> = std::result::Result<T, CommandError>;
 /// Trait for command handlers
 pub trait CommandHandler: Send + Sync {
     /// Execute the command and return a response
-    async fn execute(&self, request: SafeCommandRequest) -> Result<CommandResponse>;
+    fn execute(&self, request: SafeCommandRequest) -> impl std::future::Future<Output = Result<CommandResponse>> + Send;
     
     /// Check if this handler supports the given command type
     fn supports(&self, command_type: &SafeCommandType) -> bool;
