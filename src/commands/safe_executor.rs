@@ -1365,28 +1365,23 @@ impl SafeCommandExecutor {
     /// Parse yum/dnf search output
     fn parse_yum_search(&self, output: &str) -> Vec<serde_json::Value> {
         let mut packages = Vec::new();
-        let mut current_name = String::new();
-        
+
         for line in output.lines() {
             let line = line.trim();
-            
+
             // Skip headers and separators
             if line.is_empty() || line.contains("==") || line.contains("Matched:") {
                 continue;
             }
-            
+
             // Package lines format: package-name.arch : description
-            if line.contains(" : ") {
-                let parts: Vec<&str> = line.split(" : ").collect();
-                if parts.len() == 2 {
-                    // Remove architecture suffix if present
-                    current_name = parts[0].split('.').next().unwrap_or(parts[0]).to_string();
-                    packages.push(json!({
-                        "name": current_name.clone(),
-                        "description": parts[1],
-                        "installed": false
-                    }));
-                }
+            if let Some((left, right)) = line.split_once(" : ") {
+                let name = left.split('.').next().unwrap_or(left);
+                packages.push(json!({
+                    "name": name,
+                    "description": right.trim(),
+                    "installed": false,
+                }));
             }
         }
         
@@ -1422,11 +1417,11 @@ impl SafeCommandExecutor {
     }
     
     /// Get Windows Update history
-    async fn get_update_history(&self, days: Option<u32>) -> Result<(String, String, Option<serde_json::Value>)> {
+    async fn get_update_history(&self, #[allow(unused_variables)] days: Option<u32>) -> Result<(String, String, Option<serde_json::Value>)> {
         #[cfg(target_os = "windows")]
         {
             use crate::commands::windows_updates;
-            
+
             let days = days.unwrap_or(30);
             match windows_updates::get_update_history(days).await {
                 Ok(updates) => {

@@ -261,8 +261,6 @@ impl UpdateCheckCoordinator {
 
 /// Utility functions for update checking
 pub mod utils {
-    use super::*;
-    
     /// Compare version strings (simple lexicographic comparison)
     /// Returns true if `available` is newer than `current`
     pub fn is_version_newer(current: &str, available: &str) -> bool {
@@ -343,9 +341,8 @@ pub mod utils {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::utils::*;
-    
+    use super::{utils::*, UpdateCheckConfig};
+
     #[test]
     fn test_version_comparison() {
         assert!(is_version_newer("1.0.0", "1.0.1"));

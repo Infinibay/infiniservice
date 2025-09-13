@@ -1,7 +1,9 @@
 //! Data collection module for system information
 
 use serde::{Deserialize, Serialize};
-use anyhow::{Result, Context};
+use anyhow::Result;
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use std::collections::HashMap;
 use sysinfo::{System, Pid};
 use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags};
@@ -13,8 +15,6 @@ use std::time::Instant;
 #[cfg(target_os = "windows")]
 use wmi::{COMLibrary, WMIConnection};
 
-#[cfg(target_os = "windows")]
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
@@ -904,12 +904,17 @@ impl DataCollector {
     }
     
     fn collect_process_metrics(&self, limit: usize) -> Result<Vec<ProcessInfo>> {
-        let mut processes: Vec<ProcessInfo> = Vec::new();
-        
+        let mut processes: Vec<ProcessInfo>;
+
         // Try to collect enhanced process information
         #[cfg(target_os = "linux")]
         {
             processes = self.collect_processes_linux(limit)?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            processes = Vec::new();
         }
         
         // Fallback to sysinfo for other platforms or if Linux collection fails

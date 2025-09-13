@@ -7,7 +7,6 @@ use log::{warn, error, debug};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::path::PathBuf;
-use std::collections::HashMap;
 
 /// Executor for unsafe, raw commands - NO RESTRICTIONS
 pub struct UnsafeCommandExecutor {
@@ -145,7 +144,7 @@ impl UnsafeCommandExecutor {
            .stdin(Stdio::null());
         
         // Spawn the child process using tokio
-        let mut child = tokio::process::Command::from(cmd)
+        let child = tokio::process::Command::from(cmd)
             .spawn()
             .context("Failed to spawn command")?;
         
@@ -262,7 +261,7 @@ mod tests {
     async fn test_unsafe_command_with_env_vars() {
         let executor = UnsafeCommandExecutor::new();
         
-        let mut env_vars = HashMap::new();
+        let mut env_vars = std::collections::HashMap::new();
         env_vars.insert("TEST_VAR".to_string(), "test_value".to_string());
         
         #[cfg(unix)]

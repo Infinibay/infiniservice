@@ -671,7 +671,7 @@ impl WindowsUpdateAgentChecker {
     #[cfg(target_os = "windows")]
     async fn search_windows_update_for_app(
         &self,
-        app: &Application,
+        _app: &Application,
         _config: &UpdateCheckConfig,
     ) -> UpdateCheckResult<Option<UpdateInfo>> {
         use windows::Win32::System::UpdateAgent::*;
@@ -684,7 +684,7 @@ impl WindowsUpdateAgentChecker {
                 .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to create UpdateSession: {:?}", e)))?;
             
             // Create Update Searcher locally
-            let searcher = update_session.CreateUpdateSearcher()
+            let _searcher = update_session.CreateUpdateSearcher()
                 .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to create UpdateSearcher: {:?}", e)))?;
         
             // Search for updates that might be related to this application
@@ -697,9 +697,6 @@ impl WindowsUpdateAgentChecker {
             debug!("Direct Windows Update search method deprecated - using PowerShell approach instead");
             return Ok(None);
         }
-        
-        debug!("No Windows Update found for application: {}", app.name);
-        Ok(None)
     }
     
     #[cfg(target_os = "windows")]
@@ -985,7 +982,6 @@ impl WindowsRegistryChecker {
 /// Windows-specific utilities for update checking
 #[cfg(target_os = "windows")]
 mod windows_utils {
-    use super::*;
     use windows::Win32::System::Registry::*;
     use windows::core::HSTRING;
     use windows::Win32::Foundation::ERROR_SUCCESS;

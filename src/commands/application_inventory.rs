@@ -314,8 +314,8 @@ unsafe fn scan_registry_path(path: &str) -> Result<Vec<Application>> {
         
         index += 1;
     }
-    
-    RegCloseKey(key_handle);
+
+    let _ = RegCloseKey(key_handle);
     debug!("Found {} applications in registry path: {}", applications.len(), path);
     
     Ok(applications)
@@ -346,9 +346,9 @@ unsafe fn read_application_from_registry(parent_key: HKEY, subkey_name: &str) ->
     let install_location = read_registry_string(app_key, "InstallLocation").ok();
     let size_mb = read_registry_dword(app_key, "EstimatedSize").ok()
         .map(|kb| kb as u64 / 1024); // Convert KB to MB
-    
-    RegCloseKey(app_key);
-    
+
+    let _ = RegCloseKey(app_key);
+
     // Only create application if we have a display name
     if let Some(name) = display_name {
         // Filter out system components and updates

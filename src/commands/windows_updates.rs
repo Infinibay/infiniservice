@@ -1,12 +1,12 @@
+#![allow(clippy::needless_return)]
 //! Windows Update management via WMI and COM API
 //! 
 //! This module provides functionality to check Windows Updates, pending updates,
 //! and update history using both WMI queries and the Windows Update Agent COM API.
 
-use anyhow::{Result, anyhow, Context};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
-use log::{debug, warn, info};
 
 #[cfg(target_os = "windows")]
 use wmi::{COMLibrary, WMIConnection};
@@ -64,27 +64,27 @@ pub struct UpdateStatus {
 /// Check Windows Updates using WMI and COM API
 #[cfg(target_os = "windows")]
 pub async fn check_windows_updates() -> Result<UpdateStatus> {
-    info!("Checking Windows Updates via WMI and COM API");
+    log::info!("Checking Windows Updates via WMI and COM API");
     
     // Collect all WMI data in a separate scope
     let (installed_updates, update_agent_version, reboot_required, automatic_updates_enabled) = {
         let com_lib = COMLibrary::new()
-            .context("Failed to initialize COM library")?;
+            .map_err(|e| anyhow!("Failed to initialize COM library: {:?}", e))?;
         
         let wmi_conn = WMIConnection::new(com_lib.clone())
-            .context("Failed to create WMI connection")?;
+            .map_err(|e| anyhow!("Failed to create WMI connection: {:?}", e))?;
         
         // Query installed updates via WMI
         let installed_updates = get_installed_updates(&wmi_conn)
             .unwrap_or_else(|e| {
-                warn!("Failed to get installed updates: {}", e);
+                log::warn!("Failed to get installed updates: {}", e);
                 Vec::new()
             });
         
         // Query Windows Update Agent status
         let update_agent_version = get_update_agent_version(&wmi_conn)
             .unwrap_or_else(|e| {
-                warn!("Failed to get update agent version: {}", e);
+                log::warn!("Failed to get update agent version: {}", e);
                 None
             });
         
@@ -104,7 +104,7 @@ pub async fn check_windows_updates() -> Result<UpdateStatus> {
     // Check for pending updates using COM interface
     let pending_updates = check_pending_updates_com().await
         .unwrap_or_else(|e| {
-            warn!("Failed to check pending updates: {}", e);
+            log::warn!("Failed to check pending updates: {}", e);
             Vec::new()
         });
     
@@ -121,24 +121,24 @@ pub async fn check_windows_updates() -> Result<UpdateStatus> {
 /// Get installed updates from Win32_QuickFixEngineering
 #[cfg(target_os = "windows")]
 fn get_installed_updates(wmi_conn: &WMIConnection) -> Result<Vec<WindowsUpdate>> {
-    debug!("Querying installed Windows updates");
+    log::debug!("Querying installed Windows updates");
     
     let updates: Vec<WindowsUpdate> = wmi_conn
         .raw_query("SELECT HotFixID, Description, InstalledOn, InstalledBy FROM Win32_QuickFixEngineering")
-        .context("Failed to query Win32_QuickFixEngineering")?;
+        .map_err(|e| anyhow!("Failed to query Win32_QuickFixEngineering: {:?}", e))?;
     
-    info!("Found {} installed updates", updates.len());
+    log::info!("Found {} installed updates", updates.len());
     Ok(updates)
 }
 
 /// Get Windows Update Agent version
 #[cfg(target_os = "windows")]
 fn get_update_agent_version(wmi_conn: &WMIConnection) -> Result<Option<String>> {
-    debug!("Querying Windows Update Agent version");
+    log::debug!("Querying Windows Update Agent version");
     
     let versions: Vec<UpdateAgentStatus> = wmi_conn
         .raw_query("SELECT Version FROM Win32_WindowsUpdateAgentVersion")
-        .context("Failed to query Win32_WindowsUpdateAgentVersion")?;
+        .map_err(|e| anyhow!("Failed to query Win32_WindowsUpdateAgentVersion: {:?}", e))?;
     
     Ok(versions.first().map(|v| v.version.clone()))
 }
@@ -146,7 +146,7 @@ fn get_update_agent_version(wmi_conn: &WMIConnection) -> Result<Option<String>> 
 /// Check for pending updates using Windows Update Agent COM API
 #[cfg(target_os = "windows")]
 async fn check_pending_updates_com() -> Result<Vec<PendingUpdate>> {
-    debug!("Checking pending updates via COM API");
+    log::debug!("Checking pending updates via COM API");
     
     unsafe {
         // Initialize COM
@@ -177,7 +177,7 @@ async fn check_pending_updates_com() -> Result<Vec<PendingUpdate>> {
         let count = updates.Count()
             .map_err(|e| anyhow!("Failed to get updates count: {:?}", e))?;
         
-        info!("Found {} pending updates", count);
+        log::info!("Found {} pending updates", count);
         
         let mut pending = Vec::new();
         
@@ -213,7 +213,7 @@ async fn check_pending_updates_com() -> Result<Vec<PendingUpdate>> {
                     });
                 }
                 Err(e) => {
-                    warn!("Failed to get update item {}: {}", i, e);
+                    log::warn!("Failed to get update item {}: {}", i, e);
                 }
             }
         }
@@ -295,7 +295,7 @@ fn check_reboot_required(wmi_conn: &WMIConnection) -> Result<bool> {
 /// Check if automatic updates are enabled
 #[cfg(target_os = "windows")]
 fn check_automatic_updates(wmi_conn: &WMIConnection) -> Result<bool> {
-    debug!("Checking automatic updates configuration");
+    log::debug!("Checking automatic updates configuration");
     
     // Try to query the Windows Update Agent settings via WMI
     // First try Win32_WindowsUpdateAgentVersion for AU settings
@@ -308,12 +308,12 @@ fn check_automatic_updates(wmi_conn: &WMIConnection) -> Result<bool> {
         match wmi_conn.raw_query::<serde_json::Value>(query) {
             Ok(results) => {
                 if !results.is_empty() {
-                    debug!("Successfully queried automatic updates settings");
+                    log::debug!("Successfully queried automatic updates settings");
                     return Ok(true); // If we can query update agent, assume AU is enabled
                 }
             }
             Err(e) => {
-                debug!("WMI query '{}' failed: {}", query, e);
+                log::debug!("WMI query '{}' failed: {}", query, e);
                 continue;
             }
         }
@@ -324,7 +324,7 @@ fn check_automatic_updates(wmi_conn: &WMIConnection) -> Result<bool> {
     {
         use std::process::Command;
         
-        debug!("Falling back to PowerShell registry check");
+        log::debug!("Falling back to PowerShell registry check");
         
         let powershell_cmd = r#"
             try {
@@ -352,25 +352,25 @@ fn check_automatic_updates(wmi_conn: &WMIConnection) -> Result<bool> {
                 let output_str = String::from_utf8_lossy(&output.stdout);
                 let result = output_str.trim();
                 
-                debug!("PowerShell automatic updates check result: '{}'", result);
+                log::debug!("PowerShell automatic updates check result: '{}'", result);
                 
                 match result {
                     "enabled" => return Ok(true),
                     "disabled" => return Ok(false),
                     _ => {
-                        warn!("Could not determine automatic updates status: {}", result);
+                        log::warn!("Could not determine automatic updates status: {}", result);
                         return Ok(true); // Default to enabled for safety
                     }
                 }
             }
             Err(e) => {
-                warn!("Failed to execute PowerShell command for automatic updates check: {}", e);
+                log::warn!("Failed to execute PowerShell command for automatic updates check: {}", e);
             }
         }
     }
     
     // Final fallback - assume enabled
-    warn!("Could not determine automatic updates status, assuming enabled");
+    log::warn!("Could not determine automatic updates status, assuming enabled");
     Ok(true)
 }
 
@@ -378,10 +378,10 @@ fn check_automatic_updates(wmi_conn: &WMIConnection) -> Result<bool> {
 #[cfg(target_os = "windows")]
 pub async fn get_update_history(days: u32) -> Result<Vec<WindowsUpdate>> {
     let com_lib = COMLibrary::new()
-        .context("Failed to initialize COM library")?;
+        .map_err(|e| anyhow!("Failed to initialize COM library: {:?}", e))?;
     
     let wmi_conn = WMIConnection::new(com_lib)
-        .context("Failed to create WMI connection")?;
+        .map_err(|e| anyhow!("Failed to create WMI connection: {:?}", e))?;
     
     // Calculate date filter
     let cutoff_date = SystemTime::now()
@@ -389,7 +389,7 @@ pub async fn get_update_history(days: u32) -> Result<Vec<WindowsUpdate>> {
         .unwrap()
         .as_secs() - (days as u64 * 86400);
     
-    debug!("Getting update history for the last {} days", days);
+    log::debug!("Getting update history for the last {} days", days);
     
     // Query recent updates (this is a simplified approach)
     let query = format!(
@@ -399,9 +399,9 @@ pub async fn get_update_history(days: u32) -> Result<Vec<WindowsUpdate>> {
     
     let updates: Vec<WindowsUpdate> = wmi_conn
         .raw_query(&query)
-        .context("Failed to query recent updates")?;
+        .map_err(|e| anyhow!("Failed to query recent updates: {:?}", e))?;
     
-    info!("Found {} updates in the last {} days", updates.len(), days);
+    log::info!("Found {} updates in the last {} days", updates.len(), days);
     Ok(updates)
 }
 

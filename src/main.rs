@@ -1,5 +1,6 @@
-use log::{info, error, debug};
+use log::{info, error, debug, warn};
 use infiniservice::{Config, InfiniService};
+use anyhow::Result;
 use std::env;
 
 #[cfg(target_os = "windows")]
@@ -28,7 +29,7 @@ static SERVICE_NAME: &str = "Infiniservice";
 define_windows_service!(ffi_service_main, service_main);
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
     
@@ -71,10 +72,16 @@ async fn main() -> anyhow::Result<()> {
         println!("  --device <path>   Manually specify device path");
         println!("  --require-virtio  Require VirtIO device to run (exit if not found)");
         println!("  --no-virtio       Allow service to run without VirtIO device");
+        println!("  --virtio-min-backoff <seconds>  Set minimum VirtIO retry backoff interval");
+        println!("  --virtio-max-backoff <seconds>  Set maximum VirtIO retry backoff interval");
+        println!("  --disable-device-monitoring     Disable automatic device change monitoring");
         println!("\nEnvironment Variables:");
         println!("  INFINIBAY_VM_ID=<id>          Set VM identifier");
         println!("  INFINISERVICE_DEVICE=<path>   Manually specify device path");
         println!("  INFINISERVICE_REQUIRE_VIRTIO=<true|false>  Require VirtIO device");
+        println!("  INFINISERVICE_MIN_BACKOFF=<seconds>       Set minimum retry backoff");
+        println!("  INFINISERVICE_MAX_BACKOFF=<seconds>       Set maximum retry backoff");
+        println!("  INFINISERVICE_DISABLE_MONITORING=<true>   Disable device monitoring");
         println!("  RUST_LOG=<level>              Set log level (error|warn|info|debug)");
         return Ok(());
     }
@@ -83,14 +90,31 @@ async fn main() -> anyhow::Result<()> {
     let diagnose_mode = args.contains(&"--diagnose".to_string()) || args.contains(&"--diag".to_string());
     let require_virtio = args.contains(&"--require-virtio".to_string());
     let no_virtio = args.contains(&"--no-virtio".to_string());
+    let disable_device_monitoring = args.contains(&"--disable-device-monitoring".to_string());
     
     // Parse --device parameter
     let mut device_path_override: Option<String> = None;
+    let mut min_backoff_override: Option<u64> = None;
+    let mut max_backoff_override: Option<u64> = None;
+
     for i in 0..args.len() {
         if args[i] == "--device" && i + 1 < args.len() {
             device_path_override = Some(args[i + 1].clone());
             info!("Device path override specified: {}", args[i + 1]);
-            break;
+        } else if args[i] == "--virtio-min-backoff" && i + 1 < args.len() {
+            if let Ok(value) = args[i + 1].parse::<u64>() {
+                min_backoff_override = Some(value);
+                info!("Minimum backoff override specified: {}s", value);
+            } else {
+                warn!("Invalid minimum backoff value: {}", args[i + 1]);
+            }
+        } else if args[i] == "--virtio-max-backoff" && i + 1 < args.len() {
+            if let Ok(value) = args[i + 1].parse::<u64>() {
+                max_backoff_override = Some(value);
+                info!("Maximum backoff override specified: {}s", value);
+            } else {
+                warn!("Invalid maximum backoff value: {}", args[i + 1]);
+            }
         }
     }
     
@@ -99,6 +123,25 @@ async fn main() -> anyhow::Result<()> {
         if let Ok(path) = env::var("INFINISERVICE_DEVICE") {
             device_path_override = Some(path.clone());
             info!("Device path override from environment: {}", path);
+        }
+    }
+
+    // Check environment variables for backoff settings
+    if min_backoff_override.is_none() {
+        if let Ok(value) = env::var("INFINISERVICE_MIN_BACKOFF") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                min_backoff_override = Some(parsed);
+                info!("Minimum backoff override from environment: {}s", parsed);
+            }
+        }
+    }
+
+    if max_backoff_override.is_none() {
+        if let Ok(value) = env::var("INFINISERVICE_MAX_BACKOFF") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                max_backoff_override = Some(parsed);
+                info!("Maximum backoff override from environment: {}s", parsed);
+            }
         }
     }
     
@@ -208,13 +251,44 @@ async fn main() -> anyhow::Result<()> {
     } else {
         info!("VirtIO device is optional - service will continue without it if needed");
     }
+
+    // Apply backoff overrides
+    if let Some(min_backoff) = min_backoff_override {
+        config.virtio_min_backoff_secs = min_backoff;
+    }
+    if let Some(max_backoff) = max_backoff_override {
+        config.virtio_max_backoff_secs = max_backoff;
+    }
+
+    // Apply device monitoring setting
+    if disable_device_monitoring {
+        config.enable_device_monitoring = false;
+        info!("Device change monitoring DISABLED");
+    } else if let Ok(value) = env::var("INFINISERVICE_DISABLE_MONITORING") {
+        if value.parse::<bool>().unwrap_or(false) {
+            config.enable_device_monitoring = false;
+            info!("Device change monitoring DISABLED via environment variable");
+        }
+    }
+
+    // Validate and fix configuration
+    config.validate_and_fix();
+
+    // Validate backoff values after overrides
+    if config.virtio_min_backoff_secs > config.virtio_max_backoff_secs {
+        warn!("Minimum backoff ({}) > maximum backoff ({}), swapping values",
+              config.virtio_min_backoff_secs, config.virtio_max_backoff_secs);
+    }
     
     if debug_mode {
         debug!("Full configuration:");
         debug!("  Collection interval: {}s", config.collection_interval);
         debug!("  Virtio serial path: {:?}", config.virtio_serial_path);
         debug!("  VirtIO required: {}", config.require_virtio);
-        debug!("  VirtIO retry interval: {}s", config.virtio_retry_interval);
+        debug!("  VirtIO retry interval: {}s (deprecated)", config.virtio_retry_interval);
+        debug!("  VirtIO min backoff: {}s", config.virtio_min_backoff_secs);
+        debug!("  VirtIO max backoff: {}s", config.virtio_max_backoff_secs);
+        debug!("  Device monitoring enabled: {}", config.enable_device_monitoring);
         debug!("  System: {}", std::env::consts::OS);
         debug!("  Architecture: {}", std::env::consts::ARCH);
     }

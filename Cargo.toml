@@ -67,8 +67,9 @@ regex = "1.0"
 winapi = { version = "0.3", features = [
     "winuser", "shellapi", "commdlg", "processthreadsapi",
     "psapi", "winnt", "handleapi", "fileapi", "errhandlingapi",
-    "setupapi", "devguid", "winreg", "winbase", "commapi", 
-    "ioapiset", "synchapi", "minwinbase", "winerror"
+    "setupapi", "devguid", "winreg", "winbase", "commapi",
+    "ioapiset", "synchapi", "minwinbase", "winerror",
+    "securitybaseapi"
 ] }
 
 # Windows service management

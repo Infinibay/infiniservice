@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
 use std::fs;
-use log::{debug, info};
+use log::debug;
 
 /// Operating system type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

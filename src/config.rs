@@ -22,8 +22,17 @@ pub struct Config {
     /// If false, the service will continue running even without VirtIO
     pub require_virtio: bool,
     
-    /// Interval for retrying VirtIO connection (in seconds)
+    /// Interval for retrying VirtIO connection (in seconds) (deprecated, use min/max backoff)
     pub virtio_retry_interval: u64,
+
+    /// Minimum backoff interval in seconds for VirtIO retry attempts
+    pub virtio_min_backoff_secs: u64,
+
+    /// Maximum backoff interval in seconds for VirtIO retry attempts
+    pub virtio_max_backoff_secs: u64,
+
+    /// Enable automatic device change monitoring
+    pub enable_device_monitoring: bool,
 }
 
 impl Default for Config {
@@ -40,6 +49,9 @@ impl Default for Config {
             service_name: "infiniservice".to_string(),
             require_virtio: false, // Allow service to run without VirtIO by default
             virtio_retry_interval: 300, // Retry every 5 minutes
+            virtio_min_backoff_secs: 5, // Start with 5 second backoff
+            virtio_max_backoff_secs: 300, // Maximum 5 minute backoff
+            enable_device_monitoring: true, // Enable device change monitoring by default
         }
     }
 }
@@ -49,6 +61,25 @@ impl Config {
     pub fn load() -> Result<Self> {
         // TODO: Implement configuration loading from file
         // For now, return default configuration
-        Ok(Self::default())
+        let mut config = Self::default();
+        config.validate_and_fix();
+        Ok(config)
+    }
+
+    /// Validate and fix configuration values
+    pub fn validate_and_fix(&mut self) {
+        // Ensure backoff values are valid
+        if self.virtio_min_backoff_secs == 0 {
+            self.virtio_min_backoff_secs = 5;
+        }
+        if self.virtio_max_backoff_secs == 0 {
+            self.virtio_max_backoff_secs = 300;
+        }
+        if self.virtio_min_backoff_secs > self.virtio_max_backoff_secs {
+            // Swap values if min > max
+            let temp = self.virtio_min_backoff_secs;
+            self.virtio_min_backoff_secs = self.virtio_max_backoff_secs;
+            self.virtio_max_backoff_secs = temp;
+        }
     }
 }

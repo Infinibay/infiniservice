@@ -6,7 +6,7 @@
 use anyhow::{Result, anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
-use log::{debug, warn, info};
+use log::{debug, info, warn};
 
 #[cfg(target_os = "windows")]
 use wmi::{COMLibrary, WMIConnection};

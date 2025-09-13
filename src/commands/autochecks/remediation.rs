@@ -730,13 +730,13 @@ impl RemediationEngine {
     
     async fn enable_defender(&self) -> Result<serde_json::Value> {
         info!("Enabling Windows Defender");
-        
-        let start_time = std::time::Instant::now();
-        
+
         #[cfg(target_os = "windows")]
         {
             use std::process::Command;
-            
+
+            #[allow(unused_variables)]
+            let _start_time = std::time::Instant::now();
             let mut actions_performed = Vec::new();
             let mut has_errors = false;
             let mut error_messages = Vec::new();
@@ -852,8 +852,8 @@ impl RemediationEngine {
                     }
                 })
                 .unwrap_or((false, false));
-            
-            let duration_ms = start_time.elapsed().as_millis() as u64;
+
+            let duration_ms = _start_time.elapsed().as_millis() as u64;
             let overall_status = if !has_errors && (realtime_enabled || antivirus_enabled) {
                 "success"
             } else if !actions_performed.is_empty() {
@@ -882,13 +882,14 @@ impl RemediationEngine {
     
     async fn update_defender_signatures(&self) -> Result<serde_json::Value> {
         info!("Updating Windows Defender signatures");
-        
-        let start_time = std::time::Instant::now();
-        
+
         #[cfg(target_os = "windows")]
         {
             use std::process::Command;
-            
+
+            #[allow(unused_variables)]
+            let _start_time = std::time::Instant::now();
+
             // Use PowerShell to update Windows Defender signatures
             let update_cmd = "Update-MpSignature";
             
@@ -901,7 +902,7 @@ impl RemediationEngine {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    let duration_ms = start_time.elapsed().as_millis() as u64;
+                    let duration_ms = _start_time.elapsed().as_millis() as u64;
                     
                     if output.status.success() {
                         info!("Windows Defender signatures updated successfully in {} ms", duration_ms);
@@ -950,7 +951,7 @@ impl RemediationEngine {
                             .output()
                         {
                             Ok(alt_output) => {
-                                let alt_duration = start_time.elapsed().as_millis() as u64;
+                                let alt_duration = _start_time.elapsed().as_millis() as u64;
                                 
                                 if alt_output.status.success() {
                                     info!("Windows Defender signatures updated using MpCmdRun");
