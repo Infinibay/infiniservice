@@ -165,9 +165,10 @@ pub type DiskIOStats = DiskIO;
 pub struct DataCollector {
     system: System,
     previous_disk_stats: Option<HashMap<String, DiskIoSnapshot>>,
-    previous_network_stats: Option<HashMap<String, NetworkSnapshot>>,
+    previous_network_stats: Option<HashMap<InterfaceKey, NetworkSnapshot>>,
     last_collection_time: Option<Instant>,
     initial_ip_collection_successful: bool,
+    interface_key_cache: HashMap<String, InterfaceKey>,
     #[cfg(target_os = "windows")]
     wmi_conn: Option<WMIConnection>,
 }
@@ -192,6 +193,91 @@ struct NetworkSnapshot {
     errors_in: u64,
     errors_out: u64,
     timestamp: Instant,
+}
+
+/// Stable interface identifier for reliable correlation across Windows data sources
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct InterfaceKey {
+    guid: Option<String>,
+    mac_address: Option<String>,
+    interface_index: Option<u32>,
+    name: String, // Keep name as fallback
+}
+
+impl InterfaceKey {
+    /// Create a new InterfaceKey with all available identifiers
+    fn new(name: String, guid: Option<String>, mac_address: Option<String>, interface_index: Option<u32>) -> Self {
+        Self {
+            guid,
+            mac_address,
+            interface_index,
+            name,
+        }
+    }
+
+    /// Check if this key matches another key based on stable identifiers
+    /// Returns match confidence score (higher is better match)
+    fn matches(&self, other: &InterfaceKey) -> u32 {
+        let mut score = 0;
+
+        // Highest priority: GUID match
+        if let (Some(ref self_guid), Some(ref other_guid)) = (&self.guid, &other.guid) {
+            if self_guid == other_guid {
+                return 1000; // Perfect match
+            }
+        }
+
+        // High priority: MAC address + InterfaceIndex match
+        if let (Some(ref self_mac), Some(ref other_mac)) = (&self.mac_address, &other.mac_address) {
+            if self_mac == other_mac {
+                score += 500;
+                if let (Some(self_idx), Some(other_idx)) = (self.interface_index, other.interface_index) {
+                    if self_idx == other_idx {
+                        score += 400; // MAC + Index match
+                    }
+                }
+            }
+        }
+
+        // Medium priority: InterfaceIndex match only
+        if score == 0 {
+            if let (Some(self_idx), Some(other_idx)) = (self.interface_index, other.interface_index) {
+                if self_idx == other_idx {
+                    score += 300;
+                }
+            }
+        }
+
+        // Lower priority: Enhanced string matching
+        if score == 0 {
+            let self_name_clean = self.name.to_lowercase().replace(&[' ', '-', '_', '(', ')', '#'], "");
+            let other_name_clean = other.name.to_lowercase().replace(&[' ', '-', '_', '(', ')', '#'], "");
+
+            if self_name_clean == other_name_clean {
+                score += 100;
+            } else if self_name_clean.contains(&other_name_clean) || other_name_clean.contains(&self_name_clean) {
+                score += 50;
+            }
+        }
+
+        score
+    }
+
+    /// Check if this key has any stable identifiers available
+    fn has_stable_identifiers(&self) -> bool {
+        self.guid.is_some() || self.mac_address.is_some() || self.interface_index.is_some()
+    }
+
+    /// Get the best available display name
+    fn display_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl std::fmt::Display for InterfaceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
 }
 
 impl DataCollector {
@@ -224,6 +310,7 @@ impl DataCollector {
             previous_network_stats: None,
             last_collection_time: None,
             initial_ip_collection_successful: false,
+            interface_key_cache: HashMap::new(),
             #[cfg(target_os = "windows")]
             wmi_conn,
         })
@@ -715,29 +802,29 @@ impl DataCollector {
     fn collect_network_metrics(&mut self) -> Result<NetworkMetrics> {
         let current_network_stats;
         let mut interfaces = vec![];
-        
+
         #[cfg(target_os = "linux")]
         {
             current_network_stats = self.collect_network_stats_linux()?;
         }
-        
+
         #[cfg(target_os = "windows")]
         {
             current_network_stats = self.collect_network_stats_windows()?;
         }
-        
+
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             // Fallback for other platforms
             return Ok(NetworkMetrics { interfaces: vec![] });
         }
-        
-        // Get IP addresses for interfaces
-        let interface_ips = self.collect_interface_ips();
+
+        // Get IP addresses for interfaces using InterfaceKey
+        let interface_ips = self.collect_interface_ips_with_keys();
 
         // Update initial IP collection status
         let up_interfaces_with_ips = interface_ips.iter()
-            .filter(|(name, ips)| !ips.is_empty() && self.is_interface_up(name))
+            .filter(|(key, ips)| !ips.is_empty() && self.is_interface_up_by_key(key))
             .count();
 
         if !self.initial_ip_collection_successful && up_interfaces_with_ips > 0 {
@@ -748,21 +835,94 @@ impl DataCollector {
         // Calculate rates if we have previous stats
         if let Some(previous) = &self.previous_network_stats {
             interfaces = self.calculate_network_rates(&current_network_stats, previous);
-            // Add IP addresses to each interface
-            for interface in &mut interfaces {
-                if let Some(ips) = interface_ips.get(&interface.name) {
-                    interface.ip_addresses = ips.clone();
+
+            // Build a map from interface name to InterfaceKey to preserve context (platform-independent)
+            let mut name_to_key_map = HashMap::new();
+            for stats_key in current_network_stats.keys() {
+                name_to_key_map.insert(stats_key.display_name().to_string(), stats_key.clone());
+            }
+
+            // Correlate interfaces and assign IP addresses
+            #[cfg(target_os = "windows")]
+            {
+                let correlations = self.correlate_interface_keys(&current_network_stats, &interface_ips);
+                self.update_interface_cache(&correlations);
+
+                // Add IP addresses to each interface with correlation using preserved InterfaceKey
+                for interface in &mut interfaces {
+                    if let Some(interface_key) = name_to_key_map.get(&interface.name) {
+                        // Use the original InterfaceKey with stable identifiers
+                        if let Some(matched_ip_key) = self.find_best_interface_match(interface_key, &interface_ips) {
+                            if let Some(ips) = interface_ips.get(&matched_ip_key) {
+                                interface.ip_addresses = ips.clone();
+                                debug!("Assigned IPs using preserved InterfaceKey: '{}' (GUID: {:?}, MAC: {:?}) -> '{}' (IPs: {:?})",
+                                       interface.name, interface_key.guid, interface_key.mac_address,
+                                       matched_ip_key.display_name(),
+                                       ips.iter().map(|ip| mask_ip(ip)).collect::<Vec<_>>());
+                            }
+                        }
+                    } else {
+                        // Fallback to name-only key if not found in map
+                        let fallback_key = InterfaceKey::new(interface.name.clone(), None, None, None);
+                        if let Some(matched_ip_key) = self.find_best_interface_match(&fallback_key, &interface_ips) {
+                            if let Some(ips) = interface_ips.get(&matched_ip_key) {
+                                interface.ip_addresses = ips.clone();
+                                debug!("Assigned IPs using fallback name-only key: '{}' -> '{}' (IPs: {:?})",
+                                       interface.name, matched_ip_key.display_name(),
+                                       ips.iter().map(|ip| mask_ip(ip)).collect::<Vec<_>>());
+                            }
+                        }
+                    }
                 }
-                interface.is_up = self.is_interface_up(&interface.name);
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                // For Linux, use simpler name-based matching for now
+                for interface in &mut interfaces {
+                    for (ip_key, ips) in &interface_ips {
+                        if ip_key.display_name() == &interface.name {
+                            interface.ip_addresses = ips.clone();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Update interface status using preserved InterfaceKey context (platform-independent)
+            for interface in &mut interfaces {
+                if let Some(interface_key) = name_to_key_map.get(&interface.name) {
+                    interface.is_up = self.is_interface_up_by_key(interface_key);
+                } else {
+                    let fallback_key = InterfaceKey::new(interface.name.clone(), None, None, None);
+                    interface.is_up = self.is_interface_up_by_key(&fallback_key);
+                }
             }
         } else {
             // First collection, just report current values as-is
-            for (name, stats) in &current_network_stats {
-                let ip_addresses = interface_ips.get(name).cloned().unwrap_or_default();
-                let is_up = self.is_interface_up(name);
+            for (stats_key, stats) in &current_network_stats {
+                // Try to find matching IP addresses using correlation
+                #[cfg(target_os = "windows")]
+                let ip_addresses = {
+                    if let Some(matched_ip_key) = self.find_best_interface_match(stats_key, &interface_ips) {
+                        interface_ips.get(&matched_ip_key).cloned().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                };
+
+                #[cfg(target_os = "linux")]
+                let ip_addresses = {
+                    interface_ips.iter()
+                        .find(|(ip_key, _)| ip_key.display_name() == stats_key.display_name())
+                        .map(|(_, ips)| ips.clone())
+                        .unwrap_or_default()
+                };
+
+                let is_up = self.is_interface_up_by_key(stats_key);
 
                 interfaces.push(NetworkInterface {
-                    name: name.clone(),
+                    name: stats_key.display_name().to_string(),
                     bytes_received: stats.bytes_received,
                     bytes_sent: stats.bytes_sent,
                     packets_received: stats.packets_received,
@@ -774,17 +934,17 @@ impl DataCollector {
                 });
             }
         }
-        
+
         // Update previous stats for next calculation
         if !current_network_stats.is_empty() {
             self.previous_network_stats = Some(current_network_stats);
         }
-        
+
         Ok(NetworkMetrics { interfaces })
     }
     
     #[cfg(target_os = "linux")]
-    fn collect_network_stats_linux(&self) -> Result<HashMap<String, NetworkSnapshot>> {
+    fn collect_network_stats_linux(&self) -> Result<HashMap<InterfaceKey, NetworkSnapshot>> {
         use std::fs;
         
         let mut network_stats = HashMap::new();
@@ -819,8 +979,15 @@ impl DataCollector {
                 let packets_sent = stats[9].parse::<u64>().unwrap_or(0);
                 let errors_out = stats[10].parse::<u64>().unwrap_or(0);
                 
-                network_stats.insert(
+                let interface_key = InterfaceKey::new(
                     interface_name.to_string(),
+                    None, // GUID not available on Linux
+                    None, // MAC address not readily available from /proc/net/dev
+                    None, // InterfaceIndex not available from /proc/net/dev
+                );
+
+                network_stats.insert(
+                    interface_key,
                     NetworkSnapshot {
                         bytes_received,
                         bytes_sent,
@@ -838,10 +1005,10 @@ impl DataCollector {
     }
     
     #[cfg(target_os = "windows")]
-    fn collect_network_stats_windows(&self) -> Result<HashMap<String, NetworkSnapshot>> {
+    fn collect_network_stats_windows(&self) -> Result<HashMap<InterfaceKey, NetworkSnapshot>> {
         let mut network_stats = HashMap::new();
         let now = Instant::now();
-        
+
         // Use WMI if available
         if let Some(wmi_conn) = &self.wmi_conn {
             #[derive(Deserialize)]
@@ -854,49 +1021,202 @@ impl DataCollector {
                 PacketsReceivedErrors: u64,
                 PacketsOutboundErrors: u64,
             }
-            
+
+            #[derive(Deserialize)]
+            struct Win32NetworkAdapter {
+                Name: String,
+                GUID: Option<String>,
+                MACAddress: Option<String>,
+                InterfaceIndex: Option<u32>,
+                NetEnabled: Option<bool>,
+                NetConnectionID: Option<String>,
+                Description: Option<String>,
+            }
+
+            // First get performance data
+            let mut perf_data = HashMap::new();
             if let Ok(results) = wmi_conn.raw_query::<Win32PerfRawDataTcpipNetworkInterface>(
                 "SELECT * FROM Win32_PerfRawData_Tcpip_NetworkInterface"
             ) {
                 for interface in results {
                     // Skip certain virtual interfaces
-                    if interface.Name.contains("isatap") || 
+                    if interface.Name.contains("isatap") ||
                        interface.Name.contains("Teredo") ||
                        interface.Name == "_Total" {
                         continue;
                     }
-                    
-                    network_stats.insert(
-                        interface.Name,
-                        NetworkSnapshot {
-                            bytes_received: interface.BytesReceivedPerSec,
-                            bytes_sent: interface.BytesSentPerSec,
-                            packets_received: interface.PacketsReceivedPerSec,
-                            packets_sent: interface.PacketsSentPerSec,
-                            errors_in: interface.PacketsReceivedErrors,
-                            errors_out: interface.PacketsOutboundErrors,
-                            timestamp: now,
-                        },
-                    );
+
+                    perf_data.insert(interface.Name.clone(), NetworkSnapshot {
+                        bytes_received: interface.BytesReceivedPerSec,
+                        bytes_sent: interface.BytesSentPerSec,
+                        packets_received: interface.PacketsReceivedPerSec,
+                        packets_sent: interface.PacketsSentPerSec,
+                        errors_in: interface.PacketsReceivedErrors,
+                        errors_out: interface.PacketsOutboundErrors,
+                        timestamp: now,
+                    });
                 }
             }
+
+            // Then get adapter information for stable identifiers with enhanced fields
+            let mut adapter_keys = HashMap::new();
+            if let Ok(adapters) = wmi_conn.raw_query::<Win32NetworkAdapter>(
+                "SELECT Name, GUID, MACAddress, InterfaceIndex, NetConnectionID, Description FROM Win32_NetworkAdapter WHERE NetEnabled=true"
+            ) {
+                for adapter in adapters {
+                    // Normalize MAC address format
+                    let mac_address = adapter.MACAddress.map(|mac| {
+                        mac.replace(":", "").replace("-", "").to_uppercase()
+                    });
+
+                    let interface_key = InterfaceKey::new(
+                        adapter.Name.clone(),
+                        adapter.GUID,
+                        mac_address,
+                        adapter.InterfaceIndex,
+                    );
+
+                    debug!("Found adapter: {} with GUID: {:?}, MAC: {:?}, Index: {:?}, NetConnectionID: {:?}, Description: {:?}",
+                           adapter.Name, interface_key.guid, interface_key.mac_address,
+                           interface_key.interface_index, adapter.NetConnectionID, adapter.Description);
+
+                    // Store multiple keys for different correlation approaches
+                    adapter_keys.insert(adapter.Name.clone(), interface_key.clone());
+
+                    // Also store by NetConnectionID if available
+                    if let Some(ref net_conn_id) = adapter.NetConnectionID {
+                        if !net_conn_id.is_empty() {
+                            adapter_keys.insert(net_conn_id.clone(), interface_key.clone());
+                        }
+                    }
+
+                    // Also store by Description if available
+                    if let Some(ref description) = adapter.Description {
+                        if !description.is_empty() {
+                            adapter_keys.insert(description.clone(), interface_key.clone());
+                        }
+                    }
+                }
+            }
+
+            // Fallback: Try PowerShell Get-NetAdapter for additional correlation if WMI data is insufficient
+            if adapter_keys.is_empty() {
+                debug!("WMI adapter query returned no results, trying PowerShell Get-NetAdapter");
+                self.try_powershell_netadapter_correlation(&mut adapter_keys);
+            }
+
+            // Correlate performance data with adapter information
+            for (perf_name, snapshot) in perf_data {
+                // Try to find matching adapter by name correlation
+                let interface_key = if let Some(adapter_key) = adapter_keys.get(&perf_name) {
+                    adapter_key.clone()
+                } else {
+                    // Try fuzzy matching if exact name doesn't match
+                    let mut best_match = None;
+                    let mut best_score = 0;
+
+                    for (adapter_name, adapter_key) in &adapter_keys {
+                        let temp_key = InterfaceKey::new(perf_name.clone(), None, None, None);
+                        let score = temp_key.matches(adapter_key);
+                        if score > best_score {
+                            best_score = score;
+                            best_match = Some(adapter_key.clone());
+                        }
+                    }
+
+                    if let Some(matched_key) = best_match {
+                        debug!("Correlated performance interface '{}' with adapter '{}' (score: {})",
+                               perf_name, matched_key.name, best_score);
+                        matched_key
+                    } else {
+                        // Fallback to name-only key
+                        warn!("No adapter correlation found for performance interface: {}", perf_name);
+                        InterfaceKey::new(perf_name, None, None, None)
+                    }
+                };
+
+                network_stats.insert(interface_key, snapshot);
+            }
         }
-        
+
         Ok(network_stats)
     }
-    
+
+    /// PowerShell Get-NetAdapter correlation fallback for enhanced adapter identification
+    #[cfg(target_os = "windows")]
+    fn try_powershell_netadapter_correlation(&self, adapter_keys: &mut HashMap<String, InterfaceKey>) {
+        use std::process::Command;
+
+        let output = Command::new("powershell")
+            .args(&["-Command", "Get-NetAdapter | Select-Object InterfaceDescription, InterfaceAlias, InterfaceGuid, MacAddress, ifIndex | ConvertTo-Json -Depth 3"])
+            .output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let output_str = String::from_utf8_lossy(&output.stdout);
+                if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&output_str) {
+                    let empty_vec = vec![];
+                    let adapters = if json_value.is_array() {
+                        json_value.as_array().unwrap_or(&empty_vec)
+                    } else {
+                        std::slice::from_ref(&json_value)
+                    };
+
+                    for adapter in adapters {
+                        if let (Some(description), Some(alias)) = (
+                            adapter.get("InterfaceDescription").and_then(|v| v.as_str()),
+                            adapter.get("InterfaceAlias").and_then(|v| v.as_str())
+                        ) {
+                            let guid = adapter.get("InterfaceGuid").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let mac_address = adapter.get("MacAddress")
+                                .and_then(|v| v.as_str())
+                                .map(|mac| mac.replace(":", "").replace("-", "").to_uppercase());
+                            let interface_index = adapter.get("ifIndex")
+                                .and_then(|v| v.as_u64())
+                                .map(|i| i as u32);
+
+                            let interface_key = InterfaceKey::new(
+                                description.to_string(),
+                                guid,
+                                mac_address,
+                                interface_index,
+                            );
+
+                            debug!("PowerShell Get-NetAdapter found: Description='{}', Alias='{}', GUID={:?}, MAC={:?}, Index={:?}",
+                                   description, alias, interface_key.guid, interface_key.mac_address, interface_key.interface_index);
+
+                            // Store by multiple identifiers
+                            adapter_keys.insert(description.to_string(), interface_key.clone());
+                            adapter_keys.insert(alias.to_string(), interface_key.clone());
+                        }
+                    }
+
+                    debug!("PowerShell Get-NetAdapter correlation added {} adapter mappings", adapter_keys.len());
+                } else {
+                    debug!("Failed to parse PowerShell Get-NetAdapter JSON output");
+                }
+            } else {
+                debug!("PowerShell Get-NetAdapter command failed");
+            }
+        } else {
+            debug!("Failed to execute PowerShell Get-NetAdapter command");
+        }
+    }
     fn calculate_network_rates(
         &self,
-        current: &HashMap<String, NetworkSnapshot>,
-        previous: &HashMap<String, NetworkSnapshot>
+        current: &HashMap<InterfaceKey, NetworkSnapshot>,
+        previous: &HashMap<InterfaceKey, NetworkSnapshot>
     ) -> Vec<NetworkInterface> {
         let mut interfaces = vec![];
-        
-        for (name, current_stats) in current {
-            if let Some(prev_stats) = previous.get(name) {
+
+        for (interface_key, current_stats) in current {
+            // Try to find previous stats for this interface using correlation
+            let prev_stats = self.find_matching_previous_stats(interface_key, previous);
+
+            if let Some(prev_stats) = prev_stats {
                 let time_diff = current_stats.timestamp.duration_since(prev_stats.timestamp);
                 let seconds = time_diff.as_secs_f64();
-                
+
                 if seconds > 0.0 {
                     // Calculate deltas (handle counter wraparound)
                     let bytes_received = current_stats.bytes_received.saturating_sub(prev_stats.bytes_received);
@@ -905,9 +1225,9 @@ impl DataCollector {
                     let packets_sent = current_stats.packets_sent.saturating_sub(prev_stats.packets_sent);
                     let errors_in = current_stats.errors_in.saturating_sub(prev_stats.errors_in);
                     let errors_out = current_stats.errors_out.saturating_sub(prev_stats.errors_out);
-                    
+
                     interfaces.push(NetworkInterface {
-                        name: name.clone(),
+                        name: interface_key.display_name().to_string(),
                         bytes_received: (bytes_received as f64 / seconds) as u64,
                         bytes_sent: (bytes_sent as f64 / seconds) as u64,
                         packets_received: (packets_received as f64 / seconds) as u64,
@@ -921,7 +1241,7 @@ impl DataCollector {
             } else {
                 // New interface, report current values
                 interfaces.push(NetworkInterface {
-                    name: name.clone(),
+                    name: interface_key.display_name().to_string(),
                     bytes_received: current_stats.bytes_received,
                     bytes_sent: current_stats.bytes_sent,
                     packets_received: current_stats.packets_received,
@@ -933,8 +1253,45 @@ impl DataCollector {
                 });
             }
         }
-        
+
         interfaces
+    }
+
+    /// Find matching previous stats using InterfaceKey correlation
+    fn find_matching_previous_stats<'a>(
+        &self,
+        current_key: &InterfaceKey,
+        previous: &'a HashMap<InterfaceKey, NetworkSnapshot>
+    ) -> Option<&'a NetworkSnapshot> {
+        // First try exact match
+        if let Some(stats) = previous.get(current_key) {
+            return Some(stats);
+        }
+
+        // Then try correlation by stable identifiers
+        let mut best_match = None;
+        let mut best_score = 0;
+
+        // Dynamic threshold: use 300 when stable identifiers are present, otherwise accept >=100 (exact name)
+        let threshold = if current_key.has_stable_identifiers() {
+            300  // Higher threshold for keys with stable identifiers
+        } else {
+            100  // Lower threshold for name-only keys (Linux)
+        };
+
+        for (prev_key, prev_stats) in previous {
+            let score = current_key.matches(prev_key);
+            if score > best_score && score >= threshold {
+                best_score = score;
+                best_match = Some(prev_stats);
+            }
+        }
+
+        if best_match.is_some() {
+            debug!("Correlated interface with previous stats (score: {})", best_score);
+        }
+
+        best_match
     }
     
     fn collect_system_info_metrics(&self) -> Result<SystemInfoMetrics> {
@@ -1232,21 +1589,230 @@ impl DataCollector {
 
         #[cfg(target_os = "windows")]
         {
-            // Try PowerShell-based detection first
-            interface_ips = self.collect_interface_ips_powershell()
-                .unwrap_or_else(|| self.collect_interface_ips_text_windows());
+            debug!("Starting Windows IP collection with enhanced VirtIO support");
+
+            // Try multiple methods with correlation
+            let mut combined_ips: HashMap<InterfaceKey, Vec<String>> = HashMap::new();
+
+            // Method 1: Try PowerShell-based detection first
+            if let Some(mut powershell_ips) = self.collect_interface_ips_powershell() {
+                debug!("PowerShell method found {} interfaces", powershell_ips.len());
+
+                // Deduplicate PowerShell IPs
+                for (_, ips) in powershell_ips.iter_mut() {
+                    ips.sort_unstable();
+                    ips.dedup();
+                }
+
+                combined_ips.extend(powershell_ips);
+            }
+
+            // Method 2: Enhanced ipconfig parsing with VirtIO support
+            if let Some(ipconfig_ips) = self.try_ipconfig_parsing() {
+                debug!("Enhanced ipconfig method found {} interfaces", ipconfig_ips.len());
+
+                // For each interface found by ipconfig, try to correlate with existing interfaces
+                for (ipconfig_key, ips) in ipconfig_ips {
+                    let mut correlation_found = None;
+
+                    // Try to find a correlation with existing interfaces using InterfaceKey matching
+                    for existing_key in combined_ips.keys() {
+                        if existing_key.matches(&ipconfig_key) >= 100 {
+                            correlation_found = Some(existing_key.clone());
+                            break;
+                        }
+                    }
+
+                    // Apply the correlation or add as new interface
+                    if let Some(existing_key) = correlation_found {
+                        // Merge IPs from both sources and deduplicate
+                        let existing_ips = combined_ips.get_mut(&existing_key).unwrap();
+                        let original_count = existing_ips.len();
+                        existing_ips.extend(ips.clone());
+                        existing_ips.sort_unstable();
+                        existing_ips.dedup();
+                        let final_count = existing_ips.len();
+
+                        if final_count < original_count + ips.len() {
+                            debug!("Merged IPs from ipconfig '{}' into existing interface '{}' and removed {} duplicates",
+                                   ipconfig_key.display_name(), existing_key.display_name(), (original_count + ips.len()) - final_count);
+                        } else {
+                            debug!("Merged IPs from ipconfig '{}' into existing interface '{}'", ipconfig_key.display_name(), existing_key.display_name());
+                        }
+                    } else {
+                        // If no correlation found, add as new interface
+                        combined_ips.insert(ipconfig_key.clone(), ips);
+                        debug!("Added new interface '{}' from ipconfig", ipconfig_key.display_name());
+                    }
+                }
+            }
+
+            // Method 3: Fallback text-based collection
+            if combined_ips.is_empty() {
+                debug!("Using fallback text-based collection");
+                let text_ips = self.collect_interface_ips_text_windows();
+                // Convert String keys to InterfaceKey
+                combined_ips = text_ips.into_iter()
+                    .map(|(name, ips)| (InterfaceKey::new(name, None, None, None), ips))
+                    .collect();
+            }
+
+            interface_ips = combined_ips;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let total_interfaces = interface_ips.len();
+            let up_interfaces_with_ips = interface_ips.iter()
+                .filter(|(key, ips)| !ips.is_empty() && self.is_interface_up_by_key(key))
+                .count();
+
+            info!("IP collection completed: {} total interfaces, {} UP interfaces with IPs",
+                  total_interfaces, up_interfaces_with_ips);
+
+            if up_interfaces_with_ips == 0 {
+                warn!("No UP interfaces with IP addresses detected");
+            }
+
+            // Convert InterfaceKey keys back to String keys for compatibility
+            return interface_ips.into_iter()
+                .map(|(key, ips)| (key.display_name().to_string(), ips))
+                .collect();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let total_interfaces = interface_ips.len();
+            let up_interfaces_with_ips = interface_ips.iter()
+                .filter(|(name, ips)| !ips.is_empty() && self.is_interface_up(name))
+                .count();
+
+            info!("IP collection completed: {} total interfaces, {} UP interfaces with IPs",
+                  total_interfaces, up_interfaces_with_ips);
+
+            if up_interfaces_with_ips == 0 {
+                warn!("No UP interfaces with IP addresses detected");
+            }
+
+            return interface_ips;
+        }
+    }
+
+    /// Collect interface IPs with InterfaceKey support for enhanced correlation
+    fn collect_interface_ips_with_keys(&self) -> HashMap<InterfaceKey, Vec<String>> {
+        debug!("Starting IP collection with InterfaceKey support");
+        let mut interface_ips = HashMap::new();
+
+        #[cfg(target_os = "linux")]
+        {
+            // For Linux, convert the existing string-based collection to InterfaceKey
+            let string_based_ips = self.collect_interface_ips();
+            for (name, ips) in string_based_ips {
+                let interface_key = InterfaceKey::new(name, None, None, None);
+                interface_ips.insert(interface_key, ips);
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            debug!("Starting Windows IP collection with InterfaceKey correlation");
+
+            let mut all_ip_sources = HashMap::new();
+
+            // Method 1: PowerShell Get-NetIPAddress (with InterfaceIndex)
+            if let Some(powershell_ips) = self.try_powershell_get_netipaddress() {
+                debug!("PowerShell Get-NetIPAddress found {} interfaces", powershell_ips.len());
+                for (key, ips) in powershell_ips {
+                    debug!("PowerShell source: {} (Index: {:?}) has {} IPs",
+                           key.display_name(), key.interface_index, ips.len());
+                    all_ip_sources.insert(key, ips);
+                }
+            }
+
+            // Method 2: PowerShell WMI (with MAC and InterfaceIndex)
+            if let Some(wmi_ips) = self.try_powershell_wmi() {
+                debug!("PowerShell WMI found {} interfaces", wmi_ips.len());
+
+                // Correlate WMI results with existing sources using direct matching
+                let mut correlations = HashMap::new();
+                for wmi_key in wmi_ips.keys() {
+                    if let Some(best_match) = self.find_best_interface_match(wmi_key, &all_ip_sources) {
+                        correlations.insert(wmi_key.clone(), best_match);
+                    }
+                }
+
+                for (wmi_key, wmi_ips) in wmi_ips {
+                    if let Some(existing_key) = correlations.get(&wmi_key) {
+                        // Merge IPs with existing interface
+                        if let Some(existing_ips) = all_ip_sources.get_mut(existing_key) {
+                            let original_count = existing_ips.len();
+                            existing_ips.extend(wmi_ips.clone());
+                            existing_ips.sort_unstable();
+                            existing_ips.dedup();
+                            debug!("Merged WMI IPs with existing interface '{}': {} -> {} IPs",
+                                   existing_key.display_name(), original_count, existing_ips.len());
+                        }
+                    } else {
+                        // Add as new interface
+                        debug!("Adding new WMI interface: {} (MAC: {:?}) with {} IPs",
+                               wmi_key.display_name(), wmi_key.mac_address, wmi_ips.len());
+                        all_ip_sources.insert(wmi_key, wmi_ips);
+                    }
+                }
+            }
+
+            // Method 3: ipconfig parsing (with MAC addresses)
+            if let Some(ipconfig_ips) = self.try_ipconfig_parsing() {
+                debug!("ipconfig parsing found {} interfaces", ipconfig_ips.len());
+
+                // Correlate ipconfig results with existing sources using direct matching
+                let mut correlations = HashMap::new();
+                for ipconfig_key in ipconfig_ips.keys() {
+                    if let Some(best_match) = self.find_best_interface_match(ipconfig_key, &all_ip_sources) {
+                        correlations.insert(ipconfig_key.clone(), best_match);
+                    }
+                }
+
+                for (ipconfig_key, ipconfig_ips) in ipconfig_ips {
+                    if let Some(existing_key) = correlations.get(&ipconfig_key) {
+                        // Merge IPs with existing interface
+                        if let Some(existing_ips) = all_ip_sources.get_mut(existing_key) {
+                            let original_count = existing_ips.len();
+                            existing_ips.extend(ipconfig_ips.clone());
+                            existing_ips.sort_unstable();
+                            existing_ips.dedup();
+                            debug!("Merged ipconfig IPs with existing interface '{}': {} -> {} IPs",
+                                   existing_key.display_name(), original_count, existing_ips.len());
+                        }
+                    } else {
+                        // Add as new interface
+                        debug!("Adding new ipconfig interface: {} (MAC: {:?}) with {} IPs",
+                               ipconfig_key.display_name(), ipconfig_key.mac_address, ipconfig_ips.len());
+                        all_ip_sources.insert(ipconfig_key, ipconfig_ips);
+                    }
+                }
+            }
+
+            interface_ips = all_ip_sources;
         }
 
         let total_interfaces = interface_ips.len();
         let up_interfaces_with_ips = interface_ips.iter()
-            .filter(|(name, ips)| !ips.is_empty() && self.is_interface_up(name))
+            .filter(|(key, ips)| !ips.is_empty() && self.is_interface_up_by_key(key))
             .count();
 
-        info!("IP collection completed: {} total interfaces, {} UP interfaces with IPs",
+        info!("InterfaceKey IP collection completed: {} total interfaces, {} UP interfaces with IPs",
               total_interfaces, up_interfaces_with_ips);
 
         if up_interfaces_with_ips == 0 {
             warn!("No UP interfaces with IP addresses detected");
+        }
+
+        // Log detailed interface information
+        for (key, ips) in &interface_ips {
+            debug!("Interface '{}' (GUID: {:?}, MAC: {:?}, Index: {:?}) has {} IPs: {:?}",
+                   key.display_name(), key.guid, key.mac_address, key.interface_index,
+                   ips.len(), ips.iter().map(|ip| mask_ip(ip)).collect::<Vec<_>>());
         }
 
         interface_ips
@@ -1292,7 +1858,7 @@ impl DataCollector {
 
     /// Enhanced PowerShell-based IP collection for Windows with multiple fallback methods
     #[cfg(target_os = "windows")]
-    fn collect_interface_ips_powershell(&self) -> Option<HashMap<String, Vec<String>>> {
+    fn collect_interface_ips_powershell(&self) -> Option<HashMap<InterfaceKey, Vec<String>>> {
         use std::process::Command;
 
         // Method 1: Try modern PowerShell cmdlet (most reliable)
@@ -1319,11 +1885,11 @@ impl DataCollector {
 
     /// Method 1: Modern PowerShell Get-NetIPAddress cmdlet
     #[cfg(target_os = "windows")]
-    fn try_powershell_get_netipaddress(&self) -> Option<HashMap<String, Vec<String>>> {
+    fn try_powershell_get_netipaddress(&self) -> Option<HashMap<InterfaceKey, Vec<String>>> {
         use std::process::Command;
 
         let output = Command::new("powershell")
-            .args(&["-Command", "Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.AddressState -eq 'Preferred'} | ConvertTo-Json -Depth 3"])
+            .args(&["-Command", "Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.AddressState -eq 'Preferred'} | Select-Object InterfaceAlias, IPAddress, InterfaceIndex | ConvertTo-Json -Depth 3"])
             .output()
             .ok()?;
 
@@ -1354,8 +1920,21 @@ impl DataCollector {
                 addr.get("IPAddress").and_then(|v| v.as_str())
             ) {
                 if self.is_valid_ip_address(ip_address) {
-                    debug!("Found IP {} for interface {}", mask_ip(ip_address), interface_name);
-                    interface_ips.entry(interface_name.to_string())
+                    let interface_index = addr.get("InterfaceIndex")
+                        .and_then(|v| v.as_u64())
+                        .map(|i| i as u32);
+
+                    let interface_key = InterfaceKey::new(
+                        interface_name.to_string(),
+                        None, // GUID not available from Get-NetIPAddress
+                        None, // MAC address not available from Get-NetIPAddress
+                        interface_index,
+                    );
+
+                    debug!("Found IP {} for interface {} (InterfaceIndex: {:?})",
+                           mask_ip(ip_address), interface_name, interface_index);
+
+                    interface_ips.entry(interface_key)
                         .or_insert_with(Vec::new)
                         .push(ip_address.to_string());
                 }
@@ -1371,12 +1950,12 @@ impl DataCollector {
 
     /// Method 2: WMI via PowerShell (more compatible with older Windows)
     #[cfg(target_os = "windows")]
-    fn try_powershell_wmi(&self) -> Option<HashMap<String, Vec<String>>> {
+    fn try_powershell_wmi(&self) -> Option<HashMap<InterfaceKey, Vec<String>>> {
         use std::process::Command;
 
         let output = Command::new("powershell")
             .args(&["-Command",
-                "Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -eq $true} | ForEach-Object { [PSCustomObject]@{ Name = $_.Description; IPAddress = $_.IPAddress } } | ConvertTo-Json -Depth 3"])
+                "Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -eq $true} | ForEach-Object { [PSCustomObject]@{ Name = $_.Description; IPAddress = $_.IPAddress; MACAddress = $_.MACAddress; InterfaceIndex = $_.InterfaceIndex } } | ConvertTo-Json -Depth 3"])
             .output()
             .ok()?;
 
@@ -1409,13 +1988,33 @@ impl DataCollector {
                 for ip in ip_array {
                     if let Some(ip_str) = ip.as_str() {
                         if self.is_valid_ip_address(ip_str) {
-                            debug!("Found IP {} for interface {}", ip_str, interface_name);
                             ips.push(ip_str.to_string());
                         }
                     }
                 }
+
                 if !ips.is_empty() {
-                    interface_ips.insert(interface_name.to_string(), ips);
+                    // Extract additional identifiers
+                    let mac_address = adapter.get("MACAddress")
+                        .and_then(|v| v.as_str())
+                        .map(|mac| mac.replace(":", "").replace("-", "").to_uppercase());
+
+                    let interface_index = adapter.get("InterfaceIndex")
+                        .and_then(|v| v.as_u64())
+                        .map(|i| i as u32);
+
+                    let interface_key = InterfaceKey::new(
+                        interface_name.to_string(),
+                        None, // GUID not available from Win32_NetworkAdapterConfiguration
+                        mac_address,
+                        interface_index,
+                    );
+
+                    debug!("Found IPs {:?} for interface {} (MAC: {:?}, InterfaceIndex: {:?})",
+                           ips.iter().map(|ip| mask_ip(ip)).collect::<Vec<_>>(),
+                           interface_name, interface_key.mac_address, interface_key.interface_index);
+
+                    interface_ips.insert(interface_key, ips);
                 }
             }
         }
@@ -1427,10 +2026,11 @@ impl DataCollector {
         }
     }
 
-    /// Method 3: ipconfig parsing (universal fallback)
+    /// Method 3: ipconfig parsing (universal fallback with VirtIO support)
     #[cfg(target_os = "windows")]
-    fn try_ipconfig_parsing(&self) -> Option<HashMap<String, Vec<String>>> {
+    fn try_ipconfig_parsing(&self) -> Option<HashMap<InterfaceKey, Vec<String>>> {
         use std::process::Command;
+        use regex::Regex;
 
         let output = Command::new("ipconfig")
             .args(&["/all"])
@@ -1443,47 +2043,282 @@ impl DataCollector {
         }
 
         let output_str = String::from_utf8_lossy(&output.stdout);
-        let mut interface_ips = HashMap::new();
-        let mut current_interface = String::new();
+        let mut interface_data = HashMap::new();
+        let mut current_interface_name = String::new();
+        let mut current_interface_mac = None;
+        let mut current_interface_ips = Vec::new();
+
+        // Primary case-insensitive adapter header regex
+        let primary_adapter_regex = Regex::new(r"(?i)^.*adapter\s+(.+?):\s*$").ok()?;
+
+        // IP address detection patterns (IPv4 and IPv6)
+        let ip_patterns = vec![
+            "IPv4 Address",
+            "IP Address",
+            "Autoconfiguration IPv4 Address",
+            "IPv6 Address",
+            "Link-local IPv6 Address",
+            "Temporary IPv6 Address",
+        ];
+
+        // MAC address detection patterns
+        let mac_patterns = vec![
+            "Physical Address",
+            "Ethernet Address",
+            "MAC Address",
+        ];
+
+        // Blocked keys for regex fallback to prevent DNS/gateway IPs
+        let blocked_keys = vec![
+            "subnet mask", "default gateway", "dhcp server", "dns servers",
+            "wins server", "netbios", "lease obtained", "lease expires",
+            "primary dns suffix", "node type", "ip routing enabled",
+            "wins proxy enabled", "autoconfiguration enabled"
+        ];
+
+        // Regex for any IPv4 address in a line
+        let ip_regex = Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b").ok()?;
+
+        // Regex for MAC address detection
+        let mac_regex = Regex::new(r"\b([0-9A-F]{2}[:-]){5}[0-9A-F]{2}\b").ok()?;
+
+        debug!("Starting ipconfig parsing with enhanced VirtIO and MAC address support");
+
+        // Helper function to save current interface data
+        let mut save_current_interface = |interface_data: &mut HashMap<InterfaceKey, Vec<String>>,
+                                         name: &str,
+                                         mac: &Option<String>,
+                                         ips: &Vec<String>| {
+            if !name.is_empty() && !ips.is_empty() {
+                let interface_key = InterfaceKey::new(
+                    name.to_string(),
+                    None, // GUID not available from ipconfig
+                    mac.clone(),
+                    None, // InterfaceIndex not available from ipconfig
+                );
+
+                debug!("Saving interface data: {} with MAC: {:?}, IPs: {:?}",
+                       name, mac, ips.iter().map(|ip| mask_ip(ip)).collect::<Vec<_>>());
+
+                interface_data.insert(interface_key, ips.clone());
+            }
+        };
 
         for line in output_str.lines() {
             let line = line.trim();
 
-            // Parse adapter line - more robust pattern matching
-            if line.contains("adapter") && line.contains(":") && !line.contains("Media State") {
-                if let Some(adapter_name) = line.split("adapter").nth(1) {
-                    let clean_name = adapter_name.trim_end_matches(':').trim();
-                    if !clean_name.is_empty() {
-                        current_interface = clean_name.to_string();
-                        debug!("Processing adapter: {}", current_interface);
+            // Try primary case-insensitive adapter header regex first
+            let mut adapter_found = false;
+            if let Some(captures) = primary_adapter_regex.captures(line) {
+                if let Some(adapter_match) = captures.get(1) {
+                    let adapter_name = adapter_match.as_str().trim_end_matches(':').trim();
+                    if !adapter_name.is_empty() && !line.to_lowercase().contains("media state") {
+                        // Save previous interface data if exists
+                        save_current_interface(&mut interface_data, &current_interface_name,
+                                             &current_interface_mac, &current_interface_ips);
+
+                        // Start new interface
+                        current_interface_name = adapter_name.to_string();
+                        current_interface_mac = None;
+                        current_interface_ips.clear();
+                        debug!("Found adapter header (primary): '{}' -> interface: '{}'", line, current_interface_name);
+                        adapter_found = true;
                     }
                 }
             }
 
-            // Parse IPv4 address line - multiple patterns
-            if !current_interface.is_empty() &&
-               (line.contains("IPv4 Address") || line.contains("IP Address")) {
-                if let Some(ip_part) = line.split(':').nth(1) {
-                    let ip = ip_part.trim()
-                        .trim_end_matches("(Preferred)")
-                        .trim_end_matches("(Tentative)")
-                        .trim_end_matches("(Duplicate)")
-                        .trim();
+            // Simple fallback: try simple adapter parsing if primary regex didn't match
+            if !adapter_found && line.to_lowercase().contains("adapter") && line.contains(":") && !line.to_lowercase().contains("media state") {
+                if let Some(adapter_name) = line.split("adapter").nth(1) {
+                    let clean_name = adapter_name.trim_end_matches(':').trim();
+                    if !clean_name.is_empty() {
+                        // Save previous interface data if exists
+                        save_current_interface(&mut interface_data, &current_interface_name,
+                                             &current_interface_mac, &current_interface_ips);
 
-                    if !ip.is_empty() && self.is_valid_ip_address(ip) {
-                        debug!("Found IP {} for interface {}", ip, current_interface);
-                        interface_ips.entry(current_interface.clone())
-                            .or_insert_with(Vec::new)
-                            .push(ip.to_string());
+                        // Start new interface
+                        current_interface_name = clean_name.to_string();
+                        current_interface_mac = None;
+                        current_interface_ips.clear();
+                        debug!("Simple fallback adapter parsing: '{}' -> interface: '{}'", line, current_interface_name);
+                    }
+                }
+            }
+
+            // MAC address detection
+            if !current_interface_name.is_empty() {
+                for pattern in &mac_patterns {
+                    if line.to_lowercase().contains(&pattern.to_lowercase()) && line.contains(":") {
+                        if let Some(mac_part) = line.split(':').nth(1) {
+                            let mac_candidate = mac_part.trim();
+                            if let Some(mac_match) = mac_regex.find(mac_candidate) {
+                                let mac = mac_match.as_str().replace(":", "").replace("-", "").to_uppercase();
+                                current_interface_mac = Some(mac.clone());
+                                debug!("Found MAC address {} for interface {} using pattern '{}'",
+                                       mac, current_interface_name, pattern);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Enhanced IP address detection
+            if !current_interface_name.is_empty() {
+                let mut ip_found = false;
+
+                // Try standard IP patterns first (case-insensitive)
+                for pattern in &ip_patterns {
+                    if line.to_lowercase().contains(&pattern.to_lowercase()) && line.contains(":") {
+                        if let Some(ip_part) = line.split(':').nth(1) {
+                            let ip = ip_part.trim()
+                                .trim_end_matches("(Preferred)")
+                                .trim_end_matches("(Tentative)")
+                                .trim_end_matches("(Duplicate)")
+                                .trim_end_matches("(Temporary)")
+                                .trim_end_matches("%") // Remove IPv6 zone identifier prefix
+                                .split('%').next().unwrap_or("") // Remove IPv6 zone identifier completely
+                                .trim();
+
+                            if !ip.is_empty() && self.is_valid_ip_address(ip) {
+                                debug!("Found IP {} for interface {} using pattern '{}'", mask_ip(ip), current_interface_name, pattern);
+                                current_interface_ips.push(ip.to_string());
+                                ip_found = true;
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: try regex-based IP detection with blocked key filtering
+                if !ip_found && line.contains(":") {
+                    if let Some(ip_match) = ip_regex.find(line) {
+                        let ip = ip_match.as_str();
+                        if self.is_valid_ip_address(ip) {
+                            // Extract the label (left-hand side of colon) and check against blocked keys
+                            let label = line.split(':').next().unwrap_or("").trim().trim_end_matches('.').to_lowercase();
+
+                            let is_blocked = blocked_keys.iter().any(|&blocked| label.contains(blocked));
+
+                            if is_blocked {
+                                debug!("Skipped IP {} from regex fallback due to blocked label: '{}'", mask_ip(ip), label);
+                            } else {
+                                debug!("Found IP {} for interface {} using regex fallback (label: '{}')", mask_ip(ip), current_interface_name, label);
+                                current_interface_ips.push(ip.to_string());
+                            }
+                        }
                     }
                 }
             }
         }
 
-        if interface_ips.is_empty() {
+        // Save the last interface
+        save_current_interface(&mut interface_data, &current_interface_name,
+                             &current_interface_mac, &current_interface_ips);
+
+        debug!("ipconfig parsing complete. Found {} interfaces with IPs", interface_data.len());
+        for (interface_key, ips) in &interface_data {
+            debug!("Interface '{}' (MAC: {:?}) has IPs: {:?}",
+                   interface_key.name, interface_key.mac_address,
+                   ips.iter().map(|ip| mask_ip(ip)).collect::<Vec<_>>());
+        }
+
+        if interface_data.is_empty() {
+            debug!("No IP addresses found in ipconfig output");
             None
         } else {
-            Some(interface_ips)
+            Some(interface_data)
+        }
+    }
+
+    /// Enhanced interface correlation using stable identifiers (InterfaceKey)
+    #[cfg(target_os = "windows")]
+    fn correlate_interface_keys(
+        &self,
+        target_keys: &HashMap<InterfaceKey, NetworkSnapshot>,
+        source_keys: &HashMap<InterfaceKey, Vec<String>>,
+    ) -> HashMap<InterfaceKey, InterfaceKey> {
+        let mut correlations = HashMap::new();
+
+        debug!("Starting InterfaceKey correlation between {} target keys and {} source keys",
+               target_keys.len(), source_keys.len());
+
+        for target_key in target_keys.keys() {
+            if let Some(best_match) = self.find_best_interface_match(target_key, source_keys) {
+                debug!("Correlated target '{}' with source '{}'",
+                       target_key.display_name(), best_match.display_name());
+                correlations.insert(target_key.clone(), best_match);
+            } else {
+                debug!("No correlation found for target interface '{}'", target_key.display_name());
+            }
+        }
+
+        debug!("Interface correlation complete. {} correlations found", correlations.len());
+        correlations
+    }
+
+    /// Find the best matching InterfaceKey using priority-based correlation
+    #[cfg(target_os = "windows")]
+    fn find_best_interface_match(
+        &self,
+        target_key: &InterfaceKey,
+        available_keys: &HashMap<InterfaceKey, Vec<String>>,
+    ) -> Option<InterfaceKey> {
+        // Check cache first for previous correlations
+        if let Some(cached_key) = self.interface_key_cache.get(target_key.display_name()) {
+            // Verify the cached key is still available in the current source set
+            if available_keys.contains_key(cached_key) {
+                debug!("Using cached correlation for '{}' -> '{}'", target_key.display_name(), cached_key.display_name());
+                return Some(cached_key.clone());
+            } else {
+                debug!("Cached correlation for '{}' no longer valid, performing fresh lookup", target_key.display_name());
+            }
+        }
+
+        let mut best_match = None;
+        let mut best_score = 0;
+
+        debug!("Finding best match for target: {} (GUID: {:?}, MAC: {:?}, Index: {:?})",
+               target_key.display_name(), target_key.guid, target_key.mac_address, target_key.interface_index);
+
+        for available_key in available_keys.keys() {
+            let score = target_key.matches(available_key);
+
+            debug!("  Candidate: {} (GUID: {:?}, MAC: {:?}, Index: {:?}) -> Score: {}",
+                   available_key.display_name(), available_key.guid,
+                   available_key.mac_address, available_key.interface_index, score);
+
+            if score > best_score {
+                best_score = score;
+                best_match = Some(available_key.clone());
+            }
+        }
+
+        if let Some(ref matched_key) = best_match {
+            debug!("Best match for '{}' is '{}' with score {}",
+                   target_key.display_name(), matched_key.display_name(), best_score);
+
+            // Apply minimum threshold for correlation
+            if best_score < 50 {  // Minimum threshold for any correlation
+                debug!("Best match score {} is below threshold (50), rejecting correlation", best_score);
+                return None;
+            }
+        }
+
+        best_match
+    }
+
+    /// Update interface cache with successful correlations
+    #[cfg(target_os = "windows")]
+    fn update_interface_cache(&mut self, correlations: &HashMap<InterfaceKey, InterfaceKey>) {
+        for (target_key, source_key) in correlations {
+            // Cache the correlation for future use
+            self.interface_key_cache.insert(
+                target_key.display_name().to_string(),
+                source_key.clone()
+            );
+
+            debug!("Cached correlation: '{}' -> '{}'",
+                   target_key.display_name(), source_key.display_name());
         }
     }
 
@@ -1704,9 +2539,12 @@ impl DataCollector {
     /// Helper: Check if interface has recent network activity
     fn interface_has_network_activity(&self, interface_name: &str) -> bool {
         if let Some(previous_stats) = &self.previous_network_stats {
-            if let Some(stats) = previous_stats.get(interface_name) {
-                // Consider interface active if it has significant traffic
-                return stats.bytes_received > 1000 || stats.bytes_sent > 1000;
+            // Try to find a matching interface by name
+            for (key, stats) in previous_stats {
+                if key.display_name() == interface_name {
+                    // Consider interface active if it has significant traffic
+                    return stats.bytes_received > 1000 || stats.bytes_sent > 1000;
+                }
             }
         }
         false
@@ -1718,6 +2556,146 @@ impl DataCollector {
         interface_ips.get(interface_name)
             .map(|ips| !ips.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Check if a network interface is up using InterfaceKey
+    fn is_interface_up_by_key(&self, interface_key: &InterfaceKey) -> bool {
+        // First check if interface has network activity (most reliable indicator)
+        let has_activity = self.interface_has_network_activity_by_key(interface_key);
+
+        // If interface has activity, consider it UP regardless of other indicators
+        if has_activity {
+            debug!("Interface {} considered UP due to network activity", interface_key.display_name());
+            return true;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+
+            // Method 1: Try using InterfaceIndex with Get-NetAdapter
+            if let Some(interface_index) = interface_key.interface_index {
+                let ps_result = Command::new("powershell")
+                    .args(&["-Command", &format!(
+                        "Get-NetAdapter -InterfaceIndex {} | Select-Object -ExpandProperty Status",
+                        interface_index
+                    )])
+                    .output();
+
+                if let Ok(output) = ps_result {
+                    if output.status.success() {
+                        let status = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+                        let is_up = status == "up" || status == "connected";
+                        debug!("Interface {} (Index: {}) PowerShell status: {} ({})",
+                               interface_key.display_name(), interface_index, status,
+                               if is_up { "UP" } else { "DOWN" });
+                        return is_up;
+                    }
+                }
+            }
+
+            // Method 2: Try using interface name with PowerShell
+            let ps_result = Command::new("powershell")
+                .args(&["-Command", &format!(
+                    "Get-NetAdapter -Name '{}' | Select-Object -ExpandProperty Status",
+                    interface_key.display_name()
+                )])
+                .output();
+
+            if let Ok(output) = ps_result {
+                if output.status.success() {
+                    let status = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+                    let is_up = status == "up" || status == "connected";
+                    debug!("Interface {} PowerShell status: {} ({})",
+                           interface_key.display_name(), status, if is_up { "UP" } else { "DOWN" });
+                    return is_up;
+                }
+            }
+
+            // Method 3: Fallback to netsh
+            let netsh_result = Command::new("netsh")
+                .args(&["interface", "show", "interface", &format!("name=\"{}\"", interface_key.display_name())])
+                .output();
+
+            if let Ok(output) = netsh_result {
+                if output.status.success() {
+                    let output_str = String::from_utf8_lossy(&output.stdout);
+                    let is_connected = output_str.contains("Connected") || output_str.contains("Enabled");
+                    debug!("Interface {} netsh status: {}", interface_key.display_name(),
+                           if is_connected { "Connected" } else { "Disconnected" });
+                    return is_connected;
+                }
+            }
+
+            debug!("Failed to determine status for interface {}", interface_key.display_name());
+        }
+
+        // If we can't determine status, check for IP addresses as fallback
+        #[cfg(target_os = "linux")]
+        {
+            // For Linux, fall back to name-based checking first
+            if self.is_interface_up(interface_key.display_name()) {
+                return true;
+            }
+        }
+
+        let has_ips = self.interface_has_ip_addresses_by_key(interface_key);
+        debug!("Interface {} fallback check - has IPs: {}", interface_key.display_name(), has_ips);
+        has_ips
+    }
+
+    /// Helper: Check if interface has recent network activity using InterfaceKey
+    fn interface_has_network_activity_by_key(&self, interface_key: &InterfaceKey) -> bool {
+        if let Some(previous_stats) = &self.previous_network_stats {
+            // Try to find matching previous stats using correlation
+            if let Some(matching_key) = self.find_matching_previous_stats(interface_key, previous_stats) {
+                // Consider interface active if it has significant traffic
+                return matching_key.bytes_received > 1000 || matching_key.bytes_sent > 1000;
+            }
+        }
+        false
+    }
+
+    /// Helper: Check if interface has IP addresses assigned using InterfaceKey
+    fn interface_has_ip_addresses_by_key(&self, interface_key: &InterfaceKey) -> bool {
+        let interface_ips = self.collect_interface_ips_with_keys();
+
+        // Try exact match first
+        if let Some(ips) = interface_ips.get(interface_key) {
+            return !ips.is_empty();
+        }
+
+        // Try correlation to find matching interface
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(matched_key) = self.find_best_interface_match(interface_key, &interface_ips) {
+                if let Some(ips) = interface_ips.get(&matched_key) {
+                    return !ips.is_empty();
+                }
+            }
+        }
+
+        // Linux fallback via name equality
+        #[cfg(target_os = "linux")]
+        {
+            for (key, ips) in &interface_ips {
+                if key.display_name() == interface_key.display_name() {
+                    return !ips.is_empty();
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Helper method for string-based interface name matching using InterfaceKey logic
+    fn interfaces_match(&self, name1: &str, name2: &str) -> bool {
+        // Create temporary InterfaceKeys for comparison
+        let key1 = InterfaceKey::new(name1.to_string(), None, None, None);
+        let key2 = InterfaceKey::new(name2.to_string(), None, None, None);
+
+        // Use InterfaceKey matching logic with minimum threshold
+        key1.matches(&key2) >= 50
     }
 
     #[cfg(target_os = "linux")]

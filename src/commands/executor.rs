@@ -72,6 +72,10 @@ impl CommandExecutor {
             IncomingMessage::Metrics => {
                 // Metrics requests are handled separately in the main loop
                 Err(anyhow!("Metrics requests should be handled in the main service loop"))
+            },
+            IncomingMessage::KeepAliveResponse(_) => {
+                // Keep-alive responses are handled separately in the main loop
+                Err(anyhow!("Keep-alive responses should be handled in the main service loop"))
             }
         }
     }

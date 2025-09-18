@@ -382,11 +382,40 @@ async fn main() -> Result<()> {
     let mut service = InfiniService::new(config, debug_mode);
     service.initialize().await?;
 
-    // Run the service
+    // Set up signal handling for graceful shutdown
+    #[cfg(unix)]
+    let shutdown_signal = async {
+        use tokio::signal;
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to register SIGTERM handler");
+        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+            .expect("Failed to register SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => info!("Received SIGTERM"),
+            _ = sigint.recv() => info!("Received SIGINT"),
+        }
+    };
+
+    #[cfg(windows)]
+    let shutdown_signal = async {
+        use tokio::signal;
+        signal::ctrl_c().await.expect("Failed to register Ctrl+C handler")
+    };
+
+    // Run the service with graceful shutdown handling
     info!("Starting main service loop...");
-    if let Err(e) = service.run().await {
-        error!("Service error: {}", e);
-        return Err(e);
+    tokio::select! {
+        result = service.run() => {
+            if let Err(e) = result {
+                error!("Service error: {}", e);
+                return Err(e);
+            }
+        }
+        _ = shutdown_signal => {
+            info!("Shutdown signal received, performing graceful shutdown...");
+            service.shutdown().await;
+        }
     }
 
     Ok(())
@@ -403,17 +432,17 @@ fn service_main(_arguments: Vec<OsString>) {
     
     info!("Infiniservice Windows service starting...");
     
-    // Create a channel to communicate with the service control handler
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-    
+    // Create atomic flag for shutdown signaling
+    let shutdown_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Define the service control handler
-    let shutdown_tx_clone = shutdown_tx.clone();
+    let shutdown_flag_clone = shutdown_flag.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
                 info!("Received stop/shutdown signal");
-                // Send shutdown signal
-                let _ = shutdown_tx_clone.try_send(());
+                // Set shutdown flag
+                shutdown_flag_clone.store(true, std::sync::atomic::Ordering::Relaxed);
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -477,9 +506,9 @@ fn service_main(_arguments: Vec<OsString>) {
                 return;
             }
         };
-        
+
         info!("Configuration loaded: collection interval = {}s", config.collection_interval);
-        
+
         // Create and initialize the service
         let mut service = InfiniService::new(config, false);
         if let Err(e) = service.initialize().await {
@@ -495,21 +524,33 @@ fn service_main(_arguments: Vec<OsString>) {
             });
             return;
         }
-        
+
         info!("Service initialized successfully");
-        
-        // Run the service in the current task (not spawned)
-        // Use tokio::select! to handle both the service and shutdown signal
+
+        // Run the service with shutdown handling
         tokio::select! {
             result = service.run() => {
                 if let Err(e) = result {
                     error!("Service error: {:?}", e);
                 }
+                info!("Service run loop ended");
             }
-            _ = shutdown_rx.recv() => {
+            _ = async {
+                // Monitor shutdown flag
+                while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            } => {
                 info!("Shutdown signal received, stopping service...");
+                // Request shutdown which will cause run() loop to exit
+                service.request_shutdown();
+                // Give time for run loop to exit gracefully
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
+
+        // Perform final cleanup
+        service.shutdown().await;
         
         // Report that the service is stopped
         let _ = status_handle.set_service_status(ServiceStatus {

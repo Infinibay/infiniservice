@@ -76,6 +76,8 @@ pub struct InfiniService {
     connection_diagnostics: ConnectionDiagnostics,
     state_change_history: Vec<StateChangeEvent>,
     service_metrics: ServiceMetrics,
+    // Shutdown signaling
+    shutdown_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InfiniService {
@@ -151,6 +153,8 @@ impl InfiniService {
                 keep_alive_failures: 0,
                 circuit_breaker_trips: 0,
             },
+            // Initialize shutdown signaling
+            shutdown_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -269,8 +273,11 @@ impl InfiniService {
         info!("Service will collect metrics every {} seconds", self.config.collection_interval);
         info!("Command execution is ENABLED - both safe and unsafe commands supported");
 
+        // Clone shutdown flag for use in the loop
+        let shutdown_flag = self.shutdown_requested.clone();
+
         // Graceful Degradation: Dynamic interval adjustment based on connection quality
-        let mut current_collection_interval = self.config.collection_interval;
+        let current_collection_interval = self.config.collection_interval;
         let mut interval = time::interval(Duration::from_secs(current_collection_interval));
         let mut command_check_interval = time::interval(Duration::from_millis(500)); // Check for commands every 500ms
         let mut health_check_interval = time::interval(Duration::from_secs(self.config.virtio_health_check_interval_secs)); // Periodic health checks
@@ -284,6 +291,12 @@ impl InfiniService {
 
             // Add device change monitoring to the select loop
             loop {
+                // Check for shutdown signal first
+                if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    info!("Shutdown requested, exiting main loop");
+                    break Ok(());
+                }
+
                 select! {
                     // Periodic metrics collection or fast retry for initial IP collection
                     _ = interval.tick() => {
@@ -441,6 +454,12 @@ impl InfiniService {
         } else {
             // Fallback to simple loop without device monitoring
             loop {
+                // Check for shutdown signal first
+                if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    info!("Shutdown requested, exiting main loop");
+                    break Ok(());
+                }
+
                 select! {
                     // Periodic metrics collection or fast retry for initial IP collection
                     _ = interval.tick() => {
@@ -569,13 +588,51 @@ impl InfiniService {
         }
     }
 
+    /// Request shutdown of the service
+    pub fn request_shutdown(&self) {
+        info!("Shutdown requested");
+        self.shutdown_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Check if shutdown has been requested
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Shutdown the service and cleanup resources
-    async fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) {
+        info!("🛑 Shutting down InfiniService...");
+
+        // Mark shutdown as requested
+        self.shutdown_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Give time for tasks to receive shutdown signal
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Disconnect VirtIO communication first
+        if self.virtio_connected {
+            info!("📡 Disconnecting VirtIO communication...");
+            self.communication.disconnect();
+            self.virtio_connected = false;
+        }
+
+        // Stop device monitoring
         if let Some(handle) = self.device_monitor_handle.take() {
+            info!("📱 Stopping device monitor task...");
             handle.abort();
             let _ = handle.await;
             debug!("Device monitor task cleaned up");
         }
+
+        // Update final connection state
+        if self.connection_state != ConnectionState::Disconnected {
+            self.emit_connection_state_change(ConnectionState::Disconnected).await;
+        }
+
+        // Log final service statistics
+        self.log_final_service_summary();
+
+        info!("✅ InfiniService shutdown complete");
     }
     
     /// Attempt to retry VirtIO connection with persistent connection cleanup
@@ -583,8 +640,9 @@ impl InfiniService {
         debug!("Attempting to retry VirtIO connection...");
 
         // Intelligent Reconnection: Check circuit breaker state before attempting reconnection
+        let circuit_breaker_arc = self.communication.circuit_breaker_state();
         let circuit_state = {
-            let state = self.communication.circuit_breaker_state().read().unwrap();
+            let state = circuit_breaker_arc.read().unwrap();
             state.clone()
         };
 
@@ -630,16 +688,16 @@ impl InfiniService {
             self.emit_connection_state_change(ConnectionState::Degraded).await;
 
             // Adjust collection interval for degraded mode (longer intervals)
-            self.current_collection_interval = (self.config.collection_interval * 2).max(30);
-            info!("📉 Degraded mode: Increased collection interval to {}s", self.current_collection_interval);
+            let current_degraded_interval = (self.config.collection_interval * 2).max(30);
+            info!("📉 Degraded mode: Increased collection interval to {}s", current_degraded_interval);
         } else if !should_degrade && self.service_metrics.degraded_mode_active {
             info!("🔺 Connection quality ({:?}) restored above threshold - exiting degraded mode", connection_quality);
             self.service_metrics.degraded_mode_active = false;
             self.service_metrics.degraded_mode_start_time = None;
 
             // Restore normal collection interval
-            self.current_collection_interval = self.config.collection_interval;
-            info!("📈 Normal mode: Restored collection interval to {}s", self.current_collection_interval);
+            let normal_interval = self.config.collection_interval;
+            info!("📈 Normal mode: Restored collection interval to {}s", normal_interval);
         }
 
         // Implement adaptive backoff based on connection quality and failure patterns
@@ -824,6 +882,9 @@ impl InfiniService {
                                 error!("Command execution failed: {}", e);
                             }
                         }
+                    },
+                    IncomingMessage::KeepAliveResponse(_) => {
+                        debug!("Received keep-alive response");
                     }
                 }
                 
@@ -1368,13 +1429,57 @@ impl InfiniService {
             info!("  ⏰ Last Success: Never");
         }
     }
+
+    fn log_final_service_summary(&self) {
+        let uptime = SystemTime::now()
+            .duration_since(self.connection_diagnostics.service_start_time)
+            .unwrap_or_default();
+
+        let success_rate = if self.service_metrics.total_collections > 0 {
+            (self.service_metrics.successful_transmissions as f64 / self.service_metrics.total_collections as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        info!("🏁 Final Service Statistics:");
+        info!("  🕰️ Total Uptime: {}s ({} hours)", uptime.as_secs(), uptime.as_secs() / 3600);
+        info!("  📊 Total Collections: {}", self.service_metrics.total_collections);
+        info!("  ✅ Successful Transmissions: {} ({:.1}%)",
+              self.service_metrics.successful_transmissions, success_rate);
+        info!("  ❌ Failed Transmissions: {}", self.service_metrics.failed_transmissions);
+        info!("  🔄 Connection State Changes: {}", self.connection_diagnostics.total_state_changes);
+        info!("  🔄 Total Retry Attempts: {}", self.service_metrics.retry_attempts);
+        info!("  💔 Keep-alive Failures: {}", self.service_metrics.keep_alive_failures);
+        info!("  🚦 Circuit Breaker Trips: {}", self.service_metrics.circuit_breaker_trips);
+
+        if self.service_metrics.degraded_mode_active {
+            if let Some(degraded_start) = self.service_metrics.degraded_mode_start_time {
+                let degraded_duration = SystemTime::now().duration_since(degraded_start).unwrap_or_default();
+                info!("  ⚠️ Degraded Mode Duration: {}s", degraded_duration.as_secs());
+            }
+        }
+    }
 }
 
 impl Drop for InfiniService {
     fn drop(&mut self) {
+        // Request shutdown if not already requested
+        if !self.shutdown_requested.load(std::sync::atomic::Ordering::Relaxed) {
+            self.shutdown_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Disconnect VirtIO communication
+        if self.virtio_connected {
+            debug!("Disconnecting VirtIO communication during drop");
+            self.communication.disconnect();
+        }
+
+        // Abort device monitor task
         if let Some(handle) = self.device_monitor_handle.take() {
             handle.abort();
             debug!("Device monitor task aborted during drop");
         }
+
+        debug!("InfiniService dropped");
     }
 }
