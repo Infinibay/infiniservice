@@ -38,12 +38,16 @@ pub mod linux_update_checker;
 pub enum IncomingMessage {
     /// Request for metrics collection
     Metrics,
-    
+
     /// Safe, validated command execution
     SafeCommand(SafeCommandRequest),
-    
+
     /// Unsafe, raw command execution
     UnsafeCommand(UnsafeCommandRequest),
+
+    /// Keep-alive response from backend
+    #[serde(rename = "keep_alive_response")]
+    KeepAliveResponse(KeepAliveResponse),
 }
 
 /// Safe command request with validated operations
@@ -166,6 +170,16 @@ pub enum ServiceOperation {
     Enable,
     Disable,
     Status,
+}
+
+/// Keep-alive response from the backend
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KeepAliveResponse {
+    /// Sequence number from the original keep-alive message
+    pub sequence_number: u32,
+
+    /// Timestamp when the response was generated
+    pub timestamp: String,
 }
 
 /// Command execution response

@@ -103,6 +103,9 @@ procfs = "0.17"
 # Unix process and signal handling
 nix = { version = "0.29", features = ["signal", "process"] }
 
+# System call constants for Linux
+libc = "0.2"
+
 # APT package management for Debian/Ubuntu
 apt-pkg-native = { version = "0.3", optional = true }
 

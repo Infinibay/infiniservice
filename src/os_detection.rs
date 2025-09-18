@@ -10,6 +10,20 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use log::debug;
 
+/// Mask hostname for logging to reduce sensitive data exposure
+fn mask_hostname(hostname: &str) -> String {
+    if hostname == "unknown" || hostname.len() <= 3 {
+        return hostname.to_string();
+    }
+
+    // Show first 2 and last 2 characters, mask the middle
+    if hostname.len() > 4 {
+        format!("{}***{}", &hostname[..2], &hostname[hostname.len()-2..])
+    } else {
+        "***".to_string()
+    }
+}
+
 /// Operating system type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum OsType {
@@ -93,7 +107,7 @@ impl OsInfo {
                 debug!("Failed to get hostname, using 'unknown'");
                 "unknown".to_string()
             });
-        debug!("Hostname: {}", hostname);
+        debug!("Hostname: {}", mask_hostname(&hostname));
         
         let (version, kernel_version, linux_distro, windows_edition) = match os_type {
             OsType::Windows => {

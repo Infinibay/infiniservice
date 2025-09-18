@@ -74,6 +74,10 @@ async fn main() -> Result<()> {
         println!("  --no-virtio       Allow service to run without VirtIO device");
         println!("  --virtio-min-backoff <seconds>  Set minimum VirtIO retry backoff interval");
         println!("  --virtio-max-backoff <seconds>  Set maximum VirtIO retry backoff interval");
+        println!("  --connection-timeout <seconds>  Set VirtIO connection timeout (default: 10)");
+        println!("  --read-timeout <ms>             Set VirtIO read timeout in milliseconds (default: 500)");
+        println!("  --aggressive-retry              Enable aggressive retry for faster development");
+        println!("  --validate-connection           Enable periodic connection health checks");
         println!("  --disable-device-monitoring     Disable automatic device change monitoring");
         println!("\nEnvironment Variables:");
         println!("  INFINIBAY_VM_ID=<id>          Set VM identifier");
@@ -81,6 +85,10 @@ async fn main() -> Result<()> {
         println!("  INFINISERVICE_REQUIRE_VIRTIO=<true|false>  Require VirtIO device");
         println!("  INFINISERVICE_MIN_BACKOFF=<seconds>       Set minimum retry backoff");
         println!("  INFINISERVICE_MAX_BACKOFF=<seconds>       Set maximum retry backoff");
+        println!("  INFINISERVICE_CONNECTION_TIMEOUT=<secs>   Set connection timeout");
+        println!("  INFINISERVICE_READ_TIMEOUT=<ms>           Set read timeout");
+        println!("  INFINISERVICE_AGGRESSIVE_RETRY=<true>     Enable aggressive retry");
+        println!("  INFINISERVICE_VALIDATE_CONNECTION=<true>  Enable connection validation");
         println!("  INFINISERVICE_DISABLE_MONITORING=<true>   Disable device monitoring");
         println!("  RUST_LOG=<level>              Set log level (error|warn|info|debug)");
         return Ok(());
@@ -91,11 +99,15 @@ async fn main() -> Result<()> {
     let require_virtio = args.contains(&"--require-virtio".to_string());
     let no_virtio = args.contains(&"--no-virtio".to_string());
     let disable_device_monitoring = args.contains(&"--disable-device-monitoring".to_string());
+    let aggressive_retry = args.contains(&"--aggressive-retry".to_string());
+    let validate_connection = args.contains(&"--validate-connection".to_string());
     
     // Parse --device parameter
     let mut device_path_override: Option<String> = None;
     let mut min_backoff_override: Option<u64> = None;
     let mut max_backoff_override: Option<u64> = None;
+    let mut connection_timeout_override: Option<u64> = None;
+    let mut read_timeout_override: Option<u64> = None;
 
     for i in 0..args.len() {
         if args[i] == "--device" && i + 1 < args.len() {
@@ -114,6 +126,20 @@ async fn main() -> Result<()> {
                 info!("Maximum backoff override specified: {}s", value);
             } else {
                 warn!("Invalid maximum backoff value: {}", args[i + 1]);
+            }
+        } else if args[i] == "--connection-timeout" && i + 1 < args.len() {
+            if let Ok(value) = args[i + 1].parse::<u64>() {
+                connection_timeout_override = Some(value);
+                info!("Connection timeout override specified: {}s", value);
+            } else {
+                warn!("Invalid connection timeout value: {}", args[i + 1]);
+            }
+        } else if args[i] == "--read-timeout" && i + 1 < args.len() {
+            if let Ok(value) = args[i + 1].parse::<u64>() {
+                read_timeout_override = Some(value);
+                info!("Read timeout override specified: {}ms", value);
+            } else {
+                warn!("Invalid read timeout value: {}", args[i + 1]);
             }
         }
     }
@@ -141,6 +167,25 @@ async fn main() -> Result<()> {
             if let Ok(parsed) = value.parse::<u64>() {
                 max_backoff_override = Some(parsed);
                 info!("Maximum backoff override from environment: {}s", parsed);
+            }
+        }
+    }
+
+    // Check environment variables for timeout settings
+    if connection_timeout_override.is_none() {
+        if let Ok(value) = env::var("INFINISERVICE_CONNECTION_TIMEOUT") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                connection_timeout_override = Some(parsed);
+                info!("Connection timeout override from environment: {}s", parsed);
+            }
+        }
+    }
+
+    if read_timeout_override.is_none() {
+        if let Ok(value) = env::var("INFINISERVICE_READ_TIMEOUT") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                read_timeout_override = Some(parsed);
+                info!("Read timeout override from environment: {}ms", parsed);
             }
         }
     }
@@ -260,6 +305,27 @@ async fn main() -> Result<()> {
         config.virtio_max_backoff_secs = max_backoff;
     }
 
+    // Apply timeout overrides
+    if let Some(connection_timeout) = connection_timeout_override {
+        config.virtio_connection_timeout_secs = connection_timeout;
+    }
+    if let Some(read_timeout) = read_timeout_override {
+        config.virtio_read_timeout_ms = read_timeout;
+    }
+
+    // Apply aggressive retry mode
+    if aggressive_retry {
+        config.apply_development_mode();
+        info!("Aggressive retry mode ENABLED - using development-friendly settings");
+    } else if env::var("INFINISERVICE_AGGRESSIVE_RETRY")
+        .unwrap_or_default()
+        .parse::<bool>()
+        .unwrap_or(false)
+    {
+        config.apply_development_mode();
+        info!("Aggressive retry mode ENABLED via environment variable");
+    }
+
     // Apply device monitoring setting
     if disable_device_monitoring {
         config.enable_device_monitoring = false;
@@ -280,6 +346,19 @@ async fn main() -> Result<()> {
               config.virtio_min_backoff_secs, config.virtio_max_backoff_secs);
     }
     
+    // Apply connection validation setting
+    if validate_connection {
+        config.enable_connection_validation = true;
+        info!("Connection validation ENABLED - periodic health checks active");
+    } else if env::var("INFINISERVICE_VALIDATE_CONNECTION")
+        .unwrap_or_default()
+        .parse::<bool>()
+        .unwrap_or(false)
+    {
+        config.enable_connection_validation = true;
+        info!("Connection validation ENABLED via environment variable");
+    }
+
     if debug_mode {
         debug!("Full configuration:");
         debug!("  Collection interval: {}s", config.collection_interval);
@@ -288,7 +367,11 @@ async fn main() -> Result<()> {
         debug!("  VirtIO retry interval: {}s (deprecated)", config.virtio_retry_interval);
         debug!("  VirtIO min backoff: {}s", config.virtio_min_backoff_secs);
         debug!("  VirtIO max backoff: {}s", config.virtio_max_backoff_secs);
+        debug!("  VirtIO connection timeout: {}s", config.virtio_connection_timeout_secs);
+        debug!("  VirtIO read timeout: {}ms", config.virtio_read_timeout_ms);
+        debug!("  VirtIO health check interval: {}s", config.virtio_health_check_interval_secs);
         debug!("  Device monitoring enabled: {}", config.enable_device_monitoring);
+        debug!("  Connection validation enabled: {}", config.enable_connection_validation);
         debug!("  System: {}", std::env::consts::OS);
         debug!("  Architecture: {}", std::env::consts::ARCH);
     }

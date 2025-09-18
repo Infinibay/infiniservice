@@ -1,16 +1,124 @@
 //! Communication module for virtio-serial interface with bidirectional command support
 
 use crate::collector::{SystemInfo, SystemMetrics};
-use crate::commands::{IncomingMessage, CommandResponse};
+use crate::commands::{IncomingMessage, CommandResponse, KeepAliveResponse};
 use anyhow::{Result, Context, anyhow};
-use log::{info, debug, warn};
+use log::{info, debug, warn, error};
 use serde::Serialize;
+use serde_json;
+use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicU32};
 use std::path::Path;
-use std::fs::OpenOptions;
-use std::io::{Write, BufRead, BufReader};
+use std::fs::{File, OpenOptions};
+use std::io::{Write, BufReader, BufRead};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use chrono::Utc;
+use std::collections::HashMap;
+
+// Connection metrics tracking
+#[derive(Debug, Clone)]
+pub struct ConnectionMetrics {
+    pub connection_start_time: Option<SystemTime>,
+    pub total_connections: u64,
+    pub successful_transmissions: u64,
+    pub failed_transmissions: u64,
+    pub last_successful_transmission: Option<SystemTime>,
+    pub connection_quality: ConnectionQuality,
+    pub error_patterns: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthCheckResult {
+    pub timestamp: SystemTime,
+    pub success: bool,
+    pub latency_ms: Option<u64>,
+    pub error_details: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransmissionStats {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub message_count: u64,
+    pub average_latency_ms: f64,
+    pub last_transmission_size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnectionQuality {
+    Excellent,
+    Good,
+    Poor,
+    Critical,
+}
+
+impl std::fmt::Display for ConnectionQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionQuality::Excellent => write!(f, "excellent"),
+            ConnectionQuality::Good => write!(f, "good"),
+            ConnectionQuality::Poor => write!(f, "poor"),
+            ConnectionQuality::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+// Circuit Breaker Pattern Implementation
+#[derive(Debug, Clone, PartialEq)]
+pub enum CircuitBreakerState {
+    Closed,    // Normal operation
+    Open,      // Blocking all calls
+    HalfOpen,  // Testing recovery
+}
+
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerMetrics {
+    pub failure_count: u32,
+    pub success_count: u32,
+    pub last_failure_time: Option<SystemTime>,
+    pub state_change_time: SystemTime,
+    pub half_open_calls: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerConfig {
+    pub failure_threshold: u32,
+    pub open_duration_secs: u64,
+    pub half_open_max_calls: u32,
+    pub success_threshold: u32,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+            half_open_max_calls: 3,
+            success_threshold: 2,
+        }
+    }
+}
+
+// Error classification system for intelligent retry logic
+#[derive(Debug, Clone, PartialEq)]
+pub enum ErrorSeverity {
+    Temporary,    // Retry immediately
+    Recoverable,  // Retry with backoff
+    Fatal,        // Don't retry, mark as broken
+    Unknown,      // Treat as recoverable with caution
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassifiedError {
+    pub error_type: String,
+    pub severity: ErrorSeverity,
+    pub windows_error_code: Option<i32>,
+    pub retry_recommended: bool,
+    pub recovery_suggestion: Option<String>,
+    pub max_retries: u32,
+}
 
 // Message wrapper for metrics that matches backend expectations
 #[derive(Serialize, Debug)]
@@ -30,27 +138,164 @@ struct MetricsData {
 pub struct VirtioSerial {
     device_path: std::path::PathBuf,
     vm_id: String,
+    write_handle: Arc<std::sync::RwLock<Option<Arc<File>>>>,
+    read_handle: Arc<std::sync::RwLock<Option<Arc<File>>>>,
+    is_connected: Arc<AtomicBool>,
+    read_timeout_ms: u64,
+    ping_test_interval_secs: u64,
+    last_transmission_time: Arc<AtomicU64>,
+    consecutive_failures: Arc<AtomicUsize>,
+    initial_transmission_sent: Arc<AtomicBool>,
+    last_ping_test_time: Arc<AtomicU64>,
+    // Enhanced diagnostics
+    connection_metrics: Arc<RwLock<ConnectionMetrics>>,
+    health_check_history: Arc<RwLock<Vec<HealthCheckResult>>>,
+    transmission_stats: Arc<RwLock<TransmissionStats>>,
+    // Error retry tracking
+    error_retry_count: Arc<std::sync::atomic::AtomicU32>,
+    last_error_time: Arc<AtomicU64>,
+    error_backoff_ms: Arc<AtomicU64>,
+    max_error_retries: u32,
+    // Error report queue for when not connected
+    queued_error_reports: Arc<RwLock<Vec<serde_json::Value>>>,
+    // Circuit Breaker fields
+    circuit_breaker_state: Arc<RwLock<CircuitBreakerState>>,
+    circuit_breaker_metrics: Arc<RwLock<CircuitBreakerMetrics>>,
+    circuit_breaker_config: CircuitBreakerConfig,
+    // Keep-Alive fields
+    keep_alive_last_sent: Arc<AtomicU64>,
+    keep_alive_last_received: Arc<AtomicU64>,
+    keep_alive_sequence: Arc<AtomicU32>,
 }
 
 impl VirtioSerial {
     pub fn new<P: AsRef<Path>>(device_path: P) -> Self {
-        Self {
-            device_path: device_path.as_ref().to_path_buf(),
-            vm_id: Self::generate_vm_id(),
-        }
+        Self::with_timeout(device_path, 500) // Default 500ms timeout
+    }
+
+    pub fn with_timeout<P: AsRef<Path>>(device_path: P, read_timeout_ms: u64) -> Self {
+        Self::with_config(device_path, read_timeout_ms, 60) // Default 60s ping interval
+    }
+
+    pub fn with_config<P: AsRef<Path>>(device_path: P, read_timeout_ms: u64, ping_test_interval_secs: u64) -> Self {
+        Self::new_internal(
+            device_path,
+            Self::generate_vm_id(),
+            read_timeout_ms,
+            ping_test_interval_secs,
+            CircuitBreakerConfig::default()
+        )
     }
 
     pub fn with_vm_id<P: AsRef<Path>>(device_path: P, vm_id: String) -> Self {
-        Self {
-            device_path: device_path.as_ref().to_path_buf(),
+        Self::with_vm_id_and_timeout(device_path, vm_id, 500) // Default 500ms timeout
+    }
+
+    pub fn with_circuit_breaker_config<P: AsRef<Path>>(
+        device_path: P,
+        circuit_breaker_config: CircuitBreakerConfig,
+        read_timeout_ms: u64,
+        ping_test_interval_secs: u64
+    ) -> Self {
+        Self::new_internal(
+            device_path,
+            Self::generate_vm_id(),
+            read_timeout_ms,
+            ping_test_interval_secs,
+            circuit_breaker_config
+        )
+    }
+
+    pub fn with_vm_id_and_timeout<P: AsRef<Path>>(device_path: P, vm_id: String, read_timeout_ms: u64) -> Self {
+        Self::new_internal(
+            device_path,
             vm_id,
-        }
+            read_timeout_ms,
+            60, // Conservative default ping interval
+            CircuitBreakerConfig::default()
+        )
     }
 
     fn generate_vm_id() -> String {
         // Try to get VM ID from environment or generate one
         std::env::var("INFINIBAY_VM_ID")
             .unwrap_or_else(|_| Uuid::new_v4().to_string())
+    }
+
+    // Private constructor that ensures all fields are initialized
+    fn new_internal<P: AsRef<Path>>(
+        device_path: P,
+        vm_id: String,
+        read_timeout_ms: u64,
+        ping_test_interval_secs: u64,
+        circuit_breaker_config: CircuitBreakerConfig
+    ) -> Self {
+        Self {
+            device_path: device_path.as_ref().to_path_buf(),
+            vm_id,
+            write_handle: Arc::new(std::sync::RwLock::new(None)),
+            read_handle: Arc::new(std::sync::RwLock::new(None)),
+            is_connected: Arc::new(AtomicBool::new(false)),
+            read_timeout_ms,
+            ping_test_interval_secs,
+            last_transmission_time: Arc::new(AtomicU64::new(0)),
+            consecutive_failures: Arc::new(AtomicUsize::new(0)),
+            initial_transmission_sent: Arc::new(AtomicBool::new(false)),
+            last_ping_test_time: Arc::new(AtomicU64::new(0)),
+            // Enhanced diagnostics
+            connection_metrics: Arc::new(RwLock::new(ConnectionMetrics {
+                connection_start_time: None,
+                total_connections: 0,
+                successful_transmissions: 0,
+                failed_transmissions: 0,
+                last_successful_transmission: None,
+                connection_quality: ConnectionQuality::Good,
+                error_patterns: HashMap::new(),
+            })),
+            health_check_history: Arc::new(RwLock::new(Vec::new())),
+            transmission_stats: Arc::new(RwLock::new(TransmissionStats {
+                bytes_sent: 0,
+                bytes_received: 0,
+                message_count: 0,
+                average_latency_ms: 0.0,
+                last_transmission_size: 0,
+            })),
+            // Error retry tracking initialization
+            error_retry_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            last_error_time: Arc::new(AtomicU64::new(0)),
+            error_backoff_ms: Arc::new(AtomicU64::new(1000)), // Start with 1s backoff
+            max_error_retries: 5, // Default max retries
+            // Error report queue initialization
+            queued_error_reports: Arc::new(RwLock::new(Vec::new())),
+            // Circuit Breaker initialization
+            circuit_breaker_state: Arc::new(RwLock::new(CircuitBreakerState::Closed)),
+            circuit_breaker_metrics: Arc::new(RwLock::new(CircuitBreakerMetrics {
+                failure_count: 0,
+                success_count: 0,
+                last_failure_time: None,
+                state_change_time: SystemTime::now(),
+                half_open_calls: 0,
+            })),
+            circuit_breaker_config,
+            // Keep-Alive initialization
+            keep_alive_last_sent: Arc::new(AtomicU64::new(0)),
+            keep_alive_last_received: Arc::new(AtomicU64::new(0)),
+            keep_alive_sequence: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    // Public getters for private fields (required for service.rs access)
+    pub fn circuit_breaker_state(&self) -> Arc<RwLock<CircuitBreakerState>> {
+        Arc::clone(&self.circuit_breaker_state)
+    }
+
+    pub fn circuit_breaker_metrics(&self) -> Arc<RwLock<CircuitBreakerMetrics>> {
+        Arc::clone(&self.circuit_breaker_metrics)
+    }
+
+    pub fn connection_quality(&self) -> ConnectionQuality {
+        let metrics = self.connection_metrics.read().unwrap();
+        metrics.connection_quality.clone()
     }
 
     /// Detect virtio-serial device path based on platform
@@ -1006,20 +1251,20 @@ impl VirtioSerial {
         Ok(std::path::PathBuf::from("__NO_VIRTIO_DEVICE__"))
     }
     
-    /// Initialize connection to virtio-serial device
+    /// Initialize persistent connection to virtio-serial device
     pub async fn connect(&self) -> Result<()> {
         let path_str = self.device_path.to_string_lossy();
-        
+
         // Check if this is the special "no device" marker
         if path_str == "__NO_VIRTIO_DEVICE__" {
             warn!("VirtIO device not available - operating in degraded mode");
             warn!("Some communication features will be limited");
             return Err(anyhow!("VirtIO device not available"));
         }
-        
-        info!("Connecting to virtio-serial device: {}", self.device_path.display());
 
-        // Test if we can open the device for writing
+        info!("Establishing persistent connection to virtio-serial device: {}", self.device_path.display());
+
+        // Open device with read/write permissions and store persistent handles
         #[cfg(target_os = "windows")]
         {
             // Check device type and handle accordingly
@@ -1027,7 +1272,12 @@ impl VirtioSerial {
                 // Test if we can actually open the Global object
                 match Self::try_open_windows_device(&path_str, false) {
                     Ok(true) => {
-                        // Device is accessible
+                        // Global objects require special handling - we'll open them per-operation
+                        // but mark as connected for consistent state
+                        self.is_connected.store(true, Ordering::SeqCst);
+                        debug!("Global VirtIO device verified: {}", path_str);
+                        info!("VirtIO Global object ready - will use Windows API for persistent communication");
+                        return Ok(());
                     }
                     Ok(false) => {
                         return Err(anyhow!("VirtIO Global object exists but cannot be opened: {}. Check permissions and VM configuration.", path_str));
@@ -1071,85 +1321,302 @@ impl VirtioSerial {
                         }
                     }
                 }
-                
-                debug!("Global VirtIO device verified: {}", path_str);
-                info!("VirtIO Global object ready - will use Windows API for communication");
-                return Ok(());
             } else if path_str.contains("COM") && !path_str.contains("pipe") {
-                // It's a COM port, open with appropriate flags
+                // It's a COM port, open with appropriate flags and establish persistent handles
                 use std::os::windows::fs::OpenOptionsExt;
-                use winapi::um::winbase::FILE_FLAG_OVERLAPPED;
-                
-                match OpenOptions::new()
+                use std::os::windows::io::AsRawHandle;
+                use winapi::um::winbase::{FILE_FLAG_OVERLAPPED, COMMTIMEOUTS};
+                use winapi::um::commapi::SetCommTimeouts;
+
+                // Open for writing
+                let write_file = OpenOptions::new()
                     .write(true)
+                    .custom_flags(FILE_FLAG_OVERLAPPED)
+                    .open(&self.device_path)
+                    .with_context(|| format!("Failed to open COM port for writing: {}", self.device_path.display()))?;
+
+                // Open for reading
+                let read_file = OpenOptions::new()
                     .read(true)
                     .custom_flags(FILE_FLAG_OVERLAPPED)
                     .open(&self.device_path)
-                {
-                    Ok(_) => {
-                        info!("COM port connection established successfully");
-                        return Ok(());
+                    .with_context(|| format!("Failed to open COM port for reading: {}", self.device_path.display()))?;
+
+                // Configure COM port timeouts
+                unsafe {
+                    let mut timeouts = COMMTIMEOUTS {
+                        ReadIntervalTimeout: self.read_timeout_ms as u32,
+                        ReadTotalTimeoutMultiplier: 0,
+                        ReadTotalTimeoutConstant: self.read_timeout_ms as u32,
+                        WriteTotalTimeoutMultiplier: 0,
+                        WriteTotalTimeoutConstant: 1000, // 1 second write timeout
+                    };
+
+                    if SetCommTimeouts(read_file.as_raw_handle() as _, &mut timeouts) == 0 {
+                        warn!("Failed to set COM port read timeouts");
                     }
-                    Err(e) => {
-                        if let Some(5) = e.raw_os_error() {
-                            warn!("🔐 Access denied to COM port: {}", self.device_path.display());
-                            warn!("📋 Common causes:");
-                            warn!("   • Another application is using the port");
-                            warn!("   • Service needs Administrator privileges");
-                            warn!("   • VirtIO COM port requires special permissions");
-                            warn!("");
-                            warn!("💡 Solutions:");
-                            warn!("   • Close other applications using the COM port");
-                            warn!("   • Run as Administrator");
-                            warn!("   • Try alternative device paths with --device flag");
-                            warn!("   • Run diagnosis: infiniservice.exe --diag");
-                        } else {
-                            warn!("❌ Failed to open COM port: {} (Error: {})", self.device_path.display(), e);
-                            warn!("💡 This may indicate:");
-                            warn!("   • COM port doesn't exist or is not available");
-                            warn!("   • VirtIO driver not properly configured");
-                            warn!("   • Hardware or VM configuration issue");
-                        }
-                        return Err(anyhow!("Failed to open COM port {}: {}. Check if port is available and accessible.", self.device_path.display(), e));
+                    if SetCommTimeouts(write_file.as_raw_handle() as _, &mut timeouts) == 0 {
+                        warn!("Failed to set COM port write timeouts");
                     }
                 }
+
+                // Store persistent handles
+                {
+                    let mut write_handle = self.write_handle.write().unwrap();
+                    *write_handle = Some(Arc::new(write_file));
+                }
+                {
+                    let mut read_handle = self.read_handle.write().unwrap();
+                    *read_handle = Some(Arc::new(read_file));
+                }
+
+                self.is_connected.store(true, Ordering::SeqCst);
+                info!("COM port persistent connection established successfully with timeout {}ms", self.read_timeout_ms);
+                return Ok(());
             } else {
                 // It's a named pipe or other device
-                match OpenOptions::new()
+                use std::os::windows::io::AsRawHandle;
+                use winapi::um::namedpipeapi::SetNamedPipeHandleState;
+                use winapi::um::winbase::PIPE_NOWAIT;
+
+                let write_file = OpenOptions::new()
                     .write(true)
+                    .open(&self.device_path)
+                    .with_context(|| format!("Failed to open device for writing: {}", self.device_path.display()))?;
+
+                let read_file = OpenOptions::new()
                     .read(true)
                     .open(&self.device_path)
-                {
-                    Ok(_) => {
-                        info!("Device connection established successfully");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("Failed to open device {}: {}. Check device availability and permissions.", self.device_path.display(), e));
+                    .with_context(|| format!("Failed to open device for reading: {}", self.device_path.display()))?;
+
+                // Configure named pipe for non-blocking mode
+                if path_str.contains("pipe") {
+                    unsafe {
+                        let mut mode = PIPE_NOWAIT;
+                        if SetNamedPipeHandleState(read_file.as_raw_handle() as _, &mut mode, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
+                            warn!("Failed to set named pipe to non-blocking mode for reading");
+                        }
+                        if SetNamedPipeHandleState(write_file.as_raw_handle() as _, &mut mode, std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
+                            warn!("Failed to set named pipe to non-blocking mode for writing");
+                        }
                     }
                 }
+
+                // Store persistent handles
+                {
+                    let mut write_handle = self.write_handle.write().unwrap();
+                    *write_handle = Some(Arc::new(write_file));
+                }
+                {
+                    let mut read_handle = self.read_handle.write().unwrap();
+                    *read_handle = Some(Arc::new(read_file));
+                }
+
+                self.is_connected.store(true, Ordering::SeqCst);
+                info!("Device persistent connection established successfully with timeout {}ms", self.read_timeout_ms);
+                return Ok(());
             }
         }
-        
-        #[cfg(not(target_os = "windows"))]
+
+        #[cfg(target_os = "linux")]
         {
-            match OpenOptions::new()
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // Open with O_RDWR | O_NONBLOCK for Linux
+            let write_file = OpenOptions::new()
                 .write(true)
                 .read(true)
+                .custom_flags(libc::O_NONBLOCK)
                 .open(&self.device_path)
+                .with_context(|| format!("Failed to open virtio-serial device for writing: {}", self.device_path.display()))?;
+
+            let read_file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.device_path)
+                .with_context(|| format!("Failed to open virtio-serial device for reading: {}", self.device_path.display()))?;
+
+            // Store persistent handles
             {
-                Ok(_) => {
-                    info!("Virtio-serial connection established successfully");
-                    return Ok(());
-                }
-                Err(e) => {
-                    return Err(anyhow!("Failed to open virtio-serial device {}: {}. Check device permissions and availability.", self.device_path.display(), e));
-                }
+                let mut write_handle = self.write_handle.write().unwrap();
+                *write_handle = Some(Arc::new(write_file));
             }
+            {
+                let mut read_handle = self.read_handle.write().unwrap();
+                *read_handle = Some(Arc::new(read_file));
+            }
+
+            self.is_connected.store(true, Ordering::SeqCst);
+            info!("Virtio-serial persistent connection established successfully");
+            return Ok(());
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let write_file = OpenOptions::new()
+                .write(true)
+                .open(&self.device_path)
+                .with_context(|| format!("Failed to open device for writing: {}", self.device_path.display()))?;
+
+            let read_file = OpenOptions::new()
+                .read(true)
+                .open(&self.device_path)
+                .with_context(|| format!("Failed to open device for reading: {}", self.device_path.display()))?;
+
+            // Store persistent handles
+            {
+                let mut write_handle = self.write_handle.write().unwrap();
+                *write_handle = Some(Arc::new(write_file));
+            }
+            {
+                let mut read_handle = self.read_handle.write().unwrap();
+                *read_handle = Some(Arc::new(read_file));
+            }
+
+            self.is_connected.store(true, Ordering::SeqCst);
+            info!("Device persistent connection established successfully");
+            return Ok(());
         }
     }
 
-    
+    /// Safely disconnect and cleanup persistent handles
+    pub fn disconnect(&self) {
+        info!("Disconnecting persistent VirtIO connection");
+
+        // Clear write handle
+        {
+            let mut write_handle = self.write_handle.write().unwrap();
+            if write_handle.take().is_some() {
+                debug!("Write handle disconnected");
+            }
+        }
+
+        // Clear read handle
+        {
+            let mut read_handle = self.read_handle.write().unwrap();
+            if read_handle.take().is_some() {
+                debug!("Read handle disconnected");
+            }
+        }
+
+        // Mark as disconnected
+        self.is_connected.store(false, Ordering::SeqCst);
+        info!("VirtIO connection disconnected successfully");
+    }
+
+    /// Check connection health for persistent connections with enhanced validation
+    pub fn check_connection_health(&self) -> bool {
+        if !self.is_connected.load(Ordering::SeqCst) {
+            debug!("Connection health check failed: not connected");
+            return false;
+        }
+
+        // Add tolerance for temporary connection issues
+        let current_failures = self.consecutive_failures.load(Ordering::SeqCst);
+        let failure_threshold = 3; // Allow up to 3 consecutive failures before marking as unhealthy
+
+        let path_str = self.device_path.to_string_lossy();
+
+        // For Global objects on Windows, we can't keep persistent handles
+        // but we can test if the device is still accessible
+        #[cfg(target_os = "windows")]
+        {
+            if path_str.contains("Global") {
+                // Test if we can still open the Global object
+                match Self::try_open_windows_device(&path_str, false) {
+                    Ok(true) => {
+                        debug!("Connection health check passed: Global object accessible");
+                        // Reset failure counter on success
+                        self.consecutive_failures.store(0, Ordering::SeqCst);
+                        return true;
+                    }
+                    Ok(false) | Err(_) => {
+                        // Increment failure counter for progressive degradation
+                        let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
+                        debug!("Connection health check failed: Global object not accessible (failure {}/{})", failures, failure_threshold);
+                        return failures <= failure_threshold; // Return true if still within tolerance
+                    }
+                }
+            }
+        }
+
+        // For other device types, check if handles are still valid
+        let write_valid = {
+            let write_handle = self.write_handle.read().unwrap();
+            write_handle.is_some()
+        };
+
+        let read_valid = {
+            let read_handle = self.read_handle.read().unwrap();
+            read_handle.is_some()
+        };
+
+        let handles_valid = write_valid && read_valid;
+
+        if !handles_valid {
+            // Increment failure counter for progressive degradation
+            let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
+            debug!("Connection health check failed: handles invalid (write={}, read={}) (failure {}/{})",
+                   write_valid, read_valid, failures, failure_threshold);
+            return failures <= failure_threshold; // Return true if still within tolerance
+        }
+
+        // Additional validation: check if device path still exists (for file-based devices)
+        if !path_str.contains("Global") && !path_str.contains("pipe") {
+            if !self.device_path.exists() {
+                // Increment failure counter for progressive degradation
+                let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
+                debug!("Connection health check failed: device path no longer exists (failure {}/{})", failures, failure_threshold);
+                return failures <= failure_threshold; // Return true if still within tolerance
+            }
+        }
+
+        // Enhanced health check with ping test (rate-limited to avoid spam)
+        // Rate limit: configurable interval (default 60 seconds)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let last_ping = self.last_ping_test_time.load(Ordering::SeqCst);
+
+        // Only run ping test if enough time has passed since last test
+        if now.saturating_sub(last_ping) >= self.ping_test_interval_secs {
+            debug!("Running ping test for enhanced connection health validation");
+
+            // Perform ping test asynchronously in a blocking context
+            let ping_result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    self.test_send_ping().await
+                })
+            });
+
+            // Update the last ping test time regardless of result
+            self.last_ping_test_time.store(now, Ordering::SeqCst);
+
+            match ping_result {
+                Ok(_) => {
+                    debug!("Connection health check passed: all validations including ping test successful");
+                    // Reset failure counter on success
+                    self.consecutive_failures.store(0, Ordering::SeqCst);
+                    true
+                }
+                Err(e) => {
+                    // Increment failure counter for progressive degradation
+                    let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
+                    debug!("Connection health check failed: ping test failed - {} (failure {}/{})", e, failures, failure_threshold);
+
+                    // Only mark as unhealthy after threshold is exceeded
+                    failures <= failure_threshold // Return true if still within tolerance
+                }
+            }
+        } else {
+            debug!("Connection health check passed: basic validations successful (ping test skipped - rate limited)");
+            // Reset failure counter on success
+            self.consecutive_failures.store(0, Ordering::SeqCst);
+            true
+        }
+    }
 
     fn current_timestamp() -> String {
         SystemTime::now()
@@ -1163,6 +1630,27 @@ impl VirtioSerial {
     pub async fn send_data(&self, data: &SystemInfo) -> Result<()> {
         debug!("Sending system data via virtio-serial");
 
+        // Extract and log network interface information for diagnostics
+        let total_interfaces = data.metrics.network.interfaces.len();
+        let up_interfaces_with_ips = data.metrics.network.interfaces.iter()
+            .filter(|iface| iface.is_up && !iface.ip_addresses.is_empty())
+            .count();
+        let total_ip_addresses: usize = data.metrics.network.interfaces.iter()
+            .map(|iface| iface.ip_addresses.len())
+            .sum();
+
+        info!("Preparing metrics transmission: {} interfaces, {} UP with IPs, {} total IP addresses",
+              total_interfaces, up_interfaces_with_ips, total_ip_addresses);
+
+        // Validate that we have meaningful network information
+        if total_interfaces > 0 && up_interfaces_with_ips == 0 {
+            warn!("Transmitting metrics with no UP interfaces that have IP addresses");
+            for iface in &data.metrics.network.interfaces {
+                debug!("Interface {}: is_up={}, ip_count={}",
+                       iface.name, iface.is_up, iface.ip_addresses.len());
+            }
+        }
+
         // Wrap SystemInfo in the message format expected by backend
         let metrics_message = MetricsMessage {
             message_type: "metrics".to_string(),
@@ -1175,9 +1663,74 @@ impl VirtioSerial {
         let serialized = serde_json::to_string(&metrics_message)
             .with_context(|| "Failed to serialize metrics message")?;
 
-        self.send_raw_message(&serialized).await
+        info!("Sending metrics payload: size={} bytes, interfaces_with_ips={}",
+              serialized.len(), up_interfaces_with_ips);
+
+        // Track if this is the first transmission
+        let is_initial = !self.initial_transmission_sent.load(std::sync::atomic::Ordering::SeqCst);
+
+        match self.send_raw_message(&serialized).await {
+            Ok(()) => {
+                // Update transmission tracking
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                self.last_transmission_time.store(now, std::sync::atomic::Ordering::SeqCst);
+                self.consecutive_failures.store(0, std::sync::atomic::Ordering::SeqCst);
+
+                if is_initial {
+                    self.initial_transmission_sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                    info!("First successful metrics transmission completed with {} UP interfaces", up_interfaces_with_ips);
+                }
+
+                Ok(())
+            }
+            Err(e) => {
+                // Track transmission failures
+                let failures = self.consecutive_failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                warn!("Metrics transmission failed (failure #{} consecutive): {}", failures, e);
+                Err(e)
+            }
+        }
     }
-    
+
+    /// Try to send SystemInfo once with immediate error propagation for connection verification
+    /// This method does not treat any failures as "safe" and propagates all errors
+    pub async fn try_send_once(&self, data: &SystemInfo) -> Result<()> {
+        debug!("Attempting single transmission for connection verification");
+
+        // Extract network interface information for verification logging
+        let total_interfaces = data.metrics.network.interfaces.len();
+        let up_interfaces_with_ips = data.metrics.network.interfaces.iter()
+            .filter(|iface| iface.is_up && !iface.ip_addresses.is_empty())
+            .count();
+
+        debug!("Verification transmission data: {} interfaces, {} UP with IPs",
+               total_interfaces, up_interfaces_with_ips);
+
+        // Wrap SystemInfo in the message format expected by backend
+        let metrics_message = MetricsMessage {
+            message_type: "metrics".to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            data: MetricsData {
+                system: data.metrics.clone(),
+            },
+        };
+
+        let serialized = serde_json::to_string(&metrics_message)
+            .with_context(|| "Failed to serialize metrics message for verification")?;
+
+        // Send with strict error handling - do not treat any errors as safe
+        self.send_raw_message(&serialized).await
+            .with_context(|| "Failed to send verification message")?;
+
+        info!("Verification transmission completed successfully: {} interfaces, {} UP with IPs",
+              total_interfaces, up_interfaces_with_ips);
+
+        Ok(())
+    }
+
     /// Send a command response to the host
     pub async fn send_command_response(&self, response: &CommandResponse) -> Result<()> {
         debug!("Sending command response: id={}, success={}", response.id, response.success);
@@ -1187,79 +1740,552 @@ impl VirtioSerial {
         
         self.send_raw_message(&serialized).await
     }
-    
-    /// Send raw message to the device
+
+    /// Classify Windows error codes for intelligent retry logic
+    fn classify_windows_error(error_code: i32) -> ClassifiedError {
+        match error_code {
+            5 => ClassifiedError { // ERROR_ACCESS_DENIED
+                error_type: "ACCESS_DENIED".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: Some(5),
+                retry_recommended: true,
+                recovery_suggestion: Some("Check service permissions and restart InfiniService".to_string()),
+                max_retries: 5,
+            },
+            109 => ClassifiedError { // ERROR_BROKEN_PIPE
+                error_type: "BROKEN_PIPE".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: Some(109),
+                retry_recommended: true,
+                recovery_suggestion: Some("Connection interrupted, will retry".to_string()),
+                max_retries: 3,
+            },
+            2 => ClassifiedError { // ERROR_FILE_NOT_FOUND
+                error_type: "FILE_NOT_FOUND".to_string(),
+                severity: ErrorSeverity::Temporary,
+                windows_error_code: Some(2),
+                retry_recommended: true,
+                recovery_suggestion: Some("Device not ready, retrying".to_string()),
+                max_retries: 10,
+            },
+            6 => ClassifiedError { // ERROR_INVALID_HANDLE
+                error_type: "INVALID_HANDLE".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: Some(6),
+                retry_recommended: true,
+                recovery_suggestion: Some("Handle became invalid, will reopen device".to_string()),
+                max_retries: 3,
+            },
+            32 => ClassifiedError { // ERROR_SHARING_VIOLATION
+                error_type: "SHARING_VIOLATION".to_string(),
+                severity: ErrorSeverity::Temporary,
+                windows_error_code: Some(32),
+                retry_recommended: true,
+                recovery_suggestion: Some("Device in use by another process, retrying".to_string()),
+                max_retries: 8,
+            },
+            995 => ClassifiedError { // ERROR_OPERATION_ABORTED
+                error_type: "OPERATION_ABORTED".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: Some(995),
+                retry_recommended: true,
+                recovery_suggestion: Some("Operation was aborted, will retry".to_string()),
+                max_retries: 3,
+            },
+            _ => ClassifiedError { // Unknown error - treat as recoverable with caution
+                error_type: format!("UNKNOWN_ERROR_{}", error_code),
+                severity: ErrorSeverity::Unknown,
+                windows_error_code: Some(error_code),
+                retry_recommended: true,
+                recovery_suggestion: Some("Unknown error, will attempt limited retries".to_string()),
+                max_retries: 2,
+            }
+        }
+    }
+
+    /// Classify I/O error kinds for retry logic
+    fn classify_io_error(error_kind: std::io::ErrorKind) -> ClassifiedError {
+        match error_kind {
+            std::io::ErrorKind::BrokenPipe => ClassifiedError {
+                error_type: "IO_BROKEN_PIPE".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: None,
+                retry_recommended: true,
+                recovery_suggestion: Some("Pipe connection broken, will retry".to_string()),
+                max_retries: 3,
+            },
+            std::io::ErrorKind::ConnectionReset => ClassifiedError {
+                error_type: "IO_CONNECTION_RESET".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: None,
+                retry_recommended: true,
+                recovery_suggestion: Some("Connection was reset, will retry".to_string()),
+                max_retries: 3,
+            },
+            std::io::ErrorKind::UnexpectedEof => ClassifiedError {
+                error_type: "IO_UNEXPECTED_EOF".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: None,
+                retry_recommended: true,
+                recovery_suggestion: Some("Unexpected end of file, will retry".to_string()),
+                max_retries: 3,
+            },
+            std::io::ErrorKind::PermissionDenied => ClassifiedError {
+                error_type: "IO_PERMISSION_DENIED".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: None,
+                retry_recommended: true,
+                recovery_suggestion: Some("Permission denied, check service privileges".to_string()),
+                max_retries: 5,
+            },
+            std::io::ErrorKind::NotFound => ClassifiedError {
+                error_type: "IO_NOT_FOUND".to_string(),
+                severity: ErrorSeverity::Temporary,
+                windows_error_code: None,
+                retry_recommended: true,
+                recovery_suggestion: Some("Device not found, retrying".to_string()),
+                max_retries: 10,
+            },
+            _ => ClassifiedError {
+                error_type: format!("IO_ERROR_{:?}", error_kind),
+                severity: ErrorSeverity::Unknown,
+                windows_error_code: None,
+                retry_recommended: true,
+                recovery_suggestion: Some("I/O error occurred, will attempt limited retries".to_string()),
+                max_retries: 2,
+            }
+        }
+    }
+
+    /// Send control message directly to write handle without recursion
+    fn send_control_message(&self, value: serde_json::Value) -> Result<()> {
+        // Check if we have a write handle available
+        let file_handle = {
+            let write_handle = self.write_handle.read().unwrap();
+            if let Some(ref file) = *write_handle {
+                Some(Arc::clone(file))
+            } else {
+                None
+            }
+        };
+
+        if let Some(file) = file_handle {
+            // Write directly to the file handle with newline termination
+            use std::io::Write;
+            let message_str = value.to_string();
+            let mut file_ref = file.as_ref();
+            writeln!(file_ref, "{}", message_str)?;
+            file_ref.flush()?;
+            debug!("Control message sent successfully: {}", message_str);
+            Ok(())
+        } else {
+            Err(anyhow!("No write handle available for control message"))
+        }
+    }
+
+    /// Flush queued error reports when connection becomes available
+    fn flush_queued_error_reports(&self) -> Result<()> {
+        let mut queued_reports = self.queued_error_reports.write().unwrap();
+        if queued_reports.is_empty() {
+            return Ok(());
+        }
+
+        let mut sent_count = 0;
+        let mut failed_reports = Vec::new();
+
+        for report in queued_reports.drain(..) {
+            // Try to send with best-effort retry (1-2 attempts)
+            let mut attempts = 0;
+            let max_attempts = 2;
+
+            while attempts < max_attempts {
+                match self.send_control_message(report.clone()) {
+                    Ok(_) => {
+                        sent_count += 1;
+                        break; // Successfully sent, move to next report
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= max_attempts {
+                            debug!("Failed to send queued error report after {} attempts: {}", max_attempts, e);
+                            failed_reports.push(report.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keep failed reports for next flush attempt (ring buffer behavior)
+        *queued_reports = failed_reports;
+
+        if sent_count > 0 {
+            info!("Flushed {} queued error reports", sent_count);
+        }
+
+        Ok(())
+    }
+
+    /// Send detailed error report to backend
+    async fn send_error_report(&self, classified_error: &ClassifiedError, retry_attempt: u32) -> Result<()> {
+        let error_message = serde_json::json!({
+            "type": "error_report",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "error_type": classified_error.error_type,
+            "severity": format!("{:?}", classified_error.severity),
+            "windows_error_code": classified_error.windows_error_code,
+            "retry_attempt": retry_attempt,
+            "max_retries": classified_error.max_retries,
+            "recovery_suggestion": classified_error.recovery_suggestion,
+            "vm_id": self.vm_id
+        });
+
+        // Log the error report locally
+        info!("Sending error report: type={}, severity={:?}, retry={}/{}",
+              classified_error.error_type, classified_error.severity,
+              retry_attempt, classified_error.max_retries);
+
+        // Try to send error report when connected
+        if self.is_connected.load(Ordering::SeqCst) {
+            // Try to send directly with best-effort retry (1-2 attempts)
+            let mut attempts = 0;
+            let max_attempts = 2;
+
+            while attempts < max_attempts {
+                match self.send_control_message(error_message.clone()) {
+                    Ok(_) => {
+                        debug!("Error report sent successfully to backend");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= max_attempts {
+                            debug!("Failed to send error report after {} attempts: {}", max_attempts, e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // If not connected or send failed, queue the report
+        {
+            let mut queued_reports = self.queued_error_reports.write().unwrap();
+            queued_reports.push(error_message.clone());
+
+            // Keep ring buffer small (max 10 reports)
+            if queued_reports.len() > 10 {
+                queued_reports.remove(0);
+            }
+
+            debug!("Error report queued (queue size: {})", queued_reports.len());
+        }
+
+        Ok(())
+    }
+
+    /// Classify OS errors per platform to avoid misclassification
+    fn classify_os_error(error: &std::io::Error) -> ClassifiedError {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(code) = error.raw_os_error() {
+                return Self::classify_windows_error(code);
+            }
+        }
+        // For non-Windows or when raw_os_error() is None
+        Self::classify_io_error(error.kind())
+    }
+
+    /// Handle error with intelligent retry logic
+    async fn handle_error_with_retry(&self, error: &std::io::Error, operation: &str) -> Result<bool> {
+        let classified_error = Self::classify_os_error(error);
+
+        let current_retry_count = self.error_retry_count.load(Ordering::SeqCst);
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Update error time tracking
+        self.last_error_time.store(current_time, Ordering::SeqCst);
+
+        // Send error report to backend
+        if let Err(e) = self.send_error_report(&classified_error, current_retry_count + 1).await {
+            warn!("Failed to send error report: {}", e);
+        }
+
+        // Check if we should retry - apply unified retry caps (per-error vs global limit)
+        //
+        // Retry Cap Policy:
+        // - Each error type has its own retry limit based on severity (e.g., temporary errors get 10 retries)
+        // - The VirtioSerial instance has a global retry limit (default: 5) that applies across all error types
+        // - The effective cap is the minimum of both limits to prevent excessive retries while respecting error-specific needs
+        let per_error_cap = classified_error.max_retries;
+        let global_cap = self.max_error_retries;
+        let effective_cap = per_error_cap.min(global_cap);
+
+        if classified_error.retry_recommended && current_retry_count < effective_cap {
+            // Increment retry count
+            self.error_retry_count.store(current_retry_count + 1, Ordering::SeqCst);
+
+            // Calculate backoff delay based on error severity
+            let base_backoff = match classified_error.severity {
+                ErrorSeverity::Temporary => 500,    // 0.5s for temporary errors
+                ErrorSeverity::Recoverable => 2000, // 2s for recoverable errors
+                ErrorSeverity::Unknown => 1000,     // 1s for unknown errors
+                ErrorSeverity::Fatal => 0,          // No backoff for fatal errors
+            };
+
+            let backoff_multiplier = (current_retry_count + 1) as u64;
+            let backoff_delay = base_backoff * backoff_multiplier;
+
+            // Cap maximum backoff at 30 seconds
+            let capped_backoff = std::cmp::min(backoff_delay, 30000);
+            self.error_backoff_ms.store(capped_backoff, Ordering::SeqCst);
+
+            info!("Retrying {} operation in {}ms (attempt {}/{}) due to {}: {}",
+                  operation, capped_backoff, current_retry_count + 1,
+                  effective_cap, classified_error.error_type, error);
+
+            // Wait for backoff delay
+            tokio::time::sleep(tokio::time::Duration::from_millis(capped_backoff)).await;
+
+            return Ok(true); // Indicates retry should be attempted
+        } else {
+            // Max retries exceeded or fatal error
+            if classified_error.severity == ErrorSeverity::Fatal {
+                error!("Fatal error in {} operation: {} - {}", operation, classified_error.error_type, error);
+            } else {
+                error!("Max retries ({}) exceeded for {} operation: {} - {}",
+                       effective_cap, operation, classified_error.error_type, error);
+            }
+
+            // Mark connection as broken
+            self.is_connected.store(false, Ordering::SeqCst);
+
+            // Reset retry count for next error
+            self.error_retry_count.store(0, Ordering::SeqCst);
+
+            return Ok(false); // Indicates no more retries
+        }
+    }
+
+    /// Reset error tracking after successful operation
+    fn reset_error_tracking(&self) {
+        self.error_retry_count.store(0, Ordering::SeqCst);
+        self.error_backoff_ms.store(1000, Ordering::SeqCst); // Reset to initial backoff
+
+        // Flush any queued error reports on successful operation
+        if let Err(e) = self.flush_queued_error_reports() {
+            debug!("Failed to flush queued error reports: {}", e);
+        }
+    }
+
+    /// Send raw message using persistent connection
     async fn send_raw_message(&self, message: &str) -> Result<()> {
+        let start = std::time::Instant::now();
         let path_str = self.device_path.to_string_lossy();
 
         // Check if VirtIO is available
         if path_str == "__NO_VIRTIO_DEVICE__" {
             debug!("VirtIO not available - message not sent: {}", message);
+            let latency_ms = start.elapsed().as_millis() as u64;
+            self.update_transmission_stats(message.len() as u64, latency_ms, false);
             return Err(anyhow!("VirtIO device not available for communication"));
         }
 
-        // Open device and send data with rate-limited error logging
-        let file_result = {
-            #[cfg(target_os = "windows")]
-            {
-                if path_str.contains("COM") && !path_str.contains("pipe") {
-                    // COM port - no special flags needed for synchronous write
-                    OpenOptions::new()
-                        .write(true)
-                        .open(&self.device_path)
-                        .with_context(|| format!("Failed to open COM port for data transmission: {}", self.device_path.display()))
-                } else {
-                    OpenOptions::new()
-                        .write(true)
-                        .open(&self.device_path)
-                        .with_context(|| format!("Failed to open device for data transmission: {}", self.device_path.display()))
-                }
-            }
-
-            #[cfg(not(target_os = "windows"))]
-            {
-                OpenOptions::new()
-                    .write(true)
-                    .open(&self.device_path)
-                    .with_context(|| format!("Failed to open device for data transmission: {}", self.device_path.display()))
-            }
+        // Circuit Breaker: Check state before attempting transmission
+        let circuit_state = {
+            let state = self.circuit_breaker_state.read().unwrap();
+            state.clone()
         };
 
-        let mut file = match file_result {
-            Ok(file) => file,
-            Err(e) => {
-                // Handle device open errors with rate limiting for transmission
-                use std::sync::LazyLock;
-                static TRANSMISSION_ERROR_STATE: LazyLock<std::sync::Mutex<(std::time::Instant, u32)>> =
-                    LazyLock::new(|| std::sync::Mutex::new((std::time::Instant::now(), 0)));
+        match circuit_state {
+            CircuitBreakerState::Open => {
+                // Check if circuit should transition to Half-Open
+                let metrics = self.circuit_breaker_metrics.read().unwrap();
+                let time_since_open = SystemTime::now()
+                    .duration_since(metrics.state_change_time)
+                    .unwrap_or_default()
+                    .as_secs();
 
-                if let Ok(mut state) = TRANSMISSION_ERROR_STATE.lock() {
-                    state.1 += 1; // Increment error count
-                    let now = std::time::Instant::now();
+                if time_since_open >= self.circuit_breaker_config.open_duration_secs {
+                    drop(metrics); // Release read lock
+                    self.transition_circuit_breaker_to_half_open().await;
+                } else {
+                    let latency_ms = start.elapsed().as_millis() as u64;
+                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                    return Err(anyhow!(
+                        "Circuit breaker is OPEN - blocking transmission. Retry in {} seconds",
+                        self.circuit_breaker_config.open_duration_secs.saturating_sub(time_since_open)
+                    ));
+                }
+            },
+            CircuitBreakerState::HalfOpen => {
+                // Allow limited calls in half-open state
+                let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+                if metrics.half_open_calls >= self.circuit_breaker_config.half_open_max_calls {
+                    let latency_ms = start.elapsed().as_millis() as u64;
+                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                    return Err(anyhow!("Circuit breaker is HALF-OPEN - maximum calls reached"));
+                }
+                metrics.half_open_calls += 1;
+            },
+            CircuitBreakerState::Closed => {
+                // Normal operation - no restrictions
+            }
+        }
 
-                    // Only log every 30 seconds or every 50 errors
-                    if now.duration_since(state.0).as_secs() >= 30 || state.1 >= 50 {
-                        warn!("Failed to open virtio device for transmission ({} attempts in last interval): {}", state.1, e);
-                        debug!("Device path: {}", self.device_path.display());
-                        state.0 = now;
-                        state.1 = 0;
+        // Check connection state before attempting to send
+        if !self.is_connected.load(Ordering::SeqCst) {
+            let latency_ms = start.elapsed().as_millis() as u64;
+            self.update_transmission_stats(message.len() as u64, latency_ms, false);
+            self.record_circuit_breaker_failure().await;
+            return Err(anyhow!("VirtIO connection not established"));
+        }
+
+        // Handle Global objects on Windows differently (can't keep persistent handles)
+        #[cfg(target_os = "windows")]
+        {
+            if path_str.contains("Global") {
+                // Retry logic for Global object operations
+                loop {
+                    match OpenOptions::new()
+                        .write(true)
+                        .open(&self.device_path)
+                    {
+                        Ok(mut file) => {
+                            match writeln!(file, "{}", message) {
+                                Ok(_) => {
+                                    match file.flush() {
+                                        Ok(_) => {
+                                            debug!("Message sent successfully via Global object");
+                                            let latency_ms = start.elapsed().as_millis() as u64;
+                                            self.update_transmission_stats(message.len() as u64, latency_ms, true);
+                                            self.reset_error_tracking(); // Reset on success
+                                            self.record_circuit_breaker_success().await;
+                                            return Ok(());
+                                        }
+                                        Err(e) => {
+                                            // Handle flush error with retry logic
+                                            match self.handle_error_with_retry(&e, "Global object flush").await {
+                                                Ok(true) => continue, // Retry
+                                                Ok(false) => {
+                                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                                    return Err(anyhow!("Failed to flush message to Global object after retries: {}", e));
+                                                }
+                                                Err(retry_err) => {
+                                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                                    return Err(anyhow!("Error handling retry for flush: {}", retry_err));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Handle write error with retry logic
+                                    match self.handle_error_with_retry(&e, "Global object write").await {
+                                        Ok(true) => continue, // Retry
+                                        Ok(false) => {
+                                            let latency_ms = start.elapsed().as_millis() as u64;
+                                            self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                            return Err(anyhow!("Failed to write message to Global object after retries: {}", e));
+                                        }
+                                        Err(retry_err) => {
+                                            let latency_ms = start.elapsed().as_millis() as u64;
+                                            self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                            return Err(anyhow!("Error handling retry for write: {}", retry_err));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Handle open error with retry logic
+                            match self.handle_error_with_retry(&e, "Global object open").await {
+                                Ok(true) => continue, // Retry
+                                Ok(false) => {
+                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                    return Err(anyhow!("Failed to open Global object for transmission after retries: {}", e));
+                                }
+                                Err(retry_err) => {
+                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                    return Err(anyhow!("Error handling retry for open: {}", retry_err));
+                                }
+                            }
+                        }
                     }
                 }
-                return Err(e);
             }
+        }
+
+        // Use persistent write handle for other device types
+        // Clone Arc<File> to avoid blocking I/O under locks
+        let file_handle = {
+            let write_handle = self.write_handle.read().unwrap();
+            if let Some(ref file) = *write_handle {
+                Some(Arc::clone(file))
+            } else {
+                None
+            }
+        }; // Lock is released here immediately
+
+        let write_result = if let Some(file) = file_handle {
+            // Perform I/O operations outside of any locks
+            use std::io::Write;
+            let mut file_ref = file.as_ref();
+            let write_res = writeln!(file_ref, "{}", message);
+            if write_res.is_ok() {
+                file_ref.flush()
+            } else {
+                write_res
+            }
+        } else {
+            // No write handle available
+            self.is_connected.store(false, Ordering::SeqCst);
+            let latency_ms = start.elapsed().as_millis() as u64;
+            self.update_transmission_stats(message.len() as u64, latency_ms, false);
+            return Err(anyhow!("No write handle available - connection lost"));
         };
 
-        writeln!(file, "{}", message)
-            .with_context(|| "Failed to write message to device")?;
-
-        file.flush()
-            .with_context(|| "Failed to flush message to device")?;
-
-        debug!("Message sent successfully");
-        Ok(())
+        // Process the result outside of the mutex lock
+        match write_result {
+            Ok(_) => {
+                debug!("Message sent successfully via persistent connection");
+                let latency_ms = start.elapsed().as_millis() as u64;
+                self.update_transmission_stats(message.len() as u64, latency_ms, true);
+                self.reset_error_tracking(); // Reset on success
+                self.record_circuit_breaker_success().await;
+                Ok(())
+            }
+            Err(e) => {
+                // Use intelligent retry logic for persistent connection errors
+                match self.handle_error_with_retry(&e, "persistent connection write").await {
+                    Ok(true) => {
+                        // Retry was recommended, but we need to recursively call send_raw_message
+                        // to handle the retry properly with fresh connection state
+                        return self.send_raw_message(message).await;
+                    }
+                    Ok(false) => {
+                        // No retry recommended or max retries exceeded
+                        let latency_ms = start.elapsed().as_millis() as u64;
+                        self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                        Err(anyhow!("Failed to transmit message after retries: {}", e))
+                    }
+                    Err(retry_err) => {
+                        let latency_ms = start.elapsed().as_millis() as u64;
+                        self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                        Err(anyhow!("Error handling retry for persistent connection: {}", retry_err))
+                    }
+                }
+            }
+        }
     }
     
-    /// Read incoming commands from the device
+    /// Read incoming commands using persistent connection
     pub async fn read_command(&self) -> Result<Option<IncomingMessage>> {
         let path_str = self.device_path.to_string_lossy();
 
@@ -1269,134 +2295,134 @@ impl VirtioSerial {
             return Ok(None);
         }
 
-        // Rate limit all operations to avoid spam
-        use std::sync::LazyLock;
-        static OPERATION_STATE: LazyLock<std::sync::Mutex<(std::time::Instant, u32, std::time::Instant)>> =
-            LazyLock::new(|| std::sync::Mutex::new((std::time::Instant::now(), 0, std::time::Instant::now())));
+        // Check connection state before attempting to read
+        if !self.is_connected.load(Ordering::SeqCst) {
+            return Ok(None); // Return None instead of error to avoid breaking service loop
+        }
 
-        // Try to open device for reading with error handling
+        // Handle Global objects on Windows differently
         #[cfg(target_os = "windows")]
-        let file_result = {
-            if path_str.contains("COM") && !path_str.contains("pipe") {
-                OpenOptions::new()
-                    .read(true)
-                    .open(&self.device_path)
+        {
+            if path_str.contains("Global") {
+                // For Global objects, we can't maintain persistent read handles
+                // Use tokio timeout with select! for non-blocking behavior
+                use tokio::time::{timeout, Duration};
+                use tokio::task;
+
+                let timeout_duration = Duration::from_millis(self.read_timeout_ms);
+                let device_path = self.device_path.clone();
+
+                let read_result = timeout(timeout_duration, task::spawn_blocking(move || {
+                    match OpenOptions::new()
+                        .read(true)
+                        .open(&device_path)
+                    {
+                        Ok(file) => {
+                            let mut reader = BufReader::new(file);
+                            let mut line = String::new();
+                            reader.read_line(&mut line).map(|n| (n, line))
+                        }
+                        Err(e) => Err(e)
+                    }
+                })).await;
+
+                match read_result {
+                    Ok(Ok(Ok((0, _)))) => return Ok(None), // No data available
+                    Ok(Ok(Ok((bytes_read, line)))) => {
+                        self.update_bytes_received(bytes_read as u64);
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            return Ok(None);
+                        }
+                        return self.parse_incoming_message(trimmed);
+                    }
+                    Ok(Ok(Err(e))) => {
+                        match e.kind() {
+                            std::io::ErrorKind::WouldBlock |
+                            std::io::ErrorKind::TimedOut |
+                            std::io::ErrorKind::UnexpectedEof => {
+                                return Ok(None);
+                            }
+                            _ => {
+                                if let Some(error_code) = e.raw_os_error() {
+                                    match error_code {
+                                        5 | 2 => { // ACCESS_DENIED or FILE_NOT_FOUND
+                                            self.is_connected.store(false, Ordering::SeqCst);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        // Task join error
+                        return Ok(None);
+                    }
+                    Err(_) => {
+                        // Timeout occurred
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        // Use persistent read handle for other device types
+        // Clone Arc<File> to avoid blocking I/O under locks
+        let file_handle = {
+            let read_handle = self.read_handle.read().unwrap();
+            if let Some(ref file) = *read_handle {
+                Some(Arc::clone(file))
             } else {
-                OpenOptions::new()
-                    .read(true)
-                    .open(&self.device_path)
+                None
             }
+        }; // Lock is released here immediately
+
+        let read_result = if let Some(file) = file_handle {
+            // Perform I/O operations outside of any locks
+            use std::io::{BufReader, BufRead};
+            let mut reader = BufReader::new(file.as_ref());
+            let mut line = String::new();
+            reader.read_line(&mut line).map(|n| (n, line))
+        } else {
+            // No read handle available
+            self.is_connected.store(false, Ordering::SeqCst);
+            return Ok(None);
         };
 
-        #[cfg(not(target_os = "windows"))]
-        let file_result = OpenOptions::new()
-            .read(true)
-            .open(&self.device_path);
-
-        let file = match file_result {
-            Ok(f) => {
-                // Success - log occasionally
-                if let Ok(mut state) = OPERATION_STATE.lock() {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(state.2).as_secs() >= 30 {
-                        debug!("Successfully opened virtio-serial device for reading");
-                        state.2 = now;
-                    }
-                }
-                f
-            },
-            Err(e) => {
-                // Handle device open errors with rate limiting
-                if let Ok(mut state) = OPERATION_STATE.lock() {
-                    state.1 += 1; // Increment error count
-                    let now = std::time::Instant::now();
-
-                    // Only log every 30 seconds or every 50 errors
-                    if now.duration_since(state.0).as_secs() >= 30 || state.1 >= 50 {
-                        warn!("Failed to open virtio device ({} attempts in last interval): {}", state.1, e);
-                        debug!("Device path: {}", self.device_path.display());
-                        state.0 = now;
-                        state.1 = 0;
-                    }
-                }
-                // Return None instead of propagating error to avoid breaking the service loop
-                return Ok(None);
-            }
-        };
-        
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        
-        // Try to read a line (non-blocking would be better but requires more complex setup)
-        match reader.read_line(&mut line) {
-            Ok(0) => {
+        // Process the read result outside of the mutex lock
+        match read_result {
+            Ok((0, _)) => {
                 // No data available
                 Ok(None)
-            },
-            Ok(_) => {
-                // Parse the incoming message
+            }
+            Ok((bytes_read, line)) => {
+                self.update_bytes_received(bytes_read as u64);
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     return Ok(None);
                 }
-                
-                debug!("Received message: {}", trimmed);
-                
-                match serde_json::from_str::<IncomingMessage>(trimmed) {
-                    Ok(msg) => {
-                        match &msg {
-                            IncomingMessage::SafeCommand(cmd) => {
-                                info!("Received safe command: id={}, type={:?}", cmd.id, cmd.command_type);
-                            },
-                            IncomingMessage::UnsafeCommand(cmd) => {
-                                warn!("⚠️ Received UNSAFE command: id={}, command={}", cmd.id, cmd.raw_command);
-                            },
-                            IncomingMessage::Metrics => {
-                                debug!("Received metrics request");
-                            }
-                        }
-                        Ok(Some(msg))
-                    },
-                    Err(e) => {
-                        warn!("Failed to parse incoming message: {}", e);
-                        debug!("Raw message was: {}", trimmed);
-                        Ok(None)
-                    }
-                }
-            },
+                self.parse_incoming_message(trimmed)
+            }
             Err(e) => {
                 match e.kind() {
-                    std::io::ErrorKind::WouldBlock => {
-                        // No data available (non-blocking read) - this is normal
-                        Ok(None)
-                    },
-                    std::io::ErrorKind::TimedOut => {
-                        // Timeout - this is also normal for non-blocking operations
-                        Ok(None)
-                    },
+                    std::io::ErrorKind::WouldBlock |
+                    std::io::ErrorKind::TimedOut |
                     std::io::ErrorKind::UnexpectedEof => {
-                        // EOF - no more data available, this is normal
+                        // These are normal for non-blocking operations
                         Ok(None)
-                    },
+                    }
+                    std::io::ErrorKind::BrokenPipe |
+                    std::io::ErrorKind::ConnectionReset => {
+                        // Connection broken - mark as disconnected
+                        warn!("VirtIO connection broken during read: {}", e);
+                        self.is_connected.store(false, Ordering::SeqCst);
+                        Ok(None)
+                    }
                     _ => {
-                        // Only log actual errors, not expected conditions
-                        use std::sync::LazyLock;
-                        static ERROR_LOG_STATE: LazyLock<std::sync::Mutex<(std::time::Instant, u32)>> =
-                            LazyLock::new(|| std::sync::Mutex::new((std::time::Instant::now(), 0)));
-
-                        if let Ok(mut state) = ERROR_LOG_STATE.lock() {
-                            state.1 += 1; // Increment error count
-                            let now = std::time::Instant::now();
-
-                            // Only log every 30 seconds or every 100 errors
-                            if now.duration_since(state.0).as_secs() >= 30 || state.1 >= 100 {
-                                warn!("Communication error reading from device ({} occurrences): {}", state.1, e);
-                                state.0 = now;
-                                state.1 = 0;
-                            }
-                        }
-
-                        // Return None instead of error to avoid breaking the service loop
+                        // Other error - don't break the service loop
+                        debug!("Read error (non-fatal): {}", e);
                         Ok(None)
                     }
                 }
@@ -1404,15 +2430,46 @@ impl VirtioSerial {
         }
     }
 
-    /// Check if virtio-serial device is available
+    /// Parse incoming message and log appropriately
+    fn parse_incoming_message(&self, trimmed: &str) -> Result<Option<IncomingMessage>> {
+        debug!("Received message: {}", trimmed);
+
+        match serde_json::from_str::<IncomingMessage>(trimmed) {
+            Ok(msg) => {
+                match &msg {
+                    IncomingMessage::SafeCommand(cmd) => {
+                        info!("Received safe command: id={}, type={:?}", cmd.id, cmd.command_type);
+                    }
+                    IncomingMessage::UnsafeCommand(cmd) => {
+                        warn!("⚠️ Received UNSAFE command: id={}, command={}", cmd.id, cmd.raw_command);
+                    }
+                    IncomingMessage::Metrics => {
+                        debug!("Received metrics request");
+                    }
+                    IncomingMessage::KeepAliveResponse(response) => {
+                        debug!("Received keep-alive response: seq={}", response.sequence_number);
+                        self.handle_keep_alive_response(response.sequence_number);
+                    }
+                }
+                Ok(Some(msg))
+            }
+            Err(e) => {
+                warn!("Failed to parse incoming message: {}", e);
+                debug!("Raw message was: {}", trimmed);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Check if virtio-serial device is available (device path/access only)
     pub fn is_available(&self) -> bool {
         let path_str = self.device_path.to_string_lossy();
-        
+
         // Check if this is the special "no device" marker
         if path_str == "__NO_VIRTIO_DEVICE__" {
             return false;
         }
-        
+
         #[cfg(target_os = "windows")]
         {
             // Global objects need special handling - they're not files
@@ -1424,9 +2481,14 @@ impl VirtioSerial {
                 }
             }
         }
-        
+
         // For regular files and non-Windows systems
         self.device_path.exists()
+    }
+
+    /// Check if there is an established persistent connection
+    pub fn is_connected(&self) -> bool {
+        self.is_connected.load(Ordering::SeqCst)
     }
 
     /// Send connection status updates to host
@@ -1507,6 +2569,627 @@ impl VirtioSerial {
         health_info.insert("timestamp".to_string(), chrono::Utc::now().to_rfc3339());
         Ok(health_info)
     }
+
+    /// Get transmission statistics for diagnostics
+    pub fn get_transmission_stats(&self) -> std::collections::HashMap<String, String> {
+        let mut stats = std::collections::HashMap::new();
+
+        let last_transmission = self.last_transmission_time.load(std::sync::atomic::Ordering::SeqCst);
+        let consecutive_failures = self.consecutive_failures.load(std::sync::atomic::Ordering::SeqCst);
+        let initial_sent = self.initial_transmission_sent.load(std::sync::atomic::Ordering::SeqCst);
+
+        stats.insert("last_transmission_time".to_string(), last_transmission.to_string());
+        stats.insert("consecutive_failures".to_string(), consecutive_failures.to_string());
+        stats.insert("initial_transmission_sent".to_string(), initial_sent.to_string());
+
+        // Calculate time since last transmission
+        if last_transmission > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let time_since_last = now.saturating_sub(last_transmission);
+            stats.insert("seconds_since_last_transmission".to_string(), time_since_last.to_string());
+        } else {
+            stats.insert("seconds_since_last_transmission".to_string(), "never".to_string());
+        }
+
+        stats
+    }
+
+    /// Check if initial IP data has been successfully transmitted
+    pub fn has_initial_transmission_succeeded(&self) -> bool {
+        self.initial_transmission_sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Test the send path with a lightweight ping message
+    /// Returns detailed error classification for diagnostic purposes
+    pub async fn test_send_ping(&self) -> Result<()> {
+        debug!("Testing connection with lightweight ping message");
+
+        // Create a minimal ping message
+        let ping_message = serde_json::json!({
+            "type": "ping",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "sequence": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        });
+
+        let serialized = serde_json::to_string(&ping_message)
+            .with_context(|| "Failed to serialize ping message")?;
+
+        // Send the ping message with strict error handling
+        match self.send_raw_message(&serialized).await {
+            Ok(()) => {
+                debug!("Ping test completed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                debug!("Ping test failed: {}", e);
+                Err(e).with_context(|| "Ping test failed")
+            }
+        }
+    }
+
+    /// Get connection metadata with detailed diagnostic information
+    pub fn get_connection_diagnostics(&self) -> std::collections::HashMap<String, String> {
+        let mut diagnostics = self.get_device_metadata();
+
+        // Add transmission statistics
+        diagnostics.extend(self.get_transmission_stats());
+
+        // Add connection health information
+        diagnostics.insert("connection_health".to_string(), self.check_connection_health().to_string());
+
+        // Add timeout configuration
+        diagnostics.insert("read_timeout_ms".to_string(), self.read_timeout_ms.to_string());
+
+        // Add device type analysis
+        let path_str = self.device_path.to_string_lossy();
+        let device_type = if path_str.contains("Global") {
+            "global_object"
+        } else if path_str.contains("pipe") {
+            "named_pipe"
+        } else if path_str.contains("COM") {
+            "com_port"
+        } else if path_str.starts_with("/dev/") {
+            "linux_device"
+        } else {
+            "unknown"
+        };
+        diagnostics.insert("device_type_detected".to_string(), device_type.to_string());
+
+        diagnostics
+    }
+
+    // Enhanced diagnostic helper methods
+    fn record_health_check_result(&self, success: bool, latency_ms: Option<u64>, error_details: Option<String>) {
+        let result = HealthCheckResult {
+            timestamp: SystemTime::now(),
+            success,
+            latency_ms,
+            error_details,
+        };
+
+        if let Ok(mut history) = self.health_check_history.write() {
+            history.push(result);
+            // Keep only last 100 health check results
+            if history.len() > 100 {
+                history.drain(0..history.len() - 100);
+            }
+        }
+    }
+
+    fn update_connection_quality(&self, quality: ConnectionQuality) {
+        if let Ok(mut metrics) = self.connection_metrics.write() {
+            metrics.connection_quality = quality;
+        }
+    }
+
+    fn get_connection_quality(&self) -> ConnectionQuality {
+        self.connection_metrics.read()
+            .map(|m| m.connection_quality.clone())
+            .unwrap_or(ConnectionQuality::Poor)
+    }
+
+    fn increment_error_pattern(&self, error_type: String) {
+        if let Ok(mut metrics) = self.connection_metrics.write() {
+            *metrics.error_patterns.entry(error_type).or_insert(0) += 1;
+        }
+    }
+
+    fn classify_transmission_error(&self, error: &anyhow::Error) -> String {
+        let error_str = error.to_string().to_lowercase();
+        if error_str.contains("connection") {
+            "connection_error".to_string()
+        } else if error_str.contains("timeout") {
+            "timeout_error".to_string()
+        } else if error_str.contains("permission") {
+            "permission_error".to_string()
+        } else if error_str.contains("device") {
+            "device_error".to_string()
+        } else {
+            "unknown_error".to_string()
+        }
+    }
+
+    fn update_transmission_stats(&self, bytes: u64, latency_ms: u64, success: bool) {
+        if let Ok(mut stats) = self.transmission_stats.write() {
+            if success {
+                stats.bytes_sent += bytes;
+            }
+            stats.message_count += 1;
+            stats.last_transmission_size = bytes;
+
+            // Update average latency using exponential moving average
+            if stats.average_latency_ms == 0.0 {
+                stats.average_latency_ms = latency_ms as f64;
+            } else {
+                stats.average_latency_ms = stats.average_latency_ms * 0.9 + (latency_ms as f64) * 0.1;
+            }
+        }
+
+        if let Ok(mut metrics) = self.connection_metrics.write() {
+            if success {
+                metrics.successful_transmissions += 1;
+                metrics.last_successful_transmission = Some(SystemTime::now());
+            } else {
+                metrics.failed_transmissions += 1;
+            }
+        }
+    }
+
+    fn update_bytes_received(&self, bytes: u64) {
+        if let Ok(mut stats) = self.transmission_stats.write() {
+            stats.bytes_received += bytes;
+        }
+    }
+
+    fn get_health_statistics(&self) -> HealthStatistics {
+        if let Ok(history) = self.health_check_history.read() {
+            let total_checks = history.len();
+            if total_checks == 0 {
+                return HealthStatistics {
+                    total_checks: 0,
+                    success_rate: 0.0,
+                    average_latency_ms: 0.0,
+                };
+            }
+
+            let successful_checks = history.iter().filter(|r| r.success).count();
+            let success_rate = successful_checks as f64 / total_checks as f64;
+
+            let latencies: Vec<u64> = history.iter()
+                .filter_map(|r| r.latency_ms)
+                .collect();
+            let average_latency_ms = if latencies.is_empty() {
+                0.0
+            } else {
+                latencies.iter().sum::<u64>() as f64 / latencies.len() as f64
+            };
+
+            HealthStatistics {
+                total_checks,
+                success_rate,
+                average_latency_ms,
+            }
+        } else {
+            HealthStatistics {
+                total_checks: 0,
+                success_rate: 0.0,
+                average_latency_ms: 0.0,
+            }
+        }
+    }
+
+    fn get_transmission_statistics(&self) -> TransmissionStats {
+        self.transmission_stats.read()
+            .map(|s| s.clone())
+            .unwrap_or(TransmissionStats {
+                bytes_sent: 0,
+                bytes_received: 0,
+                message_count: 0,
+                average_latency_ms: 0.0,
+                last_transmission_size: 0,
+            })
+    }
+
+    /// Enhanced connection health check with latency measurement and quality scoring
+    pub fn check_connection_health(&self) -> bool {
+        let health_check_start = SystemTime::now();
+
+        info!("🔍 Starting comprehensive connection health check");
+
+        if !self.is_connected.load(Ordering::SeqCst) {
+            self.record_health_check_result(false, None, Some("Connection not established".to_string()));
+            warn!("❌ Connection health check failed: not connected");
+            return false;
+        }
+
+        let path_str = self.device_path.to_string_lossy();
+
+        // For Global objects on Windows, we can't keep persistent handles
+        // but we can test if the device is still accessible
+        #[cfg(target_os = "windows")]
+        {
+            if path_str.contains("Global") {
+                // Test if we can still open the Global object
+                match Self::try_open_windows_device(&path_str, false) {
+                    Ok(true) => {
+                        let latency_ms = health_check_start.elapsed().unwrap_or_default().as_millis() as u64;
+                        debug!("Connection health check passed: Global object accessible ({}ms)", latency_ms);
+                        self.record_health_check_result(true, Some(latency_ms), None);
+
+                        // Update connection quality based on latency
+                        if latency_ms < 100 {
+                            self.update_connection_quality(ConnectionQuality::Excellent);
+                        } else if latency_ms < 500 {
+                            self.update_connection_quality(ConnectionQuality::Good);
+                        } else {
+                            self.update_connection_quality(ConnectionQuality::Poor);
+                        }
+
+                        return true;
+                    }
+                    Ok(false) | Err(_) => {
+                        let latency_ms = health_check_start.elapsed().unwrap_or_default().as_millis() as u64;
+                        self.record_health_check_result(false, Some(latency_ms), Some("Global object not accessible".to_string()));
+                        self.update_connection_quality(ConnectionQuality::Critical);
+                        debug!("Connection health check failed: Global object not accessible ({}ms)", latency_ms);
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // For other device types, check if handles are still valid
+        let write_valid = {
+            let write_handle = self.write_handle.read().unwrap();
+            write_handle.is_some()
+        };
+
+        let read_valid = {
+            let read_handle = self.read_handle.read().unwrap();
+            read_handle.is_some()
+        };
+
+        let handles_valid = write_valid && read_valid;
+
+        if !handles_valid {
+            let latency_ms = health_check_start.elapsed().unwrap_or_default().as_millis() as u64;
+            let error_msg = format!("Handles invalid (write={}, read={})", write_valid, read_valid);
+            self.record_health_check_result(false, Some(latency_ms), Some(error_msg.clone()));
+            self.update_connection_quality(ConnectionQuality::Critical);
+            debug!("❌ Connection health check failed: {} ({}ms)", error_msg, latency_ms);
+            return false;
+        }
+
+        // Additional validation: check if device path still exists (for file-based devices)
+        if !path_str.contains("Global") && !path_str.contains("pipe") {
+            if !self.device_path.exists() {
+                let latency_ms = health_check_start.elapsed().unwrap_or_default().as_millis() as u64;
+                self.record_health_check_result(false, Some(latency_ms), Some("Device path no longer exists".to_string()));
+                self.update_connection_quality(ConnectionQuality::Critical);
+                warn!("❌ Connection health check failed: device path no longer exists ({}ms)", latency_ms);
+                return false;
+            }
+        }
+
+        debug!("✅ Basic health validations passed: handles_valid={}, device_path_exists={}", handles_valid, !path_str.contains("Global") && !path_str.contains("pipe"));
+
+        // Enhanced health check with ping test (rate-limited to avoid spam)
+        // Rate limit: configurable interval (default 60 seconds)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let last_ping = self.last_ping_test_time.load(Ordering::SeqCst);
+
+        // Only run ping test if enough time has passed since last test
+        if now.saturating_sub(last_ping) >= self.ping_test_interval_secs {
+            debug!("Running ping test for enhanced connection health validation");
+
+            // Perform ping test asynchronously in a blocking context
+            let ping_result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    self.test_send_ping().await
+                })
+            });
+
+            // Update the last ping test time regardless of result
+            self.last_ping_test_time.store(now, Ordering::SeqCst);
+
+            let health_check_duration = health_check_start.elapsed().unwrap_or_default();
+            let latency_ms = health_check_duration.as_millis() as u64;
+
+            match ping_result {
+                Ok(_) => {
+                    self.record_health_check_result(true, Some(latency_ms), None);
+
+                    // Update connection quality based on latency
+                    if latency_ms < 200 {
+                        self.update_connection_quality(ConnectionQuality::Excellent);
+                    } else if latency_ms < 1000 {
+                        self.update_connection_quality(ConnectionQuality::Good);
+                    } else {
+                        self.update_connection_quality(ConnectionQuality::Poor);
+                    }
+
+                    info!("✅ Connection health check passed: all validations including ping test successful ({}ms)", latency_ms);
+                    debug!("Health check details: latency={}ms, handles_valid={}, path_exists={}, quality={}",
+                           latency_ms, handles_valid, self.device_path.exists(), self.get_connection_quality());
+                    true
+                }
+                Err(e) => {
+                    self.record_health_check_result(false, Some(latency_ms), Some(format!("Ping test failed: {}", e)));
+                    self.update_connection_quality(ConnectionQuality::Poor);
+                    warn!("❌ Connection health check failed: ping test failed - {} ({}ms)", e, latency_ms);
+                    false
+                }
+            }
+        } else {
+            let health_check_duration = health_check_start.elapsed().unwrap_or_default();
+            let latency_ms = health_check_duration.as_millis() as u64;
+
+            self.record_health_check_result(true, Some(latency_ms), None);
+
+            // Get recent health check statistics
+            let health_stats = self.get_health_statistics();
+
+            info!("✅ Connection health check passed: basic validations successful ({}ms, ping test rate-limited)", latency_ms);
+            debug!("Health summary: success_rate={:.1}%, avg_latency={:.1}ms, recent_checks={}",
+                   health_stats.success_rate * 100.0, health_stats.average_latency_ms, health_stats.total_checks);
+            true
+        }
+    }
+
+    // Circuit Breaker Helper Methods
+    async fn transition_circuit_breaker_to_half_open(&self) {
+        let mut state = self.circuit_breaker_state.write().unwrap();
+        let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+
+        *state = CircuitBreakerState::HalfOpen;
+        metrics.state_change_time = SystemTime::now();
+        metrics.half_open_calls = 0;
+
+        info!("Circuit breaker transitioned to HALF-OPEN state - testing recovery");
+
+        // Send circuit breaker state change to backend
+        self.send_circuit_breaker_state_change(CircuitBreakerState::HalfOpen).await;
+    }
+
+    async fn record_circuit_breaker_failure(&self) {
+        let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+        metrics.failure_count += 1;
+        metrics.last_failure_time = Some(SystemTime::now());
+
+        let current_state = {
+            let state = self.circuit_breaker_state.read().unwrap();
+            state.clone()
+        };
+
+        match current_state {
+            CircuitBreakerState::Closed => {
+                // Check if we should open the circuit
+                if metrics.failure_count >= self.circuit_breaker_config.failure_threshold {
+                    drop(metrics); // Release lock before state change
+                    self.transition_circuit_breaker_to_open().await;
+                }
+            },
+            CircuitBreakerState::HalfOpen => {
+                // Any failure in half-open state should open the circuit
+                drop(metrics); // Release lock before state change
+                self.transition_circuit_breaker_to_open().await;
+            },
+            CircuitBreakerState::Open => {
+                // Already open, just record the failure
+            }
+        }
+    }
+
+    async fn record_circuit_breaker_success(&self) {
+        let current_state = {
+            let state = self.circuit_breaker_state.read().unwrap();
+            state.clone()
+        };
+
+        match current_state {
+            CircuitBreakerState::HalfOpen => {
+                let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+                metrics.success_count += 1;
+
+                // Check if we should close the circuit
+                if metrics.success_count >= self.circuit_breaker_config.success_threshold {
+                    drop(metrics); // Release lock before state change
+                    self.transition_circuit_breaker_to_closed().await;
+                }
+            },
+            CircuitBreakerState::Closed => {
+                // Reset failure count on success
+                let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+                metrics.failure_count = 0;
+                metrics.success_count += 1;
+            },
+            CircuitBreakerState::Open => {
+                // Shouldn't receive success when open, but handle gracefully
+                debug!("Received success while circuit breaker is open - ignoring");
+            }
+        }
+    }
+
+    async fn transition_circuit_breaker_to_open(&self) {
+        let mut state = self.circuit_breaker_state.write().unwrap();
+        let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+
+        *state = CircuitBreakerState::Open;
+        metrics.state_change_time = SystemTime::now();
+        metrics.half_open_calls = 0;
+
+        warn!("Circuit breaker OPENED - blocking all calls for {} seconds",
+              self.circuit_breaker_config.open_duration_secs);
+
+        // Send circuit breaker state change to backend
+        self.send_circuit_breaker_state_change(CircuitBreakerState::Open).await;
+    }
+
+    async fn transition_circuit_breaker_to_closed(&self) {
+        let mut state = self.circuit_breaker_state.write().unwrap();
+        let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+
+        *state = CircuitBreakerState::Closed;
+        metrics.state_change_time = SystemTime::now();
+        metrics.failure_count = 0;
+        metrics.success_count = 0;
+        metrics.half_open_calls = 0;
+
+        info!("Circuit breaker CLOSED - normal operation resumed");
+
+        // Send circuit breaker state change to backend
+        self.send_circuit_breaker_state_change(CircuitBreakerState::Closed).await;
+    }
+
+    async fn send_circuit_breaker_state_change(&self, new_state: CircuitBreakerState) {
+        let metrics = self.circuit_breaker_metrics.read().unwrap();
+        let state_message = serde_json::json!({
+            "type": "circuit_breaker_state",
+            "state": match new_state {
+                CircuitBreakerState::Closed => "Closed",
+                CircuitBreakerState::Open => "Open",
+                CircuitBreakerState::HalfOpen => "HalfOpen"
+            },
+            "failure_count": metrics.failure_count,
+            "last_failure_time": metrics.last_failure_time.map(|t|
+                t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+            ),
+            "recovery_eta_seconds": if new_state == CircuitBreakerState::Open {
+                Some(self.circuit_breaker_config.open_duration_secs)
+            } else {
+                None
+            },
+            "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        });
+
+        if let Err(e) = self.send_raw_message(&state_message.to_string()).await {
+            debug!("Failed to send circuit breaker state change: {}", e);
+            // Queue the message for later if connection is down
+            let mut queue = self.queued_error_reports.write().unwrap();
+            queue.push(state_message);
+        }
+    }
+
+    // Keep-Alive Methods
+    pub async fn send_keep_alive(&self) -> Result<()> {
+        let sequence = self.keep_alive_sequence.fetch_add(1, Ordering::SeqCst);
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        let keep_alive_message = serde_json::json!({
+            "type": "keep_alive",
+            "sequence_number": sequence,
+            "timestamp": timestamp
+        });
+
+        self.keep_alive_last_sent.store(timestamp, Ordering::SeqCst);
+
+        match self.send_raw_message(&keep_alive_message.to_string()).await {
+            Ok(_) => {
+                debug!("Keep-alive message sent (seq: {})", sequence);
+                Ok(())
+            },
+            Err(e) => {
+                self.record_circuit_breaker_failure().await;
+                Err(e)
+            }
+        }
+    }
+
+    pub fn handle_keep_alive_response(&self, sequence_number: u32) {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        self.keep_alive_last_received.store(timestamp, Ordering::SeqCst);
+
+        debug!("Keep-alive response received (seq: {})", sequence_number);
+
+        // Record successful keep-alive as circuit breaker success
+        tokio::spawn({
+            let cb_self = self.clone();
+            async move {
+                cb_self.record_circuit_breaker_success().await;
+            }
+        });
+    }
+
+    pub fn check_keep_alive_timeout(&self, keep_alive_timeout_secs: u64) -> bool {
+        let last_sent = self.keep_alive_last_sent.load(Ordering::SeqCst);
+        let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        // If we've sent a keep-alive but haven't received a response within the timeout
+        if last_sent > 0 && last_received < last_sent {
+            let time_since_sent = now.saturating_sub(last_sent);
+            if time_since_sent > keep_alive_timeout_secs {
+                warn!("Keep-alive timeout detected: {}s since last sent, no response received", time_since_sent);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn should_send_keep_alive(&self, keep_alive_interval_secs: u64, connection_idle_timeout_secs: u64) -> bool {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let last_sent = self.keep_alive_last_sent.load(Ordering::SeqCst);
+        let last_transmission = self.last_transmission_time.load(Ordering::SeqCst);
+
+        // Send keep-alive if:
+        // 1. We haven't sent one in the keep-alive interval, AND
+        // 2. The connection has been idle for longer than the idle timeout
+        let should_send_due_to_interval = now.saturating_sub(last_sent) >= keep_alive_interval_secs;
+        let connection_idle = now.saturating_sub(last_transmission) >= connection_idle_timeout_secs;
+
+        should_send_due_to_interval && connection_idle
+    }
+}
+
+// Manual Clone implementation for VirtioSerial (since it contains Arc<> fields)
+impl Clone for VirtioSerial {
+    fn clone(&self) -> Self {
+        Self {
+            device_path: self.device_path.clone(),
+            vm_id: self.vm_id.clone(),
+            write_handle: Arc::clone(&self.write_handle),
+            read_handle: Arc::clone(&self.read_handle),
+            is_connected: Arc::clone(&self.is_connected),
+            read_timeout_ms: self.read_timeout_ms,
+            ping_test_interval_secs: self.ping_test_interval_secs,
+            last_transmission_time: Arc::clone(&self.last_transmission_time),
+            consecutive_failures: Arc::clone(&self.consecutive_failures),
+            initial_transmission_sent: Arc::clone(&self.initial_transmission_sent),
+            last_ping_test_time: Arc::clone(&self.last_ping_test_time),
+            connection_metrics: Arc::clone(&self.connection_metrics),
+            health_check_history: Arc::clone(&self.health_check_history),
+            transmission_stats: Arc::clone(&self.transmission_stats),
+            error_retry_count: Arc::clone(&self.error_retry_count),
+            last_error_time: Arc::clone(&self.last_error_time),
+            error_backoff_ms: Arc::clone(&self.error_backoff_ms),
+            max_error_retries: self.max_error_retries,
+            queued_error_reports: Arc::clone(&self.queued_error_reports),
+            circuit_breaker_state: Arc::clone(&self.circuit_breaker_state),
+            circuit_breaker_metrics: Arc::clone(&self.circuit_breaker_metrics),
+            circuit_breaker_config: self.circuit_breaker_config.clone(),
+            keep_alive_last_sent: Arc::clone(&self.keep_alive_last_sent),
+            keep_alive_last_received: Arc::clone(&self.keep_alive_last_received),
+            keep_alive_sequence: Arc::clone(&self.keep_alive_sequence),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HealthStatistics {
+    total_checks: usize,
+    success_rate: f64,
+    average_latency_ms: f64,
 }
 
 #[cfg(test)]

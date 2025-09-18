@@ -7,7 +7,7 @@ use anyhow::Context;
 use std::collections::HashMap;
 use sysinfo::{System, Pid};
 use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags};
-use log::{debug, warn};
+use log::{debug, warn, info};
 use std::time::Instant;
 
 // Platform-specific imports
@@ -15,6 +15,31 @@ use std::time::Instant;
 #[cfg(target_os = "windows")]
 use wmi::{COMLibrary, WMIConnection};
 
+/// Mask IP addresses for logging to reduce sensitive data exposure
+fn mask_ip(ip: &str) -> String {
+    // Keep first and last octets, mask middle ones for IPv4
+    if ip.contains('.') {
+        let parts: Vec<&str> = ip.split('.').collect();
+        if parts.len() == 4 {
+            return format!("{}.xxx.xxx.{}", parts[0], parts[3]);
+        }
+    }
+
+    // For IPv6, show only prefix and suffix
+    if ip.contains(':') {
+        let parts: Vec<&str> = ip.split(':').collect();
+        if parts.len() > 2 {
+            return format!("{}:xxxx:xxxx:{}", parts[0], parts[parts.len() - 1]);
+        }
+    }
+
+    // For other formats, show only first 3 and last 3 chars
+    if ip.len() > 6 {
+        format!("{}...{}", &ip[..3], &ip[ip.len()-3..])
+    } else {
+        "xxx".to_string()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
@@ -78,6 +103,8 @@ pub struct NetworkInterface {
     pub packets_sent: u64,
     pub errors_in: u64,
     pub errors_out: u64,
+    pub ip_addresses: Vec<String>,  // List of IP addresses assigned to this interface
+    pub is_up: bool,               // Whether the interface is up
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +167,7 @@ pub struct DataCollector {
     previous_disk_stats: Option<HashMap<String, DiskIoSnapshot>>,
     previous_network_stats: Option<HashMap<String, NetworkSnapshot>>,
     last_collection_time: Option<Instant>,
+    initial_ip_collection_successful: bool,
     #[cfg(target_os = "windows")]
     wmi_conn: Option<WMIConnection>,
 }
@@ -195,6 +223,7 @@ impl DataCollector {
             previous_disk_stats: None,
             previous_network_stats: None,
             last_collection_time: None,
+            initial_ip_collection_successful: false,
             #[cfg(target_os = "windows")]
             wmi_conn,
         })
@@ -703,12 +732,35 @@ impl DataCollector {
             return Ok(NetworkMetrics { interfaces: vec![] });
         }
         
+        // Get IP addresses for interfaces
+        let interface_ips = self.collect_interface_ips();
+
+        // Update initial IP collection status
+        let up_interfaces_with_ips = interface_ips.iter()
+            .filter(|(name, ips)| !ips.is_empty() && self.is_interface_up(name))
+            .count();
+
+        if !self.initial_ip_collection_successful && up_interfaces_with_ips > 0 {
+            self.initial_ip_collection_successful = true;
+            info!("Initial IP collection successful: {} UP interfaces with IPs", up_interfaces_with_ips);
+        }
+
         // Calculate rates if we have previous stats
         if let Some(previous) = &self.previous_network_stats {
             interfaces = self.calculate_network_rates(&current_network_stats, previous);
+            // Add IP addresses to each interface
+            for interface in &mut interfaces {
+                if let Some(ips) = interface_ips.get(&interface.name) {
+                    interface.ip_addresses = ips.clone();
+                }
+                interface.is_up = self.is_interface_up(&interface.name);
+            }
         } else {
             // First collection, just report current values as-is
             for (name, stats) in &current_network_stats {
+                let ip_addresses = interface_ips.get(name).cloned().unwrap_or_default();
+                let is_up = self.is_interface_up(name);
+
                 interfaces.push(NetworkInterface {
                     name: name.clone(),
                     bytes_received: stats.bytes_received,
@@ -717,6 +769,8 @@ impl DataCollector {
                     packets_sent: stats.packets_sent,
                     errors_in: stats.errors_in,
                     errors_out: stats.errors_out,
+                    ip_addresses,
+                    is_up,
                 });
             }
         }
@@ -860,6 +914,8 @@ impl DataCollector {
                         packets_sent: (packets_sent as f64 / seconds) as u64,
                         errors_in: (errors_in as f64 / seconds) as u64,
                         errors_out: (errors_out as f64 / seconds) as u64,
+                        ip_addresses: vec![], // Will be filled in collect_network_metrics
+                        is_up: false,         // Will be filled in collect_network_metrics
                     });
                 }
             } else {
@@ -872,6 +928,8 @@ impl DataCollector {
                     packets_sent: current_stats.packets_sent,
                     errors_in: current_stats.errors_in,
                     errors_out: current_stats.errors_out,
+                    ip_addresses: vec![], // Will be filled in collect_network_metrics
+                    is_up: false,         // Will be filled in collect_network_metrics
                 });
             }
         }
@@ -1111,6 +1169,585 @@ impl DataCollector {
         }
         
         Ok(services)
+    }
+
+    /// Collect IP addresses for all network interfaces with enhanced reliability
+    fn collect_interface_ips(&self) -> HashMap<String, Vec<String>> {
+        debug!("Starting IP collection for all interfaces");
+        let mut interface_ips = HashMap::new();
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+            use std::time::Duration;
+            use std::net::IpAddr;
+
+            // First try JSON-based detection for more reliable parsing
+            if let Ok(output) = Command::new("ip")
+                .args(&["-j", "addr", "show"])
+                .output()
+            {
+                debug!("Using JSON-based IP detection");
+                let output_str = String::from_utf8_lossy(&output.stdout);
+
+                // Try to parse JSON output
+                if let Ok(interfaces) = serde_json::from_str::<serde_json::Value>(&output_str) {
+                    if let Some(interfaces_array) = interfaces.as_array() {
+                        for interface in interfaces_array {
+                            if let (Some(interface_name), Some(addr_info)) = (
+                                interface.get("ifname").and_then(|v| v.as_str()),
+                                interface.get("addr_info").and_then(|v| v.as_array())
+                            ) {
+                                let mut ip_list = Vec::new();
+
+                                for addr in addr_info {
+                                    if let (Some(family), Some(local)) = (
+                                        addr.get("family").and_then(|v| v.as_str()),
+                                        addr.get("local").and_then(|v| v.as_str())
+                                    ) {
+                                        if family == "inet" && self.is_valid_ip_address(local) {
+                                            ip_list.push(local.to_string());
+                                        }
+                                    }
+                                }
+
+                                if !ip_list.is_empty() {
+                                    info!("Found {} IP addresses for interface {}", ip_list.len(), interface_name);
+                                    interface_ips.insert(interface_name.to_string(), ip_list);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    debug!("JSON parsing failed, falling back to text parsing");
+                    // Fall back to text parsing
+                    interface_ips = self.collect_interface_ips_text_linux();
+                }
+            } else {
+                debug!("JSON command failed, falling back to text parsing");
+                // Fall back to text parsing
+                interface_ips = self.collect_interface_ips_text_linux();
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // Try PowerShell-based detection first
+            interface_ips = self.collect_interface_ips_powershell()
+                .unwrap_or_else(|| self.collect_interface_ips_text_windows());
+        }
+
+        let total_interfaces = interface_ips.len();
+        let up_interfaces_with_ips = interface_ips.iter()
+            .filter(|(name, ips)| !ips.is_empty() && self.is_interface_up(name))
+            .count();
+
+        info!("IP collection completed: {} total interfaces, {} UP interfaces with IPs",
+              total_interfaces, up_interfaces_with_ips);
+
+        if up_interfaces_with_ips == 0 {
+            warn!("No UP interfaces with IP addresses detected");
+        }
+
+        interface_ips
+    }
+
+    /// Fallback text-based IP collection for Linux
+    #[cfg(target_os = "linux")]
+    fn collect_interface_ips_text_linux(&self) -> HashMap<String, Vec<String>> {
+        use std::process::Command;
+
+        let mut interface_ips = HashMap::new();
+
+        if let Ok(output) = Command::new("ip")
+            .args(&["addr", "show"])
+            .output()
+        {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            let mut current_interface = String::new();
+
+            for line in output_str.lines() {
+                let line = line.trim();
+
+                // Parse interface line (e.g., "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>")
+                if let Some(interface_name) = self.parse_interface_name(line) {
+                    current_interface = interface_name;
+                }
+
+                // Parse IP line (e.g., "inet 192.168.1.100/24 brd 192.168.1.255 scope global eth0")
+                if line.starts_with("inet ") && !current_interface.is_empty() {
+                    if let Some(ip) = self.parse_ip_from_line(line) {
+                        if self.is_valid_ip_address(&ip) {
+                            interface_ips.entry(current_interface.clone())
+                                .or_insert_with(Vec::new)
+                                .push(ip);
+                        }
+                    }
+                }
+            }
+        }
+
+        interface_ips
+    }
+
+    /// Enhanced PowerShell-based IP collection for Windows with multiple fallback methods
+    #[cfg(target_os = "windows")]
+    fn collect_interface_ips_powershell(&self) -> Option<HashMap<String, Vec<String>>> {
+        use std::process::Command;
+
+        // Method 1: Try modern PowerShell cmdlet (most reliable)
+        if let Some(result) = self.try_powershell_get_netipaddress() {
+            info!("Used Get-NetIPAddress for IP collection");
+            return Some(result);
+        }
+
+        // Method 2: Try WMI via PowerShell (more compatible)
+        if let Some(result) = self.try_powershell_wmi() {
+            info!("Used WMI via PowerShell for IP collection");
+            return Some(result);
+        }
+
+        // Method 3: Try ipconfig parsing (universal fallback)
+        if let Some(result) = self.try_ipconfig_parsing() {
+            info!("Used ipconfig parsing for IP collection");
+            return Some(result);
+        }
+
+        warn!("All Windows IP collection methods failed");
+        None
+    }
+
+    /// Method 1: Modern PowerShell Get-NetIPAddress cmdlet
+    #[cfg(target_os = "windows")]
+    fn try_powershell_get_netipaddress(&self) -> Option<HashMap<String, Vec<String>>> {
+        use std::process::Command;
+
+        let output = Command::new("powershell")
+            .args(&["-Command", "Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.AddressState -eq 'Preferred'} | ConvertTo-Json -Depth 3"])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            debug!("Get-NetIPAddress command failed");
+            return None;
+        }
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        if output_str.trim().is_empty() {
+            debug!("Get-NetIPAddress returned empty output");
+            return None;
+        }
+
+        let json_value: serde_json::Value = serde_json::from_str(&output_str).ok()?;
+        let mut interface_ips = HashMap::new();
+
+        // Handle both single object and array of objects
+        let addresses = if json_value.is_array() {
+            json_value.as_array()?
+        } else {
+            std::slice::from_ref(&json_value)
+        };
+
+        for addr in addresses {
+            if let (Some(interface_name), Some(ip_address)) = (
+                addr.get("InterfaceAlias").and_then(|v| v.as_str()),
+                addr.get("IPAddress").and_then(|v| v.as_str())
+            ) {
+                if self.is_valid_ip_address(ip_address) {
+                    debug!("Found IP {} for interface {}", mask_ip(ip_address), interface_name);
+                    interface_ips.entry(interface_name.to_string())
+                        .or_insert_with(Vec::new)
+                        .push(ip_address.to_string());
+                }
+            }
+        }
+
+        if interface_ips.is_empty() {
+            None
+        } else {
+            Some(interface_ips)
+        }
+    }
+
+    /// Method 2: WMI via PowerShell (more compatible with older Windows)
+    #[cfg(target_os = "windows")]
+    fn try_powershell_wmi(&self) -> Option<HashMap<String, Vec<String>>> {
+        use std::process::Command;
+
+        let output = Command::new("powershell")
+            .args(&["-Command",
+                "Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -eq $true} | ForEach-Object { [PSCustomObject]@{ Name = $_.Description; IPAddress = $_.IPAddress } } | ConvertTo-Json -Depth 3"])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            debug!("WMI PowerShell command failed");
+            return None;
+        }
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        if output_str.trim().is_empty() {
+            debug!("WMI PowerShell returned empty output");
+            return None;
+        }
+
+        let json_value: serde_json::Value = serde_json::from_str(&output_str).ok()?;
+        let mut interface_ips = HashMap::new();
+
+        let adapters = if json_value.is_array() {
+            json_value.as_array()?
+        } else {
+            std::slice::from_ref(&json_value)
+        };
+
+        for adapter in adapters {
+            if let (Some(interface_name), Some(ip_array)) = (
+                adapter.get("Name").and_then(|v| v.as_str()),
+                adapter.get("IPAddress").and_then(|v| v.as_array())
+            ) {
+                let mut ips = Vec::new();
+                for ip in ip_array {
+                    if let Some(ip_str) = ip.as_str() {
+                        if self.is_valid_ip_address(ip_str) {
+                            debug!("Found IP {} for interface {}", ip_str, interface_name);
+                            ips.push(ip_str.to_string());
+                        }
+                    }
+                }
+                if !ips.is_empty() {
+                    interface_ips.insert(interface_name.to_string(), ips);
+                }
+            }
+        }
+
+        if interface_ips.is_empty() {
+            None
+        } else {
+            Some(interface_ips)
+        }
+    }
+
+    /// Method 3: ipconfig parsing (universal fallback)
+    #[cfg(target_os = "windows")]
+    fn try_ipconfig_parsing(&self) -> Option<HashMap<String, Vec<String>>> {
+        use std::process::Command;
+
+        let output = Command::new("ipconfig")
+            .args(&["/all"])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            debug!("ipconfig command failed");
+            return None;
+        }
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        let mut interface_ips = HashMap::new();
+        let mut current_interface = String::new();
+
+        for line in output_str.lines() {
+            let line = line.trim();
+
+            // Parse adapter line - more robust pattern matching
+            if line.contains("adapter") && line.contains(":") && !line.contains("Media State") {
+                if let Some(adapter_name) = line.split("adapter").nth(1) {
+                    let clean_name = adapter_name.trim_end_matches(':').trim();
+                    if !clean_name.is_empty() {
+                        current_interface = clean_name.to_string();
+                        debug!("Processing adapter: {}", current_interface);
+                    }
+                }
+            }
+
+            // Parse IPv4 address line - multiple patterns
+            if !current_interface.is_empty() &&
+               (line.contains("IPv4 Address") || line.contains("IP Address")) {
+                if let Some(ip_part) = line.split(':').nth(1) {
+                    let ip = ip_part.trim()
+                        .trim_end_matches("(Preferred)")
+                        .trim_end_matches("(Tentative)")
+                        .trim_end_matches("(Duplicate)")
+                        .trim();
+
+                    if !ip.is_empty() && self.is_valid_ip_address(ip) {
+                        debug!("Found IP {} for interface {}", ip, current_interface);
+                        interface_ips.entry(current_interface.clone())
+                            .or_insert_with(Vec::new)
+                            .push(ip.to_string());
+                    }
+                }
+            }
+        }
+
+        if interface_ips.is_empty() {
+            None
+        } else {
+            Some(interface_ips)
+        }
+    }
+
+    /// Fallback text-based IP collection for Windows
+    #[cfg(target_os = "windows")]
+    fn collect_interface_ips_text_windows(&self) -> HashMap<String, Vec<String>> {
+        use std::process::Command;
+
+        let mut interface_ips = HashMap::new();
+
+        if let Ok(output) = Command::new("ipconfig")
+            .args(&["/all"])
+            .output()
+        {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            let mut current_interface = String::new();
+
+            for line in output_str.lines() {
+                let line = line.trim();
+
+                // Parse adapter line
+                if line.contains("adapter") && line.contains(":") {
+                    if let Some(adapter_name) = line.split("adapter").nth(1) {
+                        current_interface = adapter_name.trim_end_matches(':').trim().to_string();
+                    }
+                }
+
+                // Parse IPv4 address line
+                if line.contains("IPv4 Address") && !current_interface.is_empty() {
+                    if let Some(ip_part) = line.split(':').nth(1) {
+                        let ip = ip_part.trim().trim_end_matches("(Preferred)").trim();
+                        if !ip.is_empty() && self.is_valid_ip_address(ip) {
+                            interface_ips.entry(current_interface.clone())
+                                .or_insert_with(Vec::new)
+                                .push(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        interface_ips
+    }
+
+    /// Enhanced IP address validation with better acceptance criteria
+    fn is_valid_ip_address(&self, ip: &str) -> bool {
+        use std::net::IpAddr;
+
+        // First check if it's a valid IP address format
+        if let Ok(addr) = ip.parse::<IpAddr>() {
+            match addr {
+                IpAddr::V4(ipv4) => {
+                    let octets = ipv4.octets();
+
+                    // Skip loopback (127.x.x.x) - these are not useful for networking
+                    if octets[0] == 127 {
+                        debug!("Skipping loopback address: {}", ip);
+                        return false;
+                    }
+
+                    // Skip multicast addresses (224.x.x.x - 239.x.x.x)
+                    if octets[0] >= 224 && octets[0] <= 239 {
+                        debug!("Skipping multicast address: {}", ip);
+                        return false;
+                    }
+
+                    // Skip reserved/experimental (240.x.x.x and above)
+                    if octets[0] >= 240 {
+                        debug!("Skipping reserved address: {}", ip);
+                        return false;
+                    }
+
+                    // Accept all other addresses, including:
+                    // - Private addresses (10.x.x.x, 172.16-31.x.x, 192.168.x.x)
+                    // - Link-local (169.254.x.x) - useful in some environments
+                    // - Public addresses
+                    debug!("Accepting IPv4 address: {}", ip);
+                    true
+                }
+                IpAddr::V6(ipv6) => {
+                    // For IPv6, skip link-local and loopback, accept others
+                    if ipv6.is_loopback() {
+                        debug!("Skipping IPv6 loopback: {}", ip);
+                        return false;
+                    }
+
+                    // Accept most IPv6 addresses including link-local for now
+                    // Link-local IPv6 (fe80::/64) might be useful in some cases
+                    debug!("Accepting IPv6 address: {}", ip);
+                    true
+                }
+            }
+        } else {
+            debug!("Invalid IP address format: {}", ip);
+            false
+        }
+    }
+
+    /// Force immediate re-collection of IP addresses
+    pub fn force_ip_recollection(&mut self) {
+        self.initial_ip_collection_successful = false;
+        info!("Forcing IP re-collection on next data collection");
+    }
+
+    /// Check if initial IP collection was successful
+    pub fn is_initial_ip_collection_successful(&self) -> bool {
+        self.initial_ip_collection_successful
+    }
+
+    /// Check if a network interface is up with enhanced detection and fallback logic
+    fn is_interface_up(&self, interface_name: &str) -> bool {
+        // First check if interface has network activity (most reliable indicator)
+        let has_activity = self.interface_has_network_activity(interface_name);
+
+        // If interface has activity, consider it UP regardless of other indicators
+        if has_activity {
+            debug!("Interface {} considered UP due to network activity", interface_name);
+            return true;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::fs;
+
+            // Try multiple methods to determine interface status
+            let mut operstate_up = false;
+            let mut carrier_up = false;
+            let mut flags_up = false;
+
+            // Method 1: Check operstate (traditional way)
+            let operstate_path = format!("/sys/class/net/{}/operstate", interface_name);
+            if let Ok(state) = fs::read_to_string(&operstate_path) {
+                let state = state.trim();
+                operstate_up = state == "up" || state == "unknown"; // unknown can mean virtual interface
+                debug!("Interface {} operstate: {} (considered {})", interface_name, state,
+                      if operstate_up { "UP" } else { "DOWN" });
+            }
+
+            // Method 2: Check carrier signal (physical interfaces)
+            let carrier_path = format!("/sys/class/net/{}/carrier", interface_name);
+            if let Ok(carrier) = fs::read_to_string(&carrier_path) {
+                carrier_up = carrier.trim() == "1";
+                debug!("Interface {} carrier: {}", interface_name, if carrier_up { "ON" } else { "OFF" });
+            } else {
+                // Virtual interfaces often don't have carrier file - that's acceptable
+                carrier_up = true; // Don't penalize virtual interfaces
+                debug!("Interface {} has no carrier file (likely virtual)", interface_name);
+            }
+
+            // Method 3: Check interface flags
+            let flags_path = format!("/sys/class/net/{}/flags", interface_name);
+            if let Ok(flags_str) = fs::read_to_string(&flags_path) {
+                if let Ok(flags) = u32::from_str_radix(flags_str.trim().trim_start_matches("0x"), 16) {
+                    // IFF_UP flag is bit 0, IFF_RUNNING is bit 6
+                    let iff_up = (flags & 0x1) != 0;
+                    let iff_running = (flags & 0x40) != 0;
+                    flags_up = iff_up && iff_running;
+                    debug!("Interface {} flags: 0x{:x} (UP={}, RUNNING={})",
+                          interface_name, flags, iff_up, iff_running);
+                }
+            }
+
+            // Consider interface UP if any reliable method indicates it's up
+            let is_up = operstate_up || (carrier_up && flags_up);
+            debug!("Interface {} final status: {} (operstate={}, carrier={}, flags={})",
+                  interface_name, if is_up { "UP" } else { "DOWN" },
+                  operstate_up, carrier_up, flags_up);
+
+            return is_up;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+
+            // Method 1: Try PowerShell first (more reliable)
+            let ps_result = Command::new("powershell")
+                .args(&["-Command", &format!(
+                    "Get-NetAdapter -Name '{}' | Select-Object -ExpandProperty Status",
+                    interface_name
+                )])
+                .output();
+
+            if let Ok(output) = ps_result {
+                if output.status.success() {
+                    let status = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
+                    let is_up = status == "up" || status == "connected";
+                    debug!("Interface {} PowerShell status: {} ({})",
+                          interface_name, status, if is_up { "UP" } else { "DOWN" });
+                    return is_up;
+                }
+            }
+
+            // Method 2: Fallback to netsh
+            let netsh_result = Command::new("netsh")
+                .args(&["interface", "show", "interface", &format!("name=\"{}\"", interface_name)])
+                .output();
+
+            if let Ok(output) = netsh_result {
+                if output.status.success() {
+                    let output_str = String::from_utf8_lossy(&output.stdout);
+                    let is_connected = output_str.contains("Connected") || output_str.contains("Enabled");
+                    debug!("Interface {} netsh status: {}", interface_name,
+                          if is_connected { "Connected" } else { "Disconnected" });
+                    return is_connected;
+                }
+            }
+
+            debug!("Failed to determine status for interface {}", interface_name);
+        }
+
+        // If we can't determine status, be optimistic for interfaces with IPs
+        let has_ips = self.interface_has_ip_addresses(interface_name);
+        debug!("Interface {} fallback check - has IPs: {}", interface_name, has_ips);
+        has_ips
+    }
+
+    /// Helper: Check if interface has recent network activity
+    fn interface_has_network_activity(&self, interface_name: &str) -> bool {
+        if let Some(previous_stats) = &self.previous_network_stats {
+            if let Some(stats) = previous_stats.get(interface_name) {
+                // Consider interface active if it has significant traffic
+                return stats.bytes_received > 1000 || stats.bytes_sent > 1000;
+            }
+        }
+        false
+    }
+
+    /// Helper: Check if interface has IP addresses assigned
+    fn interface_has_ip_addresses(&self, interface_name: &str) -> bool {
+        let interface_ips = self.collect_interface_ips();
+        interface_ips.get(interface_name)
+            .map(|ips| !ips.is_empty())
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_interface_name(&self, line: &str) -> Option<String> {
+        // Parse lines like "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>"
+        if let Some(colon_pos) = line.find(": ") {
+            if let Some(second_colon) = line[colon_pos + 2..].find(": ") {
+                let interface_name = &line[colon_pos + 2..colon_pos + 2 + second_colon];
+                if !interface_name.is_empty() {
+                    return Some(interface_name.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_ip_from_line(&self, line: &str) -> Option<String> {
+        // Parse lines like "inet 192.168.1.100/24 brd 192.168.1.255 scope global eth0"
+        if let Some(inet_part) = line.strip_prefix("inet ") {
+            if let Some(ip_with_mask) = inet_part.split_whitespace().next() {
+                if let Some(ip) = ip_with_mask.split('/').next() {
+                    // Skip loopback addresses
+                    if !ip.starts_with("127.") {
+                        return Some(ip.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -1417,6 +2054,8 @@ mod tests {
                         packets_sent: 500,
                         errors_in: 0,
                         errors_out: 0,
+                        ip_addresses: vec!["192.168.1.100".to_string()],
+                        is_up: true,
                     }],
                 },
                 system: SystemInfoMetrics {
@@ -1533,6 +2172,8 @@ mod tests {
             packets_sent: 500,
             errors_in: 0,
             errors_out: 0,
+            ip_addresses: vec!["192.168.1.100".to_string()],
+            is_up: true,
         };
 
         // Test serialization preserves data types
