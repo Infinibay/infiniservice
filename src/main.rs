@@ -28,6 +28,106 @@ static SERVICE_NAME: &str = "Infiniservice";
 #[cfg(target_os = "windows")]
 define_windows_service!(ffi_service_main, service_main);
 
+/// Apply environment variable overrides to configuration
+fn apply_env_overrides(config: &mut Config) {
+    // Device path override
+    if let Ok(path) = env::var("INFINISERVICE_DEVICE") {
+        config.virtio_serial_path = std::path::PathBuf::from(path.clone());
+        info!("Device path override from environment: {}", path);
+    }
+
+    // VirtIO requirement override
+    if let Ok(value) = env::var("INFINISERVICE_REQUIRE_VIRTIO") {
+        if let Ok(parsed) = value.parse::<bool>() {
+            config.require_virtio = parsed;
+            info!("VirtIO requirement override from environment: {}", parsed);
+        }
+    }
+
+    // Backoff settings
+    if let Ok(value) = env::var("INFINISERVICE_MIN_BACKOFF") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.virtio_min_backoff_secs = parsed;
+            info!("Minimum backoff override from environment: {}s", parsed);
+        }
+    }
+
+    if let Ok(value) = env::var("INFINISERVICE_MAX_BACKOFF") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.virtio_max_backoff_secs = parsed;
+            info!("Maximum backoff override from environment: {}s", parsed);
+        }
+    }
+
+    // Timeout settings
+    if let Ok(value) = env::var("INFINISERVICE_CONNECTION_TIMEOUT") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.virtio_connection_timeout_secs = parsed;
+            info!("Connection timeout override from environment: {}s", parsed);
+        }
+    }
+
+    if let Ok(value) = env::var("INFINISERVICE_READ_TIMEOUT") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.virtio_read_timeout_ms = parsed;
+            info!("Read timeout override from environment: {}ms", parsed);
+        }
+    }
+
+    // Keep-alive settings
+    if let Ok(value) = env::var("INFINISERVICE_KEEP_ALIVE_INTERVAL") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.keep_alive_interval_secs = parsed;
+            info!("Keep-alive interval override from environment: {}s", parsed);
+        }
+    }
+
+    if let Ok(value) = env::var("INFINISERVICE_KEEP_ALIVE_TIMEOUT") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.keep_alive_timeout_secs = parsed;
+            info!("Keep-alive timeout override from environment: {}s", parsed);
+        }
+    }
+
+    if let Ok(value) = env::var("INFINISERVICE_CONNECTION_IDLE_TIMEOUT") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            config.connection_idle_timeout_secs = parsed;
+            info!("Connection idle timeout override from environment: {}s", parsed);
+        }
+    }
+
+    // Aggressive retry mode
+    if let Ok(value) = env::var("INFINISERVICE_AGGRESSIVE_RETRY") {
+        if value.parse::<bool>().unwrap_or(false) {
+            config.apply_development_mode();
+            info!("Aggressive retry mode ENABLED via environment variable");
+        }
+    }
+
+    // Device monitoring
+    if let Ok(value) = env::var("INFINISERVICE_DISABLE_MONITORING") {
+        if value.parse::<bool>().unwrap_or(false) {
+            config.enable_device_monitoring = false;
+            info!("Device change monitoring DISABLED via environment variable");
+        }
+    }
+
+    // Connection validation
+    if let Ok(value) = env::var("INFINISERVICE_VALIDATE_CONNECTION") {
+        if value.parse::<bool>().unwrap_or(false) {
+            config.enable_connection_validation = true;
+            info!("Connection validation ENABLED via environment variable");
+        }
+    }
+
+    // Validate and fix configuration after applying overrides
+    config.validate_and_fix();
+
+    // Log final keep-alive configuration
+    info!("Keep-alive configuration: interval={}s, timeout={}s, idle_timeout={}s",
+          config.keep_alive_interval_secs, config.keep_alive_timeout_secs, config.connection_idle_timeout_secs);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
@@ -108,6 +208,9 @@ async fn main() -> Result<()> {
     let mut max_backoff_override: Option<u64> = None;
     let mut connection_timeout_override: Option<u64> = None;
     let mut read_timeout_override: Option<u64> = None;
+    let mut keep_alive_interval_override: Option<u64> = None;
+    let mut keep_alive_timeout_override: Option<u64> = None;
+    let mut connection_idle_timeout_override: Option<u64> = None;
 
     for i in 0..args.len() {
         if args[i] == "--device" && i + 1 < args.len() {
@@ -144,53 +247,7 @@ async fn main() -> Result<()> {
         }
     }
     
-    // Check environment variable for device path
-    if device_path_override.is_none() {
-        if let Ok(path) = env::var("INFINISERVICE_DEVICE") {
-            device_path_override = Some(path.clone());
-            info!("Device path override from environment: {}", path);
-        }
-    }
-
-    // Check environment variables for backoff settings
-    if min_backoff_override.is_none() {
-        if let Ok(value) = env::var("INFINISERVICE_MIN_BACKOFF") {
-            if let Ok(parsed) = value.parse::<u64>() {
-                min_backoff_override = Some(parsed);
-                info!("Minimum backoff override from environment: {}s", parsed);
-            }
-        }
-    }
-
-    if max_backoff_override.is_none() {
-        if let Ok(value) = env::var("INFINISERVICE_MAX_BACKOFF") {
-            if let Ok(parsed) = value.parse::<u64>() {
-                max_backoff_override = Some(parsed);
-                info!("Maximum backoff override from environment: {}s", parsed);
-            }
-        }
-    }
-
-    // Check environment variables for timeout settings
-    if connection_timeout_override.is_none() {
-        if let Ok(value) = env::var("INFINISERVICE_CONNECTION_TIMEOUT") {
-            if let Ok(parsed) = value.parse::<u64>() {
-                connection_timeout_override = Some(parsed);
-                info!("Connection timeout override from environment: {}s", parsed);
-            }
-        }
-    }
-
-    if read_timeout_override.is_none() {
-        if let Ok(value) = env::var("INFINISERVICE_READ_TIMEOUT") {
-            if let Ok(parsed) = value.parse::<u64>() {
-                read_timeout_override = Some(parsed);
-                info!("Read timeout override from environment: {}ms", parsed);
-            }
-        }
-    }
-    
-    // Determine VirtIO requirement setting
+    // Determine VirtIO requirement setting from command-line args or env
     let virtio_required = if require_virtio {
         true
     } else if no_virtio {
@@ -282,14 +339,18 @@ async fn main() -> Result<()> {
     // Load configuration
     let mut config = Config::load()?;
     info!("Configuration loaded: collection interval = {}s", config.collection_interval);
-    
-    // Override device path if specified
+
+    // Apply environment variable overrides first (lower priority)
+    apply_env_overrides(&mut config);
+
+    // Apply command-line argument overrides (higher priority - will override env vars)
+    // Override device path if specified via command line
     if let Some(device_path) = device_path_override {
         config.virtio_serial_path = std::path::PathBuf::from(device_path.clone());
-        info!("Using device path override: {}", device_path);
+        info!("Using device path override from command line: {}", device_path);
     }
-    
-    // Apply VirtIO requirement setting
+
+    // Apply VirtIO requirement setting from command line or env
     config.require_virtio = virtio_required;
     if config.require_virtio {
         info!("VirtIO device is REQUIRED - service will exit if not found");
@@ -313,50 +374,44 @@ async fn main() -> Result<()> {
         config.virtio_read_timeout_ms = read_timeout;
     }
 
-    // Apply aggressive retry mode
+    // Apply keep-alive overrides
+    if let Some(keep_alive_interval) = keep_alive_interval_override {
+        config.keep_alive_interval_secs = keep_alive_interval;
+    }
+    if let Some(keep_alive_timeout) = keep_alive_timeout_override {
+        config.keep_alive_timeout_secs = keep_alive_timeout;
+    }
+    if let Some(connection_idle_timeout) = connection_idle_timeout_override {
+        config.connection_idle_timeout_secs = connection_idle_timeout;
+    }
+
+    // Apply command-line flag overrides (higher priority than env vars)
     if aggressive_retry {
         config.apply_development_mode();
-        info!("Aggressive retry mode ENABLED - using development-friendly settings");
-    } else if env::var("INFINISERVICE_AGGRESSIVE_RETRY")
-        .unwrap_or_default()
-        .parse::<bool>()
-        .unwrap_or(false)
-    {
-        config.apply_development_mode();
-        info!("Aggressive retry mode ENABLED via environment variable");
+        info!("Aggressive retry mode ENABLED via command-line flag");
     }
 
-    // Apply device monitoring setting
     if disable_device_monitoring {
         config.enable_device_monitoring = false;
-        info!("Device change monitoring DISABLED");
-    } else if let Ok(value) = env::var("INFINISERVICE_DISABLE_MONITORING") {
-        if value.parse::<bool>().unwrap_or(false) {
-            config.enable_device_monitoring = false;
-            info!("Device change monitoring DISABLED via environment variable");
-        }
+        info!("Device change monitoring DISABLED via command-line flag");
     }
 
-    // Validate and fix configuration
+    if validate_connection {
+        config.enable_connection_validation = true;
+        info!("Connection validation ENABLED via command-line flag");
+    }
+
+    // Final validation after all overrides
     config.validate_and_fix();
+
+    // Log final keep-alive configuration
+    info!("Keep-alive configuration: interval={}s, timeout={}s, idle_timeout={}s",
+          config.keep_alive_interval_secs, config.keep_alive_timeout_secs, config.connection_idle_timeout_secs);
 
     // Validate backoff values after overrides
     if config.virtio_min_backoff_secs > config.virtio_max_backoff_secs {
         warn!("Minimum backoff ({}) > maximum backoff ({}), swapping values",
               config.virtio_min_backoff_secs, config.virtio_max_backoff_secs);
-    }
-    
-    // Apply connection validation setting
-    if validate_connection {
-        config.enable_connection_validation = true;
-        info!("Connection validation ENABLED - periodic health checks active");
-    } else if env::var("INFINISERVICE_VALIDATE_CONNECTION")
-        .unwrap_or_default()
-        .parse::<bool>()
-        .unwrap_or(false)
-    {
-        config.enable_connection_validation = true;
-        info!("Connection validation ENABLED via environment variable");
     }
 
     if debug_mode {
@@ -490,7 +545,7 @@ fn service_main(_arguments: Vec<OsString>) {
     
     runtime.block_on(async {
         // Load configuration
-        let config = match Config::load() {
+        let mut config = match Config::load() {
             Ok(cfg) => cfg,
             Err(e) => {
                 error!("Failed to load configuration: {:?}", e);
@@ -508,6 +563,9 @@ fn service_main(_arguments: Vec<OsString>) {
         };
 
         info!("Configuration loaded: collection interval = {}s", config.collection_interval);
+
+        // Apply environment variable overrides
+        apply_env_overrides(&mut config);
 
         // Create and initialize the service
         let mut service = InfiniService::new(config, false);

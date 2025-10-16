@@ -1,7 +1,7 @@
 //! Communication module for virtio-serial interface with bidirectional command support
 
 use crate::collector::{SystemInfo, SystemMetrics};
-use crate::commands::{IncomingMessage, CommandResponse, KeepAliveResponse};
+use crate::commands::{IncomingMessage, CommandResponse};
 use anyhow::{Result, Context, anyhow};
 use log::{info, debug, warn, error};
 use serde::Serialize;
@@ -9,13 +9,25 @@ use serde_json;
 use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicU32};
 use std::path::Path;
 use std::fs::{File, OpenOptions};
-use std::io::{Write, BufReader, BufRead};
+use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use chrono::Utc;
 use std::collections::HashMap;
+use async_recursion::async_recursion;
+
+// Windows-specific: Thread-safe wrapper for HANDLE
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct SendableHandle(winapi::shared::ntdef::HANDLE);
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for SendableHandle {}
+
+#[cfg(target_os = "windows")]
+unsafe impl Sync for SendableHandle {}
 
 // Connection metrics tracking
 #[derive(Debug, Clone)]
@@ -90,13 +102,44 @@ pub struct CircuitBreakerConfig {
     pub success_threshold: u32,
 }
 
+// Circuit Breaker Default Configuration
+//
+// These values are tuned for Windows Global objects with OVERLAPPED I/O (VIRTIO-001/002/003).
+// The increased tolerance (compared to typical circuit breaker settings) is necessary because:
+//
+// 1. Windows Global objects (e.g., \\.\Global\org.infinibay.agent) can experience transient
+//    timing delays during OVERLAPPED I/O operations, especially under system load.
+//
+// 2. VirtIO serial communication is low-frequency (keep-alive every 120s per VIRTIO-004),
+//    so failures accumulate slowly. Higher thresholds prevent false-positive trips.
+//
+// 3. The persistent handle approach (VIRTIO-001) eliminates reopen overhead but doesn't
+//    eliminate all timing variability in Windows kernel I/O completion.
+//
+// Values:
+// - failure_threshold: 15 (increased from 5) - Allows ~15-30 minutes of operation before
+//   opening circuit, depending on message frequency. Provides 3x more tolerance.
+//
+// - open_duration_secs: 60 (increased from 30) - Gives Windows Global objects sufficient
+//   time to stabilize before attempting recovery. Prevents rapid open/half-open/open cycles.
+//
+// - half_open_max_calls: 5 (increased from 3) - Provides better statistical confidence
+//   that the connection has recovered. With success_threshold=2, requires 40% success rate.
+//
+// - success_threshold: 2 (unchanged) - Requires 2 successful calls to close circuit.
+//   Conservative but achievable with the increased half_open_max_calls.
+//
+// These values are validated by config.rs to be within acceptable ranges:
+// - failure_threshold: [3, 20]
+// - open_duration_secs: [10, 600]
+// - half_open_max_calls: [1, 10]
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
         Self {
-            failure_threshold: 5,
-            open_duration_secs: 30,
-            half_open_max_calls: 3,
-            success_threshold: 2,
+            failure_threshold: 15,      // 15 failures before opening (3x tolerance for Windows Global objects)
+            open_duration_secs: 60,     // 60 seconds open (allows Windows I/O to stabilize)
+            half_open_max_calls: 5,     // 5 test calls in half-open (better recovery confidence)
+            success_threshold: 2,       // 2 successes to close (unchanged)
         }
     }
 }
@@ -163,9 +206,11 @@ pub struct VirtioSerial {
     circuit_breaker_metrics: Arc<RwLock<CircuitBreakerMetrics>>,
     circuit_breaker_config: CircuitBreakerConfig,
     // Keep-Alive fields
-    keep_alive_last_sent: Arc<AtomicU64>,
-    keep_alive_last_received: Arc<AtomicU64>,
-    keep_alive_sequence: Arc<AtomicU32>,
+    keep_alive_last_sent: Arc<AtomicU64>, // Timestamp (Unix epoch seconds) of last keep-alive message sent to backend
+    keep_alive_last_received: Arc<AtomicU64>, // Timestamp (Unix epoch seconds) of last keep-alive response received from backend
+    keep_alive_sequence: Arc<AtomicU32>, // Sequence number for keep-alive messages, incremented with each send
+    #[cfg(target_os = "windows")]
+    windows_handle: Arc<RwLock<Option<SendableHandle>>>,
 }
 
 impl VirtioSerial {
@@ -228,8 +273,20 @@ impl VirtioSerial {
         vm_id: String,
         read_timeout_ms: u64,
         ping_test_interval_secs: u64,
-        circuit_breaker_config: CircuitBreakerConfig
+        mut circuit_breaker_config: CircuitBreakerConfig
     ) -> Self {
+        // Guard: Ensure success_threshold does not exceed half_open_max_calls
+        // This prevents impossible conditions where more successes are required than attempts allowed.
+        // Use a non-fatal clamp instead of panic to maintain production stability.
+        if circuit_breaker_config.success_threshold > circuit_breaker_config.half_open_max_calls {
+            warn!(
+                "Circuit breaker config invalid: success_threshold ({}) > half_open_max_calls ({}). Clamping success_threshold to half_open_max_calls.",
+                circuit_breaker_config.success_threshold,
+                circuit_breaker_config.half_open_max_calls
+            );
+            circuit_breaker_config.success_threshold = circuit_breaker_config.half_open_max_calls;
+        }
+
         Self {
             device_path: device_path.as_ref().to_path_buf(),
             vm_id,
@@ -281,6 +338,9 @@ impl VirtioSerial {
             keep_alive_last_sent: Arc::new(AtomicU64::new(0)),
             keep_alive_last_received: Arc::new(AtomicU64::new(0)),
             keep_alive_sequence: Arc::new(AtomicU32::new(0)),
+            // Windows handle initialization
+            #[cfg(target_os = "windows")]
+            windows_handle: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1269,55 +1329,93 @@ impl VirtioSerial {
         {
             // Check device type and handle accordingly
             if path_str.contains("Global") {
-                // Test if we can actually open the Global object
-                match Self::try_open_windows_device(&path_str, false) {
-                    Ok(true) => {
-                        // Global objects require special handling - we'll open them per-operation
-                        // but mark as connected for consistent state
-                        self.is_connected.store(true, Ordering::SeqCst);
-                        debug!("Global VirtIO device verified: {}", path_str);
-                        info!("VirtIO Global object ready - will use Windows API for persistent communication");
+                // Import Windows API types
+                use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
+                use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+                use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+                use winapi::um::errhandlingapi::GetLastError;
+                use winapi::um::winbase::FILE_FLAG_OVERLAPPED;
+                use std::os::windows::ffi::OsStrExt;
+                use std::ffi::OsStr;
+
+                // Idempotency guard: check if already connected
+                {
+                    let win_handle = self.windows_handle.read().unwrap();
+                    if win_handle.is_some() {
+                        debug!("Global VirtIO device already connected, returning early");
                         return Ok(());
                     }
-                    Ok(false) => {
-                        return Err(anyhow!("VirtIO Global object exists but cannot be opened: {}. Check permissions and VM configuration.", path_str));
-                    }
-                    Err(error_code) => {
-                        // Provide specific guidance based on error code
-                        match error_code {
-                            5 => {
-                                warn!("🔐 Access denied to VirtIO Global object: {}", path_str);
-                                warn!("📋 This typically means:");
-                                warn!("   1. Service needs Administrator privileges");
-                                warn!("   2. VirtIO device needs proper VM configuration");
-                                warn!("   3. Windows security policies blocking access");
-                                warn!("   4. DEV_1043 device detected but not accessible");
-                                warn!("");
-                                warn!("🚀 Immediate solutions:");
-                                warn!("   • Run as Administrator: Right-click → 'Run as administrator'");
-                                warn!("   • Check VM config: Ensure virtio-serial channel is configured");
-                                warn!("   • Run diagnosis: infiniservice.exe --diag");
-                                warn!("   • Try alternative: infiniservice.exe --device \"\\\\.\\pipe\\org.infinibay.agent\"");
-                                return Err(anyhow!("Access denied to VirtIO Global object (Win32 error 5). Run as Administrator or check VM configuration."));
-                            }
-                            2 => {
-                                warn!("🔍 VirtIO Global object not found: {}", path_str);
-                                warn!("📋 This indicates:");
-                                warn!("   • VM configuration missing virtio-serial channel");
-                                warn!("   • Channel name mismatch in VM setup");
-                                warn!("   • VirtIO drivers not properly installed");
-                                warn!("");
-                                warn!("🔧 VM Configuration Examples:");
-                                warn!("   QEMU/KVM: <target type='virtio' name='org.infinibay.agent'/>");
-                                warn!("   VMware: serial0.fileName = \"\\\\.\\pipe\\infinibay\"");
-                                warn!("   VirtualBox: --uartmode1 server \\\\.\\pipe\\infinibay");
-                                return Err(anyhow!("VirtIO Global object not found (Win32 error 2). Check VM virtio-serial configuration."));
-                            }
-                            _ => {
-                                warn!("❌ Unexpected error accessing VirtIO device: Win32 error {}", error_code);
-                                warn!("💡 Try running: infiniservice.exe --diag");
-                                return Err(anyhow!("Failed to open VirtIO Global object {}: Win32 error {}. Check VM configuration and driver installation.", path_str, error_code));
-                            }
+                }
+
+                // Convert device path to wide string (UTF-16)
+                let wide_path: Vec<u16> = OsStr::new(&*path_str)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+
+                // Open the Global object with CreateFileW and FILE_FLAG_OVERLAPPED
+                let handle = unsafe {
+                    CreateFileW(
+                        wide_path.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null_mut(),
+                        OPEN_EXISTING,
+                        FILE_FLAG_OVERLAPPED,  // KEY: Enable overlapped I/O
+                        std::ptr::null_mut(),
+                    )
+                };
+
+                // Check for success and store handle
+                if handle != INVALID_HANDLE_VALUE {
+                    // Store the handle in windows_handle
+                    let mut win_handle = self.windows_handle.write().unwrap();
+                    *win_handle = Some(SendableHandle(handle));
+
+                    // Mark as connected
+                    self.is_connected.store(true, Ordering::SeqCst);
+
+                    info!("VirtIO Global object opened with persistent handle");
+                    debug!("Global VirtIO device connected: {}", path_str);
+                    return Ok(());
+                } else {
+                    // Get error code for detailed error message
+                    let error_code = unsafe { GetLastError() };
+
+                    // Provide specific guidance based on error code
+                    match error_code {
+                        5 => {
+                            warn!("🔐 Access denied to VirtIO Global object: {}", path_str);
+                            warn!("📋 This typically means:");
+                            warn!("   1. Service needs Administrator privileges");
+                            warn!("   2. VirtIO device needs proper VM configuration");
+                            warn!("   3. Windows security policies blocking access");
+                            warn!("   4. DEV_1043 device detected but not accessible");
+                            warn!("");
+                            warn!("🚀 Immediate solutions:");
+                            warn!("   • Run as Administrator: Right-click → 'Run as administrator'");
+                            warn!("   • Check VM config: Ensure virtio-serial channel is configured");
+                            warn!("   • Run diagnosis: infiniservice.exe --diag");
+                            warn!("   • Try alternative: infiniservice.exe --device \"\\\\.\\pipe\\org.infinibay.agent\"");
+                            return Err(anyhow!("Access denied to VirtIO Global object (Win32 error 5). Run as Administrator or check VM configuration."));
+                        }
+                        2 => {
+                            warn!("🔍 VirtIO Global object not found: {}", path_str);
+                            warn!("📋 This indicates:");
+                            warn!("   • VM configuration missing virtio-serial channel");
+                            warn!("   • Channel name mismatch in VM setup");
+                            warn!("   • VirtIO drivers not properly installed");
+                            warn!("");
+                            warn!("🔧 VM Configuration Examples:");
+                            warn!("   QEMU/KVM: <target type='virtio' name='org.infinibay.agent'/>");
+                            warn!("   VMware: serial0.fileName = \"\\\\.\\pipe\\infinibay\"");
+                            warn!("   VirtualBox: --uartmode1 server \\\\.\\pipe\\infinibay");
+                            return Err(anyhow!("VirtIO Global object not found (Win32 error 2). Check VM virtio-serial configuration."));
+                        }
+                        _ => {
+                            warn!("❌ Unexpected error accessing VirtIO device: Win32 error {}", error_code);
+                            warn!("💡 Try running: infiniservice.exe --diag");
+                            return Err(anyhow!("Failed to open VirtIO Global object {}: Win32 error {}. Check VM configuration and driver installation.", path_str, error_code));
                         }
                     }
                 }
@@ -1499,6 +1597,19 @@ impl VirtioSerial {
             }
         }
 
+        // Close Windows handle for Global objects
+        #[cfg(target_os = "windows")]
+        {
+            let mut win_handle = self.windows_handle.write().unwrap();
+            if let Some(handle) = win_handle.take() {
+                unsafe {
+                    use winapi::um::handleapi::CloseHandle;
+                    CloseHandle(handle.0);
+                }
+                debug!("Windows handle closed");
+            }
+        }
+
         // Mark as disconnected
         self.is_connected.store(false, Ordering::SeqCst);
         info!("VirtIO connection disconnected successfully");
@@ -1669,7 +1780,7 @@ impl VirtioSerial {
         // Track if this is the first transmission
         let is_initial = !self.initial_transmission_sent.load(std::sync::atomic::Ordering::SeqCst);
 
-        match self.send_raw_message(&serialized).await {
+        match self.send_raw_message(&serialized, true).await {
             Ok(()) => {
                 // Update transmission tracking
                 let now = std::time::SystemTime::now()
@@ -1722,7 +1833,7 @@ impl VirtioSerial {
             .with_context(|| "Failed to serialize metrics message for verification")?;
 
         // Send with strict error handling - do not treat any errors as safe
-        self.send_raw_message(&serialized).await
+        self.send_raw_message(&serialized, true).await
             .with_context(|| "Failed to send verification message")?;
 
         info!("Verification transmission completed successfully: {} interfaces, {} UP with IPs",
@@ -1737,8 +1848,8 @@ impl VirtioSerial {
         
         let serialized = serde_json::to_string(&response)
             .with_context(|| "Failed to serialize command response")?;
-        
-        self.send_raw_message(&serialized).await
+
+        self.send_raw_message(&serialized, true).await
     }
 
     /// Classify Windows error codes for intelligent retry logic
@@ -2081,7 +2192,8 @@ impl VirtioSerial {
     }
 
     /// Send raw message using persistent connection
-    async fn send_raw_message(&self, message: &str) -> Result<()> {
+    #[async_recursion(?Send)]
+    async fn send_raw_message(&self, message: &str, affects_circuit_breaker: bool) -> Result<()> {
         let start = std::time::Instant::now();
         let path_str = self.device_path.to_string_lossy();
 
@@ -2102,14 +2214,15 @@ impl VirtioSerial {
         match circuit_state {
             CircuitBreakerState::Open => {
                 // Check if circuit should transition to Half-Open
-                let metrics = self.circuit_breaker_metrics.read().unwrap();
-                let time_since_open = SystemTime::now()
-                    .duration_since(metrics.state_change_time)
-                    .unwrap_or_default()
-                    .as_secs();
+                let time_since_open = {
+                    let metrics = self.circuit_breaker_metrics.read().unwrap();
+                    SystemTime::now()
+                        .duration_since(metrics.state_change_time)
+                        .unwrap_or_default()
+                        .as_secs()
+                }; // metrics guard dropped here
 
                 if time_since_open >= self.circuit_breaker_config.open_duration_secs {
-                    drop(metrics); // Release read lock
                     self.transition_circuit_breaker_to_half_open().await;
                 } else {
                     let latency_ms = start.elapsed().as_millis() as u64;
@@ -2139,88 +2252,440 @@ impl VirtioSerial {
         if !self.is_connected.load(Ordering::SeqCst) {
             let latency_ms = start.elapsed().as_millis() as u64;
             self.update_transmission_stats(message.len() as u64, latency_ms, false);
-            self.record_circuit_breaker_failure().await;
+            if affects_circuit_breaker {
+                self.record_circuit_breaker_failure().await;
+            }
             return Err(anyhow!("VirtIO connection not established"));
         }
 
-        // Handle Global objects on Windows differently (can't keep persistent handles)
+        // Handle Global objects on Windows differently using OVERLAPPED I/O with persistent handle
         #[cfg(target_os = "windows")]
         {
             if path_str.contains("Global") {
-                // Retry logic for Global object operations
-                loop {
-                    match OpenOptions::new()
-                        .write(true)
-                        .open(&self.device_path)
-                    {
-                        Ok(mut file) => {
-                            match writeln!(file, "{}", message) {
-                                Ok(_) => {
-                                    match file.flush() {
-                                        Ok(_) => {
-                                            debug!("Message sent successfully via Global object");
+                // Windows API imports for OVERLAPPED I/O
+                use winapi::um::fileapi::WriteFile;
+                use winapi::um::synchapi::{CreateEventW, WaitForSingleObject};
+                use winapi::um::ioapiset::{GetOverlappedResult, CancelIoEx};
+                use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+                use winapi::um::errhandlingapi::GetLastError;
+                use winapi::um::winbase::{WAIT_OBJECT_0, WAIT_FAILED};
+                use winapi::shared::winerror::{WAIT_TIMEOUT, ERROR_IO_PENDING, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED};
+                use winapi::um::minwinbase::OVERLAPPED;
+                use winapi::shared::ntdef::HANDLE;
+                use std::mem::zeroed;
+                use std::ptr;
+
+                // Retrieve persistent handle
+                let handle_opt = {
+                    let handle_guard = self.windows_handle.read().unwrap();
+                    handle_guard.as_ref().map(|h| h.0)
+                }; // guard dropped here
+
+                let handle = match handle_opt {
+                    Some(h) => h,
+                    None => {
+                        // No handle available - connection lost
+                        self.is_connected.store(false, Ordering::SeqCst);
+                        let latency_ms = start.elapsed().as_millis() as u64;
+                        self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                        if affects_circuit_breaker {
+                            self.record_circuit_breaker_failure().await;
+                        }
+                        return Err(anyhow!("No Windows handle available for Global object"));
+                    }
+                };
+
+                // Prepare message with newline (matching writeln! behavior)
+                let message_with_newline = format!("{}\n", message);
+                let message_bytes = message_with_newline.as_bytes();
+                let bytes_to_write = message_bytes.len() as u32;
+
+                debug!("Sending message via OVERLAPPED I/O to Global object, {} bytes", bytes_to_write);
+
+                unsafe {
+                    // Create manual-reset event for OVERLAPPED I/O
+                    let event_handle = CreateEventW(
+                        ptr::null_mut(),  // Default security
+                        1,                // Manual-reset (TRUE)
+                        0,                // Initial state: non-signaled (FALSE)
+                        ptr::null_mut(),  // No name
+                    );
+
+                    if event_handle.is_null() || event_handle == INVALID_HANDLE_VALUE {
+                        let error_code = GetLastError();
+                        let latency_ms = start.elapsed().as_millis() as u64;
+                        self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                        if affects_circuit_breaker {
+                            self.record_circuit_breaker_failure().await;
+                        }
+                        return Err(anyhow!("Failed to create event for OVERLAPPED I/O: Win32 error {}", error_code));
+                    }
+
+                    // Initialize OVERLAPPED structure
+                    let mut overlapped: OVERLAPPED = zeroed();
+                    overlapped.hEvent = event_handle;
+
+                    // Call WriteFile with OVERLAPPED
+                    let mut bytes_written: u32 = 0;
+                    let write_result = WriteFile(
+                        handle,
+                        message_bytes.as_ptr() as *const _,
+                        bytes_to_write,
+                        &mut bytes_written,
+                        &mut overlapped,
+                    );
+
+                    // Handle WriteFile result - three scenarios
+                    if write_result != 0 {
+                        // Scenario A: Synchronous completion
+                        CloseHandle(event_handle);
+                        drop(overlapped); // Drop overlapped since event is closed
+
+                        // Handle partial writes
+                        if bytes_written < bytes_to_write {
+                            warn!("Partial synchronous write for Global object: {} of {} bytes", bytes_written, bytes_to_write);
+                            let mut total_written = bytes_written;
+                            let mut remaining_bytes = &message_bytes[(bytes_written as usize)..];
+
+                            // Retry remaining bytes with new OVERLAPPED structures
+                            while total_written < bytes_to_write {
+                                let remaining_count = bytes_to_write - total_written;
+
+                                // Create new event for additional write
+                                let additional_event = CreateEventW(
+                                    ptr::null_mut(),
+                                    1,  // Manual-reset
+                                    0,  // Non-signaled
+                                    ptr::null_mut(),
+                                );
+
+                                if additional_event.is_null() || additional_event == INVALID_HANDLE_VALUE {
+                                    let error_code = GetLastError();
+                                    // event_handle and overlapped already dropped/closed above
+                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                    if affects_circuit_breaker {
+                                        self.record_circuit_breaker_failure().await;
+                                    }
+                                    return Err(anyhow!("Failed to create event for partial write: Win32 error {}", error_code));
+                                }
+
+                                let mut additional_overlapped: OVERLAPPED = zeroed();
+                                additional_overlapped.hEvent = additional_event;
+
+                                let mut additional_written: u32 = 0;
+                                let additional_result = WriteFile(
+                                    handle,
+                                    remaining_bytes.as_ptr() as *const _,
+                                    remaining_count,
+                                    &mut additional_written,
+                                    &mut additional_overlapped,
+                                );
+
+                                if additional_result != 0 {
+                                    // Synchronous success
+                                    CloseHandle(additional_event);
+                                    total_written += additional_written;
+                                    if additional_written < remaining_count {
+                                        remaining_bytes = &remaining_bytes[(additional_written as usize)..];
+                                    }
+                                } else {
+                                    let add_error = GetLastError();
+                                    if add_error == ERROR_IO_PENDING {
+                                        // Wait for async completion
+                                        let add_wait = WaitForSingleObject(additional_event, 5000);
+                                        if add_wait == WAIT_OBJECT_0 {
+                                            let add_overlapped_result = GetOverlappedResult(
+                                                handle,
+                                                &mut additional_overlapped,
+                                                &mut additional_written,
+                                                0,
+                                            );
+                                            CloseHandle(additional_event);
+                                            if add_overlapped_result != 0 {
+                                                total_written += additional_written;
+                                                if additional_written < remaining_count {
+                                                    remaining_bytes = &remaining_bytes[(additional_written as usize)..];
+                                                }
+                                            } else {
+                                                let latency_ms = start.elapsed().as_millis() as u64;
+                                                self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                                if affects_circuit_breaker {
+                                                    self.record_circuit_breaker_failure().await;
+                                                }
+                                                return Err(anyhow!("Partial write GetOverlappedResult failed: {} of {} bytes written", total_written, bytes_to_write));
+                                            }
+                                        } else {
+                                            CloseHandle(additional_event);
                                             let latency_ms = start.elapsed().as_millis() as u64;
-                                            self.update_transmission_stats(message.len() as u64, latency_ms, true);
-                                            self.reset_error_tracking(); // Reset on success
-                                            self.record_circuit_breaker_success().await;
-                                            return Ok(());
+                                            self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                            if affects_circuit_breaker {
+                                                self.record_circuit_breaker_failure().await;
+                                            }
+                                            return Err(anyhow!("Partial write wait failed: {} of {} bytes written", total_written, bytes_to_write));
                                         }
-                                        Err(e) => {
-                                            // Handle flush error with retry logic
-                                            match self.handle_error_with_retry(&e, "Global object flush").await {
-                                                Ok(true) => continue, // Retry
-                                                Ok(false) => {
+                                    } else {
+                                        CloseHandle(additional_event);
+                                        let latency_ms = start.elapsed().as_millis() as u64;
+                                        self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                        if affects_circuit_breaker {
+                                            self.record_circuit_breaker_failure().await;
+                                        }
+                                        return Err(anyhow!("Partial write failed: Win32 error {}, {} of {} bytes written", add_error, total_written, bytes_to_write));
+                                    }
+                                }
+                            }
+
+                            debug!("Message sent successfully via Global object (synchronous with partial writes), {} bytes total", total_written);
+                        } else {
+                            debug!("Message sent successfully via Global object (synchronous), {} bytes", bytes_written);
+                        }
+
+                        let latency_ms = start.elapsed().as_millis() as u64;
+                        self.update_transmission_stats(message.len() as u64, latency_ms, true);
+                        self.reset_error_tracking();
+                        if affects_circuit_breaker {
+                            self.record_circuit_breaker_success().await;
+                        }
+                        return Ok(());
+                    } else {
+                        let error_code = GetLastError();
+
+                        if error_code == ERROR_IO_PENDING {
+                            // Scenario B: Async pending - wait for completion
+                            debug!("WriteFile returned ERROR_IO_PENDING, waiting for completion...");
+                            let wait_result = WaitForSingleObject(event_handle, 5000); // 5 second timeout
+
+                            match wait_result {
+                                WAIT_OBJECT_0 => {
+                                    // Event signaled - operation completed
+                                    let overlapped_result = GetOverlappedResult(
+                                        handle,
+                                        &mut overlapped,
+                                        &mut bytes_written,
+                                        0, // Don't wait (FALSE)
+                                    );
+
+                                    if overlapped_result != 0 {
+                                        // Success
+                                        CloseHandle(event_handle);
+
+                                        // Handle partial writes
+                                        if bytes_written < bytes_to_write {
+                                            warn!("Partial asynchronous write for Global object: {} of {} bytes", bytes_written, bytes_to_write);
+                                            let mut total_written = bytes_written;
+                                            let mut remaining_bytes = &message_bytes[(bytes_written as usize)..];
+
+                                            // Retry remaining bytes with new OVERLAPPED structures
+                                            while total_written < bytes_to_write {
+                                                let remaining_count = bytes_to_write - total_written;
+
+                                                // Create new event for additional write
+                                                let additional_event = CreateEventW(
+                                                    ptr::null_mut(),
+                                                    1,  // Manual-reset
+                                                    0,  // Non-signaled
+                                                    ptr::null_mut(),
+                                                );
+
+                                                if additional_event.is_null() || additional_event == INVALID_HANDLE_VALUE {
+                                                    let error_code = GetLastError();
                                                     let latency_ms = start.elapsed().as_millis() as u64;
                                                     self.update_transmission_stats(message.len() as u64, latency_ms, false);
-                                                    return Err(anyhow!("Failed to flush message to Global object after retries: {}", e));
+                                                    if affects_circuit_breaker {
+                                                        self.record_circuit_breaker_failure().await;
+                                                    }
+                                                    return Err(anyhow!("Failed to create event for partial write: Win32 error {}", error_code));
                                                 }
-                                                Err(retry_err) => {
-                                                    let latency_ms = start.elapsed().as_millis() as u64;
-                                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
-                                                    return Err(anyhow!("Error handling retry for flush: {}", retry_err));
+
+                                                let mut additional_overlapped: OVERLAPPED = zeroed();
+                                                additional_overlapped.hEvent = additional_event;
+
+                                                let mut additional_written: u32 = 0;
+                                                let additional_result = WriteFile(
+                                                    handle,
+                                                    remaining_bytes.as_ptr() as *const _,
+                                                    remaining_count,
+                                                    &mut additional_written,
+                                                    &mut additional_overlapped,
+                                                );
+
+                                                if additional_result != 0 {
+                                                    // Synchronous success
+                                                    CloseHandle(additional_event);
+                                                    total_written += additional_written;
+                                                    if additional_written < remaining_count {
+                                                        remaining_bytes = &remaining_bytes[(additional_written as usize)..];
+                                                    }
+                                                } else {
+                                                    let add_error = GetLastError();
+                                                    if add_error == ERROR_IO_PENDING {
+                                                        // Wait for async completion
+                                                        let add_wait = WaitForSingleObject(additional_event, 5000);
+                                                        if add_wait == WAIT_OBJECT_0 {
+                                                            let add_overlapped_result = GetOverlappedResult(
+                                                                handle,
+                                                                &mut additional_overlapped,
+                                                                &mut additional_written,
+                                                                0,
+                                                            );
+                                                            CloseHandle(additional_event);
+                                                            if add_overlapped_result != 0 {
+                                                                total_written += additional_written;
+                                                                if additional_written < remaining_count {
+                                                                    remaining_bytes = &remaining_bytes[(additional_written as usize)..];
+                                                                }
+                                                            } else {
+                                                                let latency_ms = start.elapsed().as_millis() as u64;
+                                                                self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                                                if affects_circuit_breaker {
+                                                                    self.record_circuit_breaker_failure().await;
+                                                                }
+                                                                return Err(anyhow!("Partial write GetOverlappedResult failed: {} of {} bytes written", total_written, bytes_to_write));
+                                                            }
+                                                        } else {
+                                                            CloseHandle(additional_event);
+                                                            let latency_ms = start.elapsed().as_millis() as u64;
+                                                            self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                                            if affects_circuit_breaker {
+                                                                self.record_circuit_breaker_failure().await;
+                                                            }
+                                                            return Err(anyhow!("Partial write wait failed: {} of {} bytes written", total_written, bytes_to_write));
+                                                        }
+                                                    } else {
+                                                        CloseHandle(additional_event);
+                                                        let latency_ms = start.elapsed().as_millis() as u64;
+                                                        self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                                        if affects_circuit_breaker {
+                                                            self.record_circuit_breaker_failure().await;
+                                                        }
+                                                        return Err(anyhow!("Partial write failed: Win32 error {}, {} of {} bytes written", add_error, total_written, bytes_to_write));
+                                                    }
                                                 }
+                                            }
+
+                                            debug!("Message sent successfully via Global object (asynchronous with partial writes), {} bytes total", total_written);
+                                        } else {
+                                            debug!("Message sent successfully via Global object (asynchronous), {} bytes", bytes_written);
+                                        }
+
+                                        let latency_ms = start.elapsed().as_millis() as u64;
+                                        self.update_transmission_stats(message.len() as u64, latency_ms, true);
+                                        self.reset_error_tracking();
+                                        if affects_circuit_breaker {
+                                            self.record_circuit_breaker_success().await;
+                                        }
+                                        return Ok(());
+                                    } else {
+                                        // GetOverlappedResult failed
+                                        let overlapped_error = GetLastError();
+                                        CloseHandle(event_handle);
+                                        warn!("GetOverlappedResult failed for Global object: Win32 error {}", overlapped_error);
+                                        let latency_ms = start.elapsed().as_millis() as u64;
+                                        self.update_transmission_stats(message.len() as u64, latency_ms, false);
+
+                                        // Handle error with retry logic
+                                        let io_error = std::io::Error::from_raw_os_error(overlapped_error as i32);
+                                        match self.handle_error_with_retry(&io_error, "Global object OVERLAPPED write").await {
+                                            Ok(true) => {
+                                                // Retry recommended
+                                                return self.send_raw_message(message, affects_circuit_breaker).await;
+                                            }
+                                            Ok(false) => {
+                                                if affects_circuit_breaker {
+                                                    self.record_circuit_breaker_failure().await;
+                                                }
+                                                return Err(anyhow!("GetOverlappedResult failed for Global object: Win32 error {}", overlapped_error));
+                                            }
+                                            Err(retry_err) => {
+                                                if affects_circuit_breaker {
+                                                    self.record_circuit_breaker_failure().await;
+                                                }
+                                                return Err(anyhow!("Error handling retry for OVERLAPPED write: {}", retry_err));
                                             }
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    // Handle write error with retry logic
-                                    match self.handle_error_with_retry(&e, "Global object write").await {
-                                        Ok(true) => continue, // Retry
-                                        Ok(false) => {
-                                            let latency_ms = start.elapsed().as_millis() as u64;
-                                            self.update_transmission_stats(message.len() as u64, latency_ms, false);
-                                            return Err(anyhow!("Failed to write message to Global object after retries: {}", e));
-                                        }
-                                        Err(retry_err) => {
-                                            let latency_ms = start.elapsed().as_millis() as u64;
-                                            self.update_transmission_stats(message.len() as u64, latency_ms, false);
-                                            return Err(anyhow!("Error handling retry for write: {}", retry_err));
-                                        }
+                                WAIT_TIMEOUT => {
+                                    // Timeout - cancel I/O
+                                    warn!("WriteFile timed out after 5 seconds for Global object");
+                                    CancelIoEx(handle, &mut overlapped);
+                                    CloseHandle(event_handle);
+                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                    if affects_circuit_breaker {
+                                        self.record_circuit_breaker_failure().await;
                                     }
+                                    return Err(anyhow!("WriteFile timed out after 5 seconds for Global object"));
+                                }
+                                WAIT_FAILED => {
+                                    // Wait failed
+                                    let wait_error = GetLastError();
+                                    CloseHandle(event_handle);
+                                    warn!("WaitForSingleObject failed for Global object: Win32 error {}", wait_error);
+                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                    if affects_circuit_breaker {
+                                        self.record_circuit_breaker_failure().await;
+                                    }
+                                    return Err(anyhow!("WaitForSingleObject failed: Win32 error {}", wait_error));
+                                }
+                                _ => {
+                                    // Unexpected wait result
+                                    CloseHandle(event_handle);
+                                    let latency_ms = start.elapsed().as_millis() as u64;
+                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                    if affects_circuit_breaker {
+                                        self.record_circuit_breaker_failure().await;
+                                    }
+                                    return Err(anyhow!("Unexpected WaitForSingleObject result: {}", wait_result));
                                 }
                             }
-                        }
-                        Err(e) => {
-                            // Handle open error with retry logic
-                            match self.handle_error_with_retry(&e, "Global object open").await {
-                                Ok(true) => continue, // Retry
+                        } else {
+                            // Scenario C: Immediate failure
+                            CloseHandle(event_handle);
+                            warn!("WriteFile failed for Global object: Win32 error {}", error_code);
+
+                            // Handle specific fatal errors
+                            if error_code == ERROR_BROKEN_PIPE || error_code == ERROR_NO_DATA || error_code == ERROR_PIPE_NOT_CONNECTED {
+                                // Connection lost
+                                self.is_connected.store(false, Ordering::SeqCst);
+                                let latency_ms = start.elapsed().as_millis() as u64;
+                                self.update_transmission_stats(message.len() as u64, latency_ms, false);
+                                if affects_circuit_breaker {
+                                    self.record_circuit_breaker_failure().await;
+                                }
+                                return Err(anyhow!("Global object connection lost: Win32 error {}", error_code));
+                            }
+
+                            // Handle retriable errors
+                            let latency_ms = start.elapsed().as_millis() as u64;
+                            self.update_transmission_stats(message.len() as u64, latency_ms, false);
+
+                            let io_error = std::io::Error::from_raw_os_error(error_code as i32);
+                            match self.handle_error_with_retry(&io_error, "Global object OVERLAPPED write").await {
+                                Ok(true) => {
+                                    // Retry recommended
+                                    return self.send_raw_message(message, affects_circuit_breaker).await;
+                                }
                                 Ok(false) => {
-                                    let latency_ms = start.elapsed().as_millis() as u64;
-                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
-                                    return Err(anyhow!("Failed to open Global object for transmission after retries: {}", e));
+                                    if affects_circuit_breaker {
+                                        self.record_circuit_breaker_failure().await;
+                                    }
+                                    return Err(anyhow!("WriteFile failed for Global object after retries: Win32 error {}", error_code));
                                 }
                                 Err(retry_err) => {
-                                    let latency_ms = start.elapsed().as_millis() as u64;
-                                    self.update_transmission_stats(message.len() as u64, latency_ms, false);
-                                    return Err(anyhow!("Error handling retry for open: {}", retry_err));
+                                    if affects_circuit_breaker {
+                                        self.record_circuit_breaker_failure().await;
+                                    }
+                                    return Err(anyhow!("Error handling retry for OVERLAPPED write: {}", retry_err));
                                 }
                             }
                         }
                     }
-                }
-            }
-        }
+                } // unsafe block
+            } // if path_str.contains("Global")
+        } // cfg(target_os = "windows")
 
         // Use persistent write handle for other device types
         // Clone Arc<File> to avoid blocking I/O under locks
@@ -2258,7 +2723,9 @@ impl VirtioSerial {
                 let latency_ms = start.elapsed().as_millis() as u64;
                 self.update_transmission_stats(message.len() as u64, latency_ms, true);
                 self.reset_error_tracking(); // Reset on success
-                self.record_circuit_breaker_success().await;
+                if affects_circuit_breaker {
+                    self.record_circuit_breaker_success().await;
+                }
                 Ok(())
             }
             Err(e) => {
@@ -2267,7 +2734,7 @@ impl VirtioSerial {
                     Ok(true) => {
                         // Retry was recommended, but we need to recursively call send_raw_message
                         // to handle the retry properly with fresh connection state
-                        return Box::pin(self.send_raw_message(message)).await;
+                        return Box::pin(self.send_raw_message(message, affects_circuit_breaker)).await;
                     }
                     Ok(false) => {
                         // No retry recommended or max retries exceeded
@@ -2284,7 +2751,7 @@ impl VirtioSerial {
             }
         }
     }
-    
+
     /// Read incoming commands using persistent connection
     pub async fn read_command(&self) -> Result<Option<IncomingMessage>> {
         let path_str = self.device_path.to_string_lossy();
@@ -2304,37 +2771,212 @@ impl VirtioSerial {
         #[cfg(target_os = "windows")]
         {
             if path_str.contains("Global") {
-                // For Global objects, we can't maintain persistent read handles
-                // Use tokio timeout with select! for non-blocking behavior
+                // For Global objects, use OVERLAPPED I/O with persistent handle
                 use tokio::time::{timeout, Duration};
                 use tokio::task;
+                use winapi::um::fileapi::ReadFile;
+                use winapi::um::synchapi::{CreateEventW, WaitForSingleObject};
+                use winapi::um::ioapiset::{GetOverlappedResult, CancelIoEx};
+                use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+                use winapi::um::errhandlingapi::GetLastError;
+                use winapi::um::winbase::{WAIT_OBJECT_0, WAIT_FAILED};
+                use winapi::shared::winerror::{WAIT_TIMEOUT, ERROR_IO_PENDING, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED, ERROR_MORE_DATA};
+                use winapi::um::minwinbase::OVERLAPPED;
+                use std::mem::zeroed;
+                use std::ptr;
 
                 let timeout_duration = Duration::from_millis(self.read_timeout_ms);
-                let device_path = self.device_path.clone();
+                let windows_handle = self.windows_handle.clone(); // Clone Arc for move into closure
+                let read_timeout_ms = self.read_timeout_ms; // Capture timeout for inner wait
 
                 let read_result = timeout(timeout_duration, task::spawn_blocking(move || {
-                    match OpenOptions::new()
-                        .read(true)
-                        .open(&device_path)
-                    {
-                        Ok(file) => {
-                            let mut reader = BufReader::new(file);
-                            let mut line = String::new();
-                            reader.read_line(&mut line).map(|n| (n, line))
+                    unsafe {
+                        // Step 3: Retrieve persistent handle
+                        let handle_guard = windows_handle.read().unwrap();
+                        let handle = match handle_guard.as_ref() {
+                            Some(h) => h.0,
+                            None => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotConnected,
+                                    "No Windows handle available for Global object"
+                                ));
+                            }
+                        };
+
+                        // Step 4: Allocate read buffer
+                        const READ_BUFFER_SIZE: usize = 4096;
+                        let mut buffer: Vec<u8> = vec![0u8; READ_BUFFER_SIZE];
+
+                        // Step 5: Create manual-reset event
+                        let event_handle = CreateEventW(
+                            ptr::null_mut(),  // Default security
+                            1,                // Manual-reset (TRUE)
+                            0,                // Initial state: non-signaled (FALSE)
+                            ptr::null_mut(),  // No name
+                        );
+
+                        if event_handle.is_null() || event_handle == INVALID_HANDLE_VALUE {
+                            let error_code = GetLastError();
+                            return Err(std::io::Error::from_raw_os_error(error_code as i32));
                         }
-                        Err(e) => Err(e)
+
+                        // Step 6: Initialize OVERLAPPED structure
+                        let mut overlapped: OVERLAPPED = zeroed();
+                        overlapped.hEvent = event_handle;
+
+                        // Step 7: Call ReadFile with OVERLAPPED
+                        let mut bytes_read: u32 = 0;
+                        debug!("Reading from Global object via OVERLAPPED I/O, buffer size: {}", READ_BUFFER_SIZE);
+                        let read_result = ReadFile(
+                            handle,
+                            buffer.as_mut_ptr() as *mut _,
+                            READ_BUFFER_SIZE as u32,
+                            &mut bytes_read,
+                            &mut overlapped,
+                        );
+
+                        // Step 8: Handle ReadFile result - Three scenarios
+                        if read_result != 0 {
+                            // Scenario A: Synchronous completion
+                            debug!("Read completed synchronously, {} bytes", bytes_read);
+                            CloseHandle(event_handle);
+
+                            if bytes_read == 0 {
+                                debug!("No data available from Global object");
+                                return Ok((0, String::new()));
+                            }
+
+                            let string = String::from_utf8_lossy(&buffer[..bytes_read as usize]);
+                            return Ok((bytes_read as usize, string.to_string()));
+                        } else {
+                            let error_code = GetLastError();
+
+                            if error_code == ERROR_IO_PENDING {
+                                // Scenario B: Async pending
+                                debug!("ReadFile returned ERROR_IO_PENDING, waiting for completion...");
+
+                                // Wait for completion with configured timeout (matches QGA pattern)
+                                // Use full configured timeout; outer tokio timeout provides additional safety
+                                let wait_result = WaitForSingleObject(event_handle, read_timeout_ms as u32);
+
+                                match wait_result {
+                                    WAIT_OBJECT_0 => {
+                                        // Event signaled, operation completed
+                                        let get_result = GetOverlappedResult(handle, &mut overlapped, &mut bytes_read, 0);
+
+                                        if get_result != 0 {
+                                            debug!("Read completed asynchronously, {} bytes", bytes_read);
+                                            CloseHandle(event_handle);
+
+                                            if bytes_read == 0 {
+                                                debug!("No data available from Global object");
+                                                return Ok((0, String::new()));
+                                            }
+
+                                            let string = String::from_utf8_lossy(&buffer[..bytes_read as usize]);
+                                            return Ok((bytes_read as usize, string.to_string()));
+                                        } else {
+                                            let error_code = GetLastError();
+                                            debug!("GetOverlappedResult failed: Win32 error {}", error_code);
+                                            CloseHandle(event_handle);
+                                            return Err(std::io::Error::from_raw_os_error(error_code as i32));
+                                        }
+                                    }
+                                    WAIT_TIMEOUT => {
+                                        // No data arrived within wait period - must cancel the pending I/O
+                                        debug!("Read operation timed out, cancelling pending I/O");
+
+                                        // Cancel the pending I/O operation
+                                        let cancel_result = CancelIoEx(handle, &mut overlapped);
+                                        if cancel_result == 0 {
+                                            let cancel_error = GetLastError();
+                                            debug!("CancelIoEx failed or operation already completed: Win32 error {}", cancel_error);
+                                            // Operation may have already completed, try to get result
+                                        }
+
+                                        // Wait for cancellation to complete (brief wait)
+                                        let cancel_wait = WaitForSingleObject(event_handle, 1000);
+                                        if cancel_wait == WAIT_OBJECT_0 {
+                                            // Get the final result (will be ERROR_OPERATION_ABORTED if cancelled)
+                                            GetOverlappedResult(handle, &mut overlapped, &mut bytes_read, 0);
+                                            debug!("Pending I/O cancelled successfully");
+                                        } else {
+                                            debug!("Warning: Cancellation wait timed out or failed");
+                                        }
+
+                                        CloseHandle(event_handle);
+                                        return Ok((0, String::new()));
+                                    }
+                                    WAIT_FAILED => {
+                                        // Wait operation failed - cancel pending I/O before returning
+                                        let error_code = GetLastError();
+                                        debug!("WaitForSingleObject failed: Win32 error {}", error_code);
+
+                                        // Cancel the pending I/O
+                                        CancelIoEx(handle, &mut overlapped);
+                                        WaitForSingleObject(event_handle, 1000); // Wait for cancellation
+                                        GetOverlappedResult(handle, &mut overlapped, &mut bytes_read, 0);
+
+                                        CloseHandle(event_handle);
+                                        return Err(std::io::Error::from_raw_os_error(error_code as i32));
+                                    }
+                                    _ => {
+                                        // Unexpected wait result - cancel pending I/O before returning
+                                        debug!("Unexpected WaitForSingleObject result: {}", wait_result);
+
+                                        // Cancel the pending I/O
+                                        CancelIoEx(handle, &mut overlapped);
+                                        WaitForSingleObject(event_handle, 1000); // Wait for cancellation
+                                        GetOverlappedResult(handle, &mut overlapped, &mut bytes_read, 0);
+
+                                        CloseHandle(event_handle);
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            "Unexpected wait result"
+                                        ));
+                                    }
+                                }
+                            } else {
+                                // Scenario C: Immediate failure
+                                debug!("ReadFile failed for Global object: Win32 error {}", error_code);
+                                CloseHandle(event_handle);
+
+                                // Handle ERROR_MORE_DATA as partial success
+                                if error_code == ERROR_MORE_DATA {
+                                    let string = String::from_utf8_lossy(&buffer[..bytes_read as usize]);
+                                    return Ok((bytes_read as usize, string.to_string()));
+                                }
+
+                                return Err(std::io::Error::from_raw_os_error(error_code as i32));
+                            }
+                        }
                     }
                 })).await;
 
+                // Step 9: Process read result in outer context
                 match read_result {
                     Ok(Ok(Ok((0, _)))) => return Ok(None), // No data available
                     Ok(Ok(Ok((bytes_read, line)))) => {
                         self.update_bytes_received(bytes_read as u64);
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
+
+                        // Handle line-based protocol: look for newline
+                        // Note: We already waited up to read_timeout_ms for ReadFile to complete.
+                        // If the received data doesn't contain a newline, we return Ok(None) to
+                        // allow the service loop to poll again. This follows the "Simple OVERLAPPED
+                        // Read" pattern and avoids CPU spinning since the outer loop controls polling.
+                        if let Some(newline_pos) = line.find('\n') {
+                            let message_line = &line[..newline_pos];
+                            let trimmed = message_line.trim();
+                            if trimmed.is_empty() {
+                                return Ok(None);
+                            }
+                            return self.parse_incoming_message(trimmed);
+                        } else {
+                            // No newline found, incomplete message - no pending I/O to cancel
+                            // (ReadFile already completed successfully)
+                            debug!("Incomplete message (no newline), waiting for more data");
                             return Ok(None);
                         }
-                        return self.parse_incoming_message(trimmed);
                     }
                     Ok(Ok(Err(e))) => {
                         match e.kind() {
@@ -2343,10 +2985,20 @@ impl VirtioSerial {
                             std::io::ErrorKind::UnexpectedEof => {
                                 return Ok(None);
                             }
+                            std::io::ErrorKind::NotConnected => {
+                                // No persistent Windows handle available - mark disconnected
+                                warn!("VirtIO Windows handle not available (NotConnected)");
+                                self.is_connected.store(false, Ordering::SeqCst);
+                                return Ok(None);
+                            }
                             _ => {
                                 if let Some(error_code) = e.raw_os_error() {
                                     match error_code {
                                         5 | 2 => { // ACCESS_DENIED or FILE_NOT_FOUND
+                                            self.is_connected.store(false, Ordering::SeqCst);
+                                        }
+                                        109 | 232 | 233 => { // ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED
+                                            warn!("VirtIO connection broken during read: Win32 error {}", error_code);
                                             self.is_connected.store(false, Ordering::SeqCst);
                                         }
                                         _ => {}
@@ -2509,7 +3161,7 @@ impl VirtioSerial {
         let message_str = status_message.to_string();
         debug!("Sending connection status: {}", message_str);
 
-        self.send_raw_message(&message_str).await
+        self.send_raw_message(&message_str, true).await
     }
 
     /// Compare device paths for changes
@@ -2621,7 +3273,7 @@ impl VirtioSerial {
             .with_context(|| "Failed to serialize ping message")?;
 
         // Send the ping message with strict error handling
-        match self.send_raw_message(&serialized).await {
+        match self.send_raw_message(&serialized, true).await {
             Ok(()) => {
                 debug!("Ping test completed successfully");
                 Ok(())
@@ -2949,45 +3601,51 @@ impl VirtioSerial {
 
     // Circuit Breaker Helper Methods
     async fn transition_circuit_breaker_to_half_open(&self) {
-        let mut state = self.circuit_breaker_state.write().unwrap();
-        let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+        {
+            let mut state = self.circuit_breaker_state.write().unwrap();
+            let mut metrics = self.circuit_breaker_metrics.write().unwrap();
 
-        *state = CircuitBreakerState::HalfOpen;
-        metrics.state_change_time = SystemTime::now();
-        metrics.half_open_calls = 0;
+            *state = CircuitBreakerState::HalfOpen;
+            metrics.state_change_time = SystemTime::now();
+            metrics.half_open_calls = 0;
 
-        info!("Circuit breaker transitioned to HALF-OPEN state - testing recovery");
+            info!("Circuit breaker transitioned to HALF-OPEN state - testing recovery");
+        } // Locks dropped here
 
         // Send circuit breaker state change to backend
         self.send_circuit_breaker_state_change(CircuitBreakerState::HalfOpen).await;
     }
 
     async fn record_circuit_breaker_failure(&self) {
-        let mut metrics = self.circuit_breaker_metrics.write().unwrap();
-        metrics.failure_count += 1;
-        metrics.last_failure_time = Some(SystemTime::now());
+        let (should_transition_from_closed, should_transition_from_half_open) = {
+            let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+            metrics.failure_count += 1;
+            metrics.last_failure_time = Some(SystemTime::now());
 
-        let current_state = {
-            let state = self.circuit_breaker_state.read().unwrap();
-            state.clone()
-        };
+            let current_state = {
+                let state = self.circuit_breaker_state.read().unwrap();
+                state.clone()
+            };
 
-        match current_state {
-            CircuitBreakerState::Closed => {
-                // Check if we should open the circuit
-                if metrics.failure_count >= self.circuit_breaker_config.failure_threshold {
-                    drop(metrics); // Release lock before state change
-                    self.transition_circuit_breaker_to_open().await;
+            match current_state {
+                CircuitBreakerState::Closed => {
+                    // Check if we should open the circuit
+                    let should_open = metrics.failure_count >= self.circuit_breaker_config.failure_threshold;
+                    (should_open, false)
+                },
+                CircuitBreakerState::HalfOpen => {
+                    // Any failure in half-open state should open the circuit
+                    (false, true)
+                },
+                CircuitBreakerState::Open => {
+                    // Already open, just record the failure
+                    (false, false)
                 }
-            },
-            CircuitBreakerState::HalfOpen => {
-                // Any failure in half-open state should open the circuit
-                drop(metrics); // Release lock before state change
-                self.transition_circuit_breaker_to_open().await;
-            },
-            CircuitBreakerState::Open => {
-                // Already open, just record the failure
             }
+        }; // metrics guard dropped here
+
+        if should_transition_from_closed || should_transition_from_half_open {
+            self.transition_circuit_breaker_to_open().await;
         }
     }
 
@@ -3022,15 +3680,17 @@ impl VirtioSerial {
     }
 
     async fn transition_circuit_breaker_to_open(&self) {
-        let mut state = self.circuit_breaker_state.write().unwrap();
-        let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+        {
+            let mut state = self.circuit_breaker_state.write().unwrap();
+            let mut metrics = self.circuit_breaker_metrics.write().unwrap();
 
-        *state = CircuitBreakerState::Open;
-        metrics.state_change_time = SystemTime::now();
-        metrics.half_open_calls = 0;
+            *state = CircuitBreakerState::Open;
+            metrics.state_change_time = SystemTime::now();
+            metrics.half_open_calls = 0;
 
-        warn!("Circuit breaker OPENED - blocking all calls for {} seconds",
-              self.circuit_breaker_config.open_duration_secs);
+            warn!("Circuit breaker OPENED - blocking all calls for {} seconds",
+                  self.circuit_breaker_config.open_duration_secs);
+        } // Locks dropped here
 
         // Send circuit breaker state change to backend
         self.send_circuit_breaker_state_change(CircuitBreakerState::Open).await;
@@ -3087,6 +3747,15 @@ impl VirtioSerial {
     pub async fn send_keep_alive(&self) -> Result<()> {
         let sequence = self.keep_alive_sequence.fetch_add(1, Ordering::SeqCst);
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
+        let time_since_last_received = timestamp.saturating_sub(last_received);
+
+        info!(
+            "📤 Sending keep-alive request (seq: {}, timestamp: {}, last_received: {}s ago)",
+            sequence,
+            timestamp,
+            time_since_last_received
+        );
 
         let keep_alive_message = serde_json::json!({
             "type": "keep_alive",
@@ -3096,13 +3765,18 @@ impl VirtioSerial {
 
         self.keep_alive_last_sent.store(timestamp, Ordering::SeqCst);
 
-        match self.send_raw_message(&keep_alive_message.to_string()).await {
+        match self.send_raw_message(&keep_alive_message.to_string(), false).await {
             Ok(_) => {
-                debug!("Keep-alive message sent (seq: {})", sequence);
+                debug!("Keep-alive message sent successfully (seq: {}, timestamp: {})", sequence, timestamp);
                 Ok(())
             },
             Err(e) => {
-                self.record_circuit_breaker_failure().await;
+                // Keep-alive failures are logged but do NOT count toward circuit breaker failures.
+                // This is intentional because keep-alive is a periodic maintenance operation,
+                // and its failures should not trigger circuit breaker state changes, which are
+                // reserved for actual data transmission failures.
+                // The affects_circuit_breaker=false parameter ensures no CB metrics are updated.
+                warn!("Keep-alive send failed (seq: {}): {} - not counting toward circuit breaker", sequence, e);
                 Err(e)
             }
         }
@@ -3112,26 +3786,55 @@ impl VirtioSerial {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         self.keep_alive_last_received.store(timestamp, Ordering::SeqCst);
 
-        debug!("Keep-alive response received (seq: {})", sequence_number);
+        // Calculate round-trip time (RTT)
+        let last_sent_timestamp = self.keep_alive_last_sent.load(Ordering::SeqCst);
+        let rtt_secs = timestamp.saturating_sub(last_sent_timestamp);
+
+        info!(
+            "✅ Keep-alive response received (seq: {}, rtt: {}s)",
+            sequence_number,
+            rtt_secs
+        );
+
+        // Warn about high latency
+        if rtt_secs > 5 {
+            warn!(
+                "⚠️ High keep-alive latency detected: {}s RTT",
+                rtt_secs
+            );
+        }
 
         // Record successful keep-alive as circuit breaker success
-        // Note: Using spawn_local or direct call instead of tokio::spawn to avoid Send issues
-        // TODO: This could be optimized with a background task queue
-        // For now, we'll skip the circuit breaker success recording to allow compilation
-        debug!("Keep-alive successful - circuit breaker success recorded");
+        // Note: Keep-alive success does NOT count toward circuit breaker metrics
+        // This is intentional because keep-alive is a maintenance operation, not data transmission
+        debug!("Keep-alive successful - circuit breaker success not recorded (intentional)");
     }
 
     pub fn check_keep_alive_timeout(&self, keep_alive_timeout_secs: u64) -> bool {
         let last_sent = self.keep_alive_last_sent.load(Ordering::SeqCst);
         let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
+        let last_transmission = self.last_transmission_time.load(Ordering::SeqCst);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         // If we've sent a keep-alive but haven't received a response within the timeout
         if last_sent > 0 && last_received < last_sent {
             let time_since_sent = now.saturating_sub(last_sent);
             if time_since_sent > keep_alive_timeout_secs {
-                warn!("Keep-alive timeout detected: {}s since last sent, no response received", time_since_sent);
+                let time_since_transmission = now.saturating_sub(last_transmission);
+                warn!(
+                    "Keep-alive timeout detected: {}s since last sent, no response received (timeout: {}s, last_transmission: {}s ago)",
+                    time_since_sent,
+                    keep_alive_timeout_secs,
+                    time_since_transmission
+                );
                 return true;
+            } else {
+                // Log detailed timing for near-timeout situations
+                debug!(
+                    "Keep-alive pending: {}s since sent, waiting for response (timeout at {}s)",
+                    time_since_sent,
+                    keep_alive_timeout_secs
+                );
             }
         }
 
@@ -3141,15 +3844,124 @@ impl VirtioSerial {
     pub fn should_send_keep_alive(&self, keep_alive_interval_secs: u64, connection_idle_timeout_secs: u64) -> bool {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let last_sent = self.keep_alive_last_sent.load(Ordering::SeqCst);
+        let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
         let last_transmission = self.last_transmission_time.load(Ordering::SeqCst);
 
-        // Send keep-alive if:
-        // 1. We haven't sent one in the keep-alive interval, AND
-        // 2. The connection has been idle for longer than the idle timeout
-        let should_send_due_to_interval = now.saturating_sub(last_sent) >= keep_alive_interval_secs;
-        let connection_idle = now.saturating_sub(last_transmission) >= connection_idle_timeout_secs;
+        // Edge case: At startup, last_sent is 0. Treat this as "not due yet" to avoid
+        // sending keep-alive immediately. The first keep-alive will be sent after the
+        // normal interval has elapsed from the first transmission.
+        if last_sent == 0 {
+            return false;
+        }
 
-        should_send_due_to_interval && connection_idle
+        // Send keep-alive every keep_alive_interval_secs regardless of connection activity
+        // This ensures the connection stays alive even during regular data transmission
+        let should_send_due_to_interval = now.saturating_sub(last_sent) >= keep_alive_interval_secs;
+
+        // Calculate diagnostic information
+        let time_since_last_sent = now.saturating_sub(last_sent);
+        let time_since_last_received = now.saturating_sub(last_received);
+        let time_since_last_transmission = now.saturating_sub(last_transmission);
+        let idle_duration = time_since_last_transmission;
+
+        // Detailed connection state logging with all timing information
+        debug!(
+            "Connection state: last_sent={}s ago, last_received={}s ago, last_transmission={}s ago, interval_threshold={}s, idle_threshold={}s",
+            time_since_last_sent,
+            time_since_last_received,
+            time_since_last_transmission,
+            keep_alive_interval_secs,
+            connection_idle_timeout_secs
+        );
+
+        // Enhanced logging for interval reached with decision reason
+        if should_send_due_to_interval {
+            info!(
+                "⏰ Keep-alive interval reached ({}s since last keep-alive) - sending keep-alive (reason: interval_expired)",
+                time_since_last_sent
+            );
+        }
+
+        // Check if connection is idle and provide enhanced logging
+        // Note: We don't track state transitions here to avoid additional atomic fields,
+        // but we log the current idle status for diagnostics
+        let is_idle = idle_duration >= connection_idle_timeout_secs;
+        if is_idle && should_send_due_to_interval {
+            warn!(
+                "💤 Connection IDLE: {}s since last transmission (threshold: {}s) - connection is inactive while sending keep-alive",
+                idle_duration,
+                connection_idle_timeout_secs
+            );
+        } else if is_idle {
+            debug!(
+                "Connection idle: {}s since last transmission (threshold: {}s)",
+                idle_duration,
+                connection_idle_timeout_secs
+            );
+        }
+
+        should_send_due_to_interval
+    }
+
+    /// Log a comprehensive summary of the keep-alive state for diagnostics
+    pub fn log_keep_alive_state_summary(&self, keep_alive_interval_secs: u64, connection_idle_timeout_secs: u64) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let last_sent = self.keep_alive_last_sent.load(Ordering::SeqCst);
+        let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
+        let last_transmission = self.last_transmission_time.load(Ordering::SeqCst);
+        let sequence = self.keep_alive_sequence.load(Ordering::SeqCst);
+
+        let time_since_last_sent = now.saturating_sub(last_sent);
+        let time_since_last_received = now.saturating_sub(last_received);
+        let time_since_last_transmission = now.saturating_sub(last_transmission);
+        let idle_duration = time_since_last_transmission;
+
+        // Determine connection status
+        let status = if idle_duration < connection_idle_timeout_secs {
+            "ACTIVE"
+        } else {
+            "IDLE"
+        };
+
+        info!(
+            "📊 Keep-Alive State Summary:\n   Status: {}\n   Last Keep-Alive Sent: {}s ago\n   Last Keep-Alive Received: {}s ago\n   Last Data Transmission: {}s ago\n   Idle Duration: {}s (threshold: {}s)\n   Keep-Alive Interval: {}s\n   Sequence: {}",
+            status,
+            time_since_last_sent,
+            time_since_last_received,
+            time_since_last_transmission,
+            idle_duration,
+            connection_idle_timeout_secs,
+            keep_alive_interval_secs,
+            sequence
+        );
+    }
+}
+
+// Drop implementation to ensure resources are cleaned up
+impl Drop for VirtioSerial {
+    fn drop(&mut self) {
+        // Close Windows handle for Global objects
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(mut win_handle) = self.windows_handle.write() {
+                if let Some(handle) = win_handle.take() {
+                    unsafe {
+                        use winapi::um::handleapi::CloseHandle;
+                        CloseHandle(handle.0);
+                    }
+                }
+            }
+        }
+
+        // Clear write handle
+        if let Ok(mut write_handle) = self.write_handle.write() {
+            let _ = write_handle.take();
+        }
+
+        // Clear read handle
+        if let Ok(mut read_handle) = self.read_handle.write() {
+            let _ = read_handle.take();
+        }
     }
 }
 
@@ -3182,6 +3994,8 @@ impl Clone for VirtioSerial {
             keep_alive_last_sent: Arc::clone(&self.keep_alive_last_sent),
             keep_alive_last_received: Arc::clone(&self.keep_alive_last_received),
             keep_alive_sequence: Arc::clone(&self.keep_alive_sequence),
+            #[cfg(target_os = "windows")]
+            windows_handle: Arc::clone(&self.windows_handle),
         }
     }
 }

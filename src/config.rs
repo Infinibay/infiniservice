@@ -59,26 +59,26 @@ pub struct Config {
     pub virtio_max_reconnect_attempts: u32,
 
     // Circuit Breaker Configuration
-    /// Number of failures before opening circuit (default: 5)
+    /// Number of failures before opening circuit (default: 15)
     pub circuit_breaker_failure_threshold: u32,
 
     /// How long circuit stays open in seconds (default: 60 seconds)
     pub circuit_breaker_open_duration_secs: u64,
 
-    /// Max calls allowed in half-open state (default: 3)
+    /// Max calls allowed in half-open state (default: 5)
     pub circuit_breaker_half_open_max_calls: u32,
 
     /// Successes needed to close circuit (default: 2)
     pub circuit_breaker_success_threshold: u32,
 
     // Keep-Alive Configuration
-    /// Heartbeat interval in seconds (default: 30 seconds)
+    /// Heartbeat interval in seconds - how often to send keep-alive messages (default: 30 seconds, env: INFINISERVICE_KEEP_ALIVE_INTERVAL)
     pub keep_alive_interval_secs: u64,
 
-    /// Heartbeat response timeout in seconds (default: 10 seconds)
+    /// Heartbeat response timeout in seconds - must be less than interval (default: 60 seconds, env: INFINISERVICE_KEEP_ALIVE_TIMEOUT)
     pub keep_alive_timeout_secs: u64,
 
-    /// Max idle time before proactive ping in seconds (default: 120 seconds)
+    /// Max idle time before proactive ping in seconds - should be >= interval (default: 30 seconds, env: INFINISERVICE_CONNECTION_IDLE_TIMEOUT)
     pub connection_idle_timeout_secs: u64,
 
     // Graceful Degradation Settings
@@ -119,15 +119,15 @@ impl Default for Config {
             virtio_max_reconnect_attempts: 15, // 15 attempts (increased from typical 10)
 
             // Circuit Breaker defaults
-            circuit_breaker_failure_threshold: 5, // 5 failures before opening circuit
+            circuit_breaker_failure_threshold: 15, // 15 failures before opening circuit (3x tolerance for Windows Global objects)
             circuit_breaker_open_duration_secs: 60, // Circuit stays open for 60 seconds
-            circuit_breaker_half_open_max_calls: 3, // Allow 3 calls in half-open state
+            circuit_breaker_half_open_max_calls: 5, // Allow 5 calls in half-open state (better recovery confidence)
             circuit_breaker_success_threshold: 2, // 2 successes needed to close circuit
 
             // Keep-Alive defaults
             keep_alive_interval_secs: 30, // Send heartbeat every 30 seconds
-            keep_alive_timeout_secs: 10, // 10 second timeout for heartbeat response
-            connection_idle_timeout_secs: 120, // 120 seconds idle before proactive ping
+            keep_alive_timeout_secs: 60, // 60 second timeout for heartbeat response (increased from 10s for reliability)
+            connection_idle_timeout_secs: 30, // 30 seconds idle before proactive ping
 
             // Graceful Degradation defaults
             degraded_mode_collection_interval_secs: 120, // Slower collection when degraded
@@ -258,15 +258,20 @@ impl Config {
         if self.keep_alive_timeout_secs > 60 {
             self.keep_alive_timeout_secs = 60; // Cap at 1 minute
         }
+        // Timeout must be less than interval to detect failures before next keep-alive
         if self.keep_alive_timeout_secs >= self.keep_alive_interval_secs {
-            self.keep_alive_timeout_secs = self.keep_alive_interval_secs / 2; // Timeout should be less than interval
+            self.keep_alive_timeout_secs = self.keep_alive_interval_secs / 2;
         }
 
-        if self.connection_idle_timeout_secs < 60 {
-            self.connection_idle_timeout_secs = 60; // Minimum 1 minute
+        if self.connection_idle_timeout_secs < 30 {
+            self.connection_idle_timeout_secs = 30; // Minimum 30 seconds
         }
         if self.connection_idle_timeout_secs > 1800 {
             self.connection_idle_timeout_secs = 1800; // Cap at 30 minutes
+        }
+        // Idle timeout should be at least as long as keep-alive interval
+        if self.connection_idle_timeout_secs < self.keep_alive_interval_secs {
+            self.connection_idle_timeout_secs = self.keep_alive_interval_secs;
         }
 
         // Graceful Degradation validation
@@ -313,6 +318,6 @@ impl Config {
         // Keep-Alive development mode settings
         self.keep_alive_interval_secs = 15; // More frequent heartbeats for faster detection
         self.keep_alive_timeout_secs = 5; // Shorter timeout for faster failure detection
-        self.connection_idle_timeout_secs = 60; // Shorter idle timeout for more proactive pinging
+        self.connection_idle_timeout_secs = 30; // Shorter idle timeout for more proactive pinging
     }
 }

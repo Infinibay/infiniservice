@@ -19,7 +19,7 @@ pub enum ConnectionState {
     Monitoring,
     CircuitBreakerOpen,  // Connection blocked by circuit breaker
     Degraded,           // Operating in reduced functionality mode
-    KeepAliveTimeout,   // Connection lost due to heartbeat failure
+    KeepAliveTimeout,   // Connection lost due to heartbeat failure - backend stopped responding to keep-alive messages within the configured timeout period
 }
 
 // Service-level diagnostic structures
@@ -371,6 +371,17 @@ impl InfiniService {
                     _ = keep_alive_interval.tick(), if self.virtio_connected => {
                         // Check for keep-alive timeout first
                         if self.communication.check_keep_alive_timeout(self.config.keep_alive_timeout_secs) {
+                            // Log detailed state before marking as disconnected
+                            self.communication.log_keep_alive_state_summary(
+                                self.config.keep_alive_interval_secs,
+                                self.config.connection_idle_timeout_secs
+                            );
+                            error!(
+                                "💔 Keep-alive timeout detected - connection lost (failures: {}, last_successful_transmission: {:?})",
+                                self.service_metrics.keep_alive_failures,
+                                self.connection_diagnostics.last_successful_metrics_transmission
+                            );
+                            info!("ℹ️ Backend will detect keep-alive failure through its own monitoring system");
                             warn!("Keep-alive timeout detected - connection lost");
                             self.virtio_connected = false;
                             self.service_metrics.keep_alive_failures += 1;
@@ -388,6 +399,14 @@ impl InfiniService {
                                     // Don't immediately disconnect, let health check handle it
                                 }
                             }
+                        }
+
+                        // Log periodic keep-alive state summary (every 10 iterations)
+                        if self.service_metrics.total_collections % 10 == 0 && self.service_metrics.total_collections > 0 {
+                            self.communication.log_keep_alive_state_summary(
+                                self.config.keep_alive_interval_secs,
+                                self.config.connection_idle_timeout_secs
+                            );
                         }
                     }
 
@@ -534,6 +553,17 @@ impl InfiniService {
                     _ = keep_alive_interval.tick(), if self.virtio_connected => {
                         // Check for keep-alive timeout first
                         if self.communication.check_keep_alive_timeout(self.config.keep_alive_timeout_secs) {
+                            // Log detailed state before marking as disconnected
+                            self.communication.log_keep_alive_state_summary(
+                                self.config.keep_alive_interval_secs,
+                                self.config.connection_idle_timeout_secs
+                            );
+                            error!(
+                                "💔 Keep-alive timeout detected - connection lost (failures: {}, last_successful_transmission: {:?})",
+                                self.service_metrics.keep_alive_failures,
+                                self.connection_diagnostics.last_successful_metrics_transmission
+                            );
+                            info!("ℹ️ Backend will detect keep-alive failure through its own monitoring system");
                             warn!("Keep-alive timeout detected - connection lost");
                             self.virtio_connected = false;
                             self.service_metrics.keep_alive_failures += 1;
@@ -551,6 +581,14 @@ impl InfiniService {
                                     // Don't immediately disconnect, let health check handle it
                                 }
                             }
+                        }
+
+                        // Log periodic keep-alive state summary (every 10 iterations)
+                        if self.service_metrics.total_collections % 10 == 0 && self.service_metrics.total_collections > 0 {
+                            self.communication.log_keep_alive_state_summary(
+                                self.config.keep_alive_interval_secs,
+                                self.config.connection_idle_timeout_secs
+                            );
                         }
                     }
 
@@ -1083,6 +1121,13 @@ impl InfiniService {
                     ("degraded", "Service operating with reduced functionality due to connection issues")
                 }
                 ConnectionState::KeepAliveTimeout => {
+                    warn!("⚠️ Connection state change: {:?} -> {:?} due to keep-alive timeout (total_failures: {})",
+                          old_state, new_state, self.service_metrics.keep_alive_failures);
+                    // Log detailed state summary for diagnostics
+                    self.communication.log_keep_alive_state_summary(
+                        self.config.keep_alive_interval_secs,
+                        self.config.connection_idle_timeout_secs
+                    );
                     warn!("💔 Keep-alive timeout - connection lost");
                     self.service_metrics.keep_alive_failures += 1;
                     ("keep_alive_timeout", "Connection lost due to keep-alive timeout")
@@ -1393,6 +1438,7 @@ impl InfiniService {
             (ConnectionState::Connected, ConnectionState::ConnectedPendingIPs) => "ips_lost".to_string(),
             (_, ConnectionState::Retrying(backoff)) => format!("retry_scheduled_{}s", backoff),
             (_, ConnectionState::Monitoring) => "device_change_detected".to_string(),
+            (_, ConnectionState::KeepAliveTimeout) => "keep_alive_timeout".to_string(),
             _ => "state_transition".to_string(),
         }
     }
@@ -1428,6 +1474,12 @@ impl InfiniService {
         } else {
             info!("  ⏰ Last Success: Never");
         }
+
+        // Log keep-alive state summary
+        self.communication.log_keep_alive_state_summary(
+            self.config.keep_alive_interval_secs,
+            self.config.connection_idle_timeout_secs
+        );
     }
 
     fn log_final_service_summary(&self) {

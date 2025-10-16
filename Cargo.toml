@@ -39,6 +39,7 @@ uuid = { version = "1.0", features = ["v4"] }
 
 # Async trait support
 async-trait = "0.1"
+async-recursion = "1.0"
 
 # Configuration
 config = "0.14"

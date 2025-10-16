@@ -100,6 +100,131 @@ watcher.on('add', (path) => {
 });
 ```
 
+## Configuration and Environment Variables
+
+### Keep-Alive and Timeout Configuration
+
+Maintaining persistent connections between the backend and InfiniService is critical for real-time monitoring and command execution. The keep-alive mechanism ensures connections remain active even during periods of low activity, preventing unexpected disconnections and ensuring reliable communication.
+
+The system uses a bidirectional keep-alive approach where both the backend and InfiniService send periodic heartbeat messages to each other. This redundancy provides robust connection health monitoring and quick failure detection.
+
+### Recommended Timeout Values
+
+The following values are optimized for maintaining stable, persistent connections without interruptions:
+
+| Parameter | Recommended Value | Description |
+|-----------|-------------------|-------------|
+| `keep_alive_interval` | 30 seconds | Frequency of keep-alive message transmission |
+| `keep_alive_timeout` | 15 seconds | Maximum wait time for keep-alive response (must be < interval) |
+| `connection_idle_timeout` | 30 seconds | Maximum inactivity period before proactive ping |
+| `message_timeout` | 300 seconds (5 min) | Timeout for long-running operations like health checks |
+| `ping_interval` | 60 seconds (1 min) | Frequency of periodic health monitoring |
+
+**Note:** These values are optimized to maintain persistent connections without interruptions, even during periods of low activity. They provide a balance between quick failure detection and network efficiency.
+
+### InfiniService Environment Variables
+
+Configure InfiniService behavior using the following environment variables (all optional, defaults shown):
+
+| Variable | Description | Default | Unit |
+|----------|-------------|---------|------|
+| `INFINISERVICE_KEEP_ALIVE_INTERVAL` | Interval for sending keep-alive messages | 30 | seconds |
+| `INFINISERVICE_KEEP_ALIVE_TIMEOUT` | Timeout for keep-alive response | 60 | seconds |
+| `INFINISERVICE_CONNECTION_IDLE_TIMEOUT` | Maximum idle time before proactive ping | 30 | seconds |
+| `INFINISERVICE_MIN_BACKOFF` | Minimum reconnection backoff interval | 5 | seconds |
+| `INFINISERVICE_MAX_BACKOFF` | Maximum reconnection backoff interval | 300 | seconds |
+| `INFINISERVICE_CONNECTION_TIMEOUT` | Connection establishment timeout | 10 | seconds |
+| `INFINISERVICE_READ_TIMEOUT` | Socket read timeout | 500 | milliseconds |
+| `INFINISERVICE_DEVICE` | VirtIO-serial device path | auto-detect | path |
+| `INFINISERVICE_REQUIRE_VIRTIO` | Whether VirtIO device is required | false | boolean |
+
+**Note:** All variables are optional. If not specified, default values are used.
+
+### Backend Environment Variables
+
+Configure backend VirtIO socket watcher behavior using these environment variables:
+
+| Variable | Description | Default | Unit |
+|----------|-------------|---------|------|
+| `VIRTIO_KEEP_ALIVE_INTERVAL_MS` | Keep-alive transmission interval from backend | 30000 | milliseconds |
+| `VIRTIO_PING_INTERVAL_MS` | Health monitoring check interval | 60000 | milliseconds |
+| `VIRTIO_MESSAGE_TIMEOUT_MS` | Timeout for long-running messages | 300000 | milliseconds |
+| `VIRTIO_MAX_RECONNECT_ATTEMPTS` | Maximum reconnection attempts | 15 | number |
+| `VIRTIO_RECONNECT_BASE_DELAY_MS` | Base delay for reconnection backoff | 3000 | milliseconds |
+| `VIRTIO_MAX_RECONNECT_DELAY_MS` | Maximum reconnection backoff delay | 120000 | milliseconds |
+
+**Important:** Backend uses milliseconds while InfiniService uses seconds. Ensure proper conversion when configuring matching values.
+
+### Configuration Examples
+
+#### Production Environment (Default Values)
+
+Stable configuration for production deployments:
+
+```bash
+# InfiniService (in the VM)
+export INFINISERVICE_KEEP_ALIVE_INTERVAL=30
+export INFINISERVICE_KEEP_ALIVE_TIMEOUT=60
+export INFINISERVICE_CONNECTION_IDLE_TIMEOUT=30
+
+# Backend
+export VIRTIO_KEEP_ALIVE_INTERVAL_MS=30000
+export VIRTIO_PING_INTERVAL_MS=60000
+export VIRTIO_MESSAGE_TIMEOUT_MS=300000
+```
+
+#### Development Environment (Faster Detection)
+
+Faster failure detection for development and testing:
+
+```bash
+# InfiniService (in the VM)
+export INFINISERVICE_KEEP_ALIVE_INTERVAL=15
+export INFINISERVICE_KEEP_ALIVE_TIMEOUT=5
+export INFINISERVICE_CONNECTION_IDLE_TIMEOUT=30
+
+# Backend
+export VIRTIO_KEEP_ALIVE_INTERVAL_MS=15000
+export VIRTIO_PING_INTERVAL_MS=30000
+export VIRTIO_MESSAGE_TIMEOUT_MS=300000
+```
+
+#### Slow/Unreliable Networks (Extended Timeouts)
+
+Configuration for high-latency or unreliable network conditions:
+
+```bash
+# InfiniService (in the VM)
+export INFINISERVICE_KEEP_ALIVE_INTERVAL=60
+export INFINISERVICE_KEEP_ALIVE_TIMEOUT=60
+export INFINISERVICE_CONNECTION_IDLE_TIMEOUT=60
+
+# Backend
+export VIRTIO_KEEP_ALIVE_INTERVAL_MS=60000
+export VIRTIO_PING_INTERVAL_MS=120000
+export VIRTIO_MESSAGE_TIMEOUT_MS=1800000
+```
+
+### Validation Rules
+
+InfiniService automatically validates and adjusts configuration values at startup to ensure consistency:
+
+1. **Keep-alive timeout constraint:** `keep_alive_timeout_secs` must be less than `keep_alive_interval_secs`
+   - If violated, automatically adjusted to `interval / 2`
+
+2. **Idle timeout constraint:** `connection_idle_timeout_secs` must be ≥ `keep_alive_interval_secs`
+   - If violated, automatically adjusted to match `keep_alive_interval_secs`
+
+3. **Interval bounds:** `keep_alive_interval_secs` must be between 10 and 300 seconds
+
+4. **Timeout bounds:** `keep_alive_timeout_secs` must be between 5 and 60 seconds
+
+**⚠️ Warning:** If configured values violate validation rules, they will be automatically adjusted at service startup. Check logs for final applied values:
+
+```
+[INFO] Keep-alive configuration: interval=30s, timeout=15s, idle_timeout=30s
+```
+
 ## Message Processing
 
 ### Incoming Message Flow
@@ -417,14 +542,58 @@ async deleteVm(vmId: string): Promise<void> {
 setInterval(() => {
   for (const [vmId, connection] of this.connections) {
     const lastSeen = Date.now() - connection.lastMessageTime;
-    
-    if (lastSeen > 60000) { // 1 minute timeout
+
+    if (lastSeen > 300000) { // 5 minutes timeout (configurable via VIRTIO_MESSAGE_TIMEOUT_MS)
       this.logger.warn(`VM ${vmId} appears offline`);
       this.handleVmOffline(vmId);
     }
   }
-}, 30000); // Check every 30 seconds
+}, 60000); // Check every 60 seconds (configurable via VIRTIO_PING_INTERVAL_MS)
 ```
+
+### Bidirectional Keep-Alive
+
+The system implements a bidirectional keep-alive mechanism to ensure robust connection health monitoring. Both the backend and InfiniService actively maintain the connection by sending periodic heartbeat messages.
+
+**Keep-Alive Flow:**
+
+```
+Backend                    InfiniService
+   |                              |
+   |---keep_alive_request(30s)-->|
+   |<------keep_alive-------------|
+   |---keep_alive_response------->|
+   |                              |
+   |<------keep_alive(30s)--------|
+   |---keep_alive_response------->|
+   |                              |
+   |    (cycle repeats)           |
+```
+
+**Behavior:**
+
+1. **Backend → InfiniService:**
+   - Backend sends `keep_alive_request` every 30 seconds (configurable via `VIRTIO_KEEP_ALIVE_INTERVAL_MS`)
+   - InfiniService responds with `keep_alive` message
+   - Backend sends `keep_alive_response` to acknowledge
+
+2. **InfiniService → Backend:**
+   - InfiniService sends `keep_alive` proactively every 30 seconds (configurable via `INFINISERVICE_KEEP_ALIVE_INTERVAL`)
+   - Backend responds with `keep_alive_response`
+
+3. **Failure Detection:**
+   - If no response is received within the timeout period, the connection is considered failed
+   - Both sides can independently detect connection failures
+   - Failed connections trigger automatic reconnection logic
+
+**Benefits:**
+
+- **Redundancy:** Either side can detect connection failures independently
+- **Active Connections:** Prevents idle timeout disconnections at the OS/network level
+- **Quick Detection:** Failures are detected within one keep-alive interval
+- **Reliability:** Works even if one side's keep-alive mechanism fails
+
+This bidirectional approach ensures that connections remain active even during periods of low activity, preventing unexpected disconnections and ensuring reliable real-time communication between the backend and VMs.
 
 ### Metrics Validation
 

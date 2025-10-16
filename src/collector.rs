@@ -1859,8 +1859,6 @@ impl DataCollector {
     /// Enhanced PowerShell-based IP collection for Windows with multiple fallback methods
     #[cfg(target_os = "windows")]
     fn collect_interface_ips_powershell(&self) -> Option<HashMap<InterfaceKey, Vec<String>>> {
-        use std::process::Command;
-
         // Method 1: Try modern PowerShell cmdlet (most reliable)
         if let Some(result) = self.try_powershell_get_netipaddress() {
             info!("Used Get-NetIPAddress for IP collection");
