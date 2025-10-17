@@ -7,6 +7,7 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc, Timelike, Datelike, TimeZone};
 
 #[cfg(target_os = "windows")]
 use wmi::{COMLibrary, WMIConnection};
@@ -50,6 +51,13 @@ pub struct UpdateAgentStatus {
     pub version: String,
 }
 
+/// Operating System information from Win32_OperatingSystem
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct OperatingSystemInfo {
+    #[serde(rename = "LastBootUpTime")]
+    pub last_boot_up_time: Option<String>,
+}
+
 /// Complete Windows Update status
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UpdateStatus {
@@ -59,6 +67,8 @@ pub struct UpdateStatus {
     pub update_agent_version: Option<String>,
     pub automatic_updates_enabled: bool,
     pub reboot_required: bool,
+    /// RFC3339/ISO-8601 timestamp string when reboot became required (last boot time)
+    pub reboot_required_since: Option<String>,
 }
 
 /// Check Windows Updates using WMI and COM API
@@ -67,7 +77,7 @@ pub async fn check_windows_updates() -> Result<UpdateStatus> {
     log::info!("Checking Windows Updates via WMI and COM API");
     
     // Collect all WMI data in a separate scope
-    let (installed_updates, update_agent_version, reboot_required, automatic_updates_enabled) = {
+    let (installed_updates, update_agent_version, reboot_required, reboot_required_since, automatic_updates_enabled) = {
         let com_lib = COMLibrary::new()
             .map_err(|e| anyhow!("Failed to initialize COM library: {:?}", e))?;
         
@@ -88,16 +98,16 @@ pub async fn check_windows_updates() -> Result<UpdateStatus> {
                 None
             });
         
-        // Check if reboot is required
-        let reboot_required = check_reboot_required(&wmi_conn)
-            .unwrap_or(false);
-        
+        // Check if reboot is required and get last boot time
+        let (reboot_required, reboot_required_since) = check_reboot_required(&wmi_conn)
+            .unwrap_or((false, None));
+
         // Check automatic updates setting
         let automatic_updates_enabled = check_automatic_updates(&wmi_conn)
             .unwrap_or(false);
-        
+
         // Return all data before scope ends, dropping com_lib and wmi_conn
-        (installed_updates, update_agent_version, reboot_required, automatic_updates_enabled)
+        (installed_updates, update_agent_version, reboot_required, reboot_required_since, automatic_updates_enabled)
     };
     
     // Now do async operations - com_lib and wmi_conn are out of scope
@@ -115,6 +125,7 @@ pub async fn check_windows_updates() -> Result<UpdateStatus> {
         update_agent_version,
         automatic_updates_enabled,
         reboot_required,
+        reboot_required_since,
     })
 }
 
@@ -269,27 +280,87 @@ fn get_kb_article_ids(update: &IUpdate) -> Result<Vec<String>> {
     Ok(kb_ids)
 }
 
-/// Check if reboot is required using registry
+/// Check if reboot is required using registry and get last boot time
 #[cfg(target_os = "windows")]
-fn check_reboot_required(wmi_conn: &WMIConnection) -> Result<bool> {
+fn check_reboot_required(wmi_conn: &WMIConnection) -> Result<(bool, Option<String>)> {
     // Check common registry keys that indicate pending reboot
+    // Using multiple detection methods for robustness as Win32_Registry may be unreliable
     let registry_queries = vec![
         "SELECT * FROM Win32_Registry WHERE Hive='HKEY_LOCAL_MACHINE' AND KeyPath='SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired'",
         "SELECT * FROM Win32_Registry WHERE Hive='HKEY_LOCAL_MACHINE' AND KeyPath='SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending'",
     ];
-    
+
+    let mut reboot_required = false;
+
     for query in registry_queries {
         match wmi_conn.raw_query::<serde_json::Value>(query) {
             Ok(results) => {
                 if !results.is_empty() {
-                    return Ok(true);
+                    reboot_required = true;
+                    log::debug!("Reboot detected via WMI registry query");
+                    break;
                 }
             }
-            Err(_) => continue,
+            Err(e) => {
+                log::debug!("WMI registry query failed (expected if key doesn't exist): {}", e);
+                continue;
+            }
         }
     }
-    
-    Ok(false)
+
+    // Fallback: Check using PowerShell for more reliable detection
+    if !reboot_required {
+        reboot_required = check_reboot_via_powershell().unwrap_or(false);
+    }
+
+    // If reboot is required, get the last boot time as RFC3339 string
+    let reboot_required_since = if reboot_required {
+        match get_last_boot_time(wmi_conn) {
+            Ok(Some(boot_time_rfc3339)) => {
+                log::info!("Reboot required since last boot at: {}", boot_time_rfc3339);
+                Some(boot_time_rfc3339)
+            }
+            Ok(None) => {
+                log::warn!("Reboot required but could not determine last boot time");
+                None
+            }
+            Err(e) => {
+                log::warn!("Failed to get last boot time: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok((reboot_required, reboot_required_since))
+}
+
+/// Get the last boot time from Win32_OperatingSystem as RFC3339 string
+#[cfg(target_os = "windows")]
+fn get_last_boot_time(wmi_conn: &WMIConnection) -> Result<Option<String>> {
+    log::debug!("Querying last boot time from Win32_OperatingSystem");
+
+    let os_info: Vec<OperatingSystemInfo> = wmi_conn
+        .raw_query("SELECT LastBootUpTime FROM Win32_OperatingSystem")
+        .map_err(|e| anyhow!("Failed to query Win32_OperatingSystem: {:?}", e))?;
+
+    if let Some(info) = os_info.first() {
+        if let Some(ref last_boot_time_str) = info.last_boot_up_time {
+            match parse_wmi_datetime_to_rfc3339(last_boot_time_str) {
+                Ok(boot_time_rfc3339) => {
+                    log::debug!("Successfully parsed last boot time: {}", boot_time_rfc3339);
+                    return Ok(Some(boot_time_rfc3339));
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse LastBootUpTime '{}': {}", last_boot_time_str, e);
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Check if automatic updates are enabled
@@ -411,9 +482,139 @@ fn format_wmi_date(timestamp: u64) -> String {
     // This is a simplified conversion
     let datetime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp);
     let _system_time: SystemTime = datetime;
-    
+
     // For now, return a basic format - in real implementation we'd format properly
     format!("{:010}", timestamp)
+}
+
+/// Parse WMI DMTF datetime format to RFC3339 string
+/// WMI/DMTF datetime format: YYYYMMDDHHMMSS.mmmmmm+UUU
+/// Example: "20240115103045.500000-480" (UTC-8 hours = 480 minutes)
+/// Returns: RFC3339/ISO-8601 string like "2024-01-15T10:30:45.500000-08:00"
+fn parse_wmi_datetime_to_rfc3339(wmi_date: &str) -> Result<String> {
+    // WMI DMTF format: YYYYMMDDHHMMSS.ffffff+UUU
+    // UUU is UTC offset in minutes (can be negative, indicated by +/-)
+
+    if wmi_date.len() < 21 {
+        return Err(anyhow!("Invalid WMI datetime format: expected at least 21 chars, got {}", wmi_date.len()));
+    }
+
+    // Parse date/time components
+    let year: i32 = wmi_date[0..4].parse()
+        .map_err(|_| anyhow!("Invalid year in WMI datetime"))?;
+    let month: u32 = wmi_date[4..6].parse()
+        .map_err(|_| anyhow!("Invalid month in WMI datetime"))?;
+    let day: u32 = wmi_date[6..8].parse()
+        .map_err(|_| anyhow!("Invalid day in WMI datetime"))?;
+    let hour: u32 = wmi_date[8..10].parse()
+        .map_err(|_| anyhow!("Invalid hour in WMI datetime"))?;
+    let minute: u32 = wmi_date[10..12].parse()
+        .map_err(|_| anyhow!("Invalid minute in WMI datetime"))?;
+    let second: u32 = wmi_date[12..14].parse()
+        .map_err(|_| anyhow!("Invalid second in WMI datetime"))?;
+
+    // Parse microseconds (after decimal point)
+    let microseconds: u32 = if wmi_date.len() > 15 && &wmi_date[14..15] == "." {
+        wmi_date[15..21].parse()
+            .map_err(|_| anyhow!("Invalid microseconds in WMI datetime"))?
+    } else {
+        0
+    };
+
+    // Parse UTC offset in minutes (format: +UUU or -UUU)
+    let offset_sign = &wmi_date[21..22];
+    let offset_minutes: i32 = wmi_date[22..25].parse()
+        .map_err(|_| anyhow!("Invalid UTC offset in WMI datetime"))?;
+
+    let offset_minutes_signed = match offset_sign {
+        "+" => offset_minutes,
+        "-" => -offset_minutes,
+        _ => return Err(anyhow!("Invalid offset sign: {}", offset_sign)),
+    };
+
+    // Construct DateTime with FixedOffset using chrono
+    // FixedOffset expects seconds (east of UTC), WMI provides minutes
+    let offset = FixedOffset::east_opt(offset_minutes_signed * 60)
+        .ok_or_else(|| anyhow!("Invalid timezone offset: {} minutes", offset_minutes_signed))?;
+
+    // Create NaiveDateTime first (this represents local time in the given timezone)
+    let naive_dt = NaiveDateTime::new(
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .ok_or_else(|| anyhow!("Invalid date: {}-{:02}-{:02}", year, month, day))?,
+        chrono::NaiveTime::from_hms_micro_opt(hour, minute, second, microseconds)
+            .ok_or_else(|| anyhow!("Invalid time: {:02}:{:02}:{:02}.{:06}", hour, minute, second, microseconds))?
+    );
+
+    // Create DateTime from local datetime and offset
+    // The WMI datetime is local time in the specified timezone
+    let dt_with_offset = offset.from_local_datetime(&naive_dt)
+        .single()
+        .ok_or_else(|| anyhow!("Ambiguous or invalid local datetime"))?;
+
+    // Convert to RFC3339 string
+    Ok(dt_with_offset.to_rfc3339())
+}
+
+/// Check if reboot is required using PowerShell registry queries (fallback method)
+/// More reliable than WMI Win32_Registry queries which may fail
+#[cfg(target_os = "windows")]
+fn check_reboot_via_powershell() -> Result<bool> {
+    use std::process::Command;
+
+    log::debug!("Checking reboot requirement via PowerShell");
+
+    let powershell_cmd = r#"
+        $rebootRequired = $false
+
+        # Check Windows Update RebootRequired key
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+            $rebootRequired = $true
+        }
+
+        # Check Component Based Servicing RebootPending key
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+            $rebootRequired = $true
+        }
+
+        # Check PendingFileRenameOperations
+        try {
+            $pfro = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue
+            if ($pfro) {
+                $rebootRequired = $true
+            }
+        } catch { }
+
+        if ($rebootRequired) {
+            Write-Output "true"
+        } else {
+            Write-Output "false"
+        }
+    "#;
+
+    match Command::new("powershell")
+        .args(&["-NoProfile", "-NonInteractive", "-Command", powershell_cmd])
+        .output()
+    {
+        Ok(output) => {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            let result = output_str.trim();
+
+            log::debug!("PowerShell reboot check result: '{}'", result);
+
+            match result {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => {
+                    log::warn!("Unexpected PowerShell reboot check output: {}", result);
+                    Ok(false)
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to execute PowerShell reboot check: {}", e);
+            Err(anyhow!("PowerShell execution failed: {}", e))
+        }
+    }
 }
 
 /// Non-Windows implementation (stub)
