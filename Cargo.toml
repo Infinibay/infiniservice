@@ -1,6 +1,6 @@
 [package]
 name = "infiniservice"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Infinibay Team"]
 description = "Multiplatform background service for VM data collection and communication via virtio-serial"
