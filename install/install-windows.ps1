@@ -4,7 +4,7 @@
 param(
     [string]$ServiceMode = "normal",
     [string]$VmId = $null,
-    [string]$InstallPath = "C:\Program Files\Infiniservice"
+    [string]$InstallPath = "$env:ProgramFiles\Infiniservice"
 )
 
 # Initialize logging

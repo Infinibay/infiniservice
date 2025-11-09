@@ -1643,7 +1643,7 @@ dependencies = [
 
 [[package]]
 name = "infiniservice"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "apt-pkg-native",

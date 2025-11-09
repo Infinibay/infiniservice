@@ -48,6 +48,10 @@ pub enum IncomingMessage {
     /// Keep-alive response from backend
     #[serde(rename = "keep_alive_response")]
     KeepAliveResponse(KeepAliveResponse),
+
+    /// Pending scripts response from host
+    #[serde(rename = "pending_scripts_response")]
+    PendingScriptsResponse(PendingScriptsResponse),
 }
 
 /// Safe command request with validated operations
@@ -180,6 +184,85 @@ pub struct KeepAliveResponse {
 
     /// Timestamp when the response was generated
     pub timestamp: String,
+}
+
+/// Request for pending scripts from the host
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RequestPendingScripts {
+    /// VM ID for which scripts are requested
+    pub vm_id: String,
+
+    /// Timestamp when the request was generated
+    pub timestamp: String,
+
+    /// Request timestamp (duplicate for compatibility)
+    pub request_timestamp: String,
+}
+
+/// Pending scripts response from the host
+///
+/// NOTE: Script scheduling is enforced entirely server-side. The host maintains
+/// schedule state and determines which scripts to return based on scheduledFor
+/// timestamps and repeat intervals. InfiniService executes all returned scripts
+/// blindly without performing local schedule validation. The host will re-queue
+/// repeating scripts for subsequent boots as needed.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PendingScriptsResponse {
+    /// Timestamp when the response was generated
+    pub timestamp: String,
+
+    /// List of pending scripts to execute
+    pub scripts: Vec<PendingScriptInfo>,
+}
+
+/// Information about a pending script to execute
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PendingScriptInfo {
+    /// Unique execution ID for tracking
+    pub execution_id: String,
+
+    /// Script ID reference
+    pub script_id: String,
+
+    /// Human-readable script name
+    pub script_name: String,
+
+    /// Script content to execute (interpolated)
+    pub script_content: String,
+
+    /// Shell to use for execution
+    pub shell: String,
+
+    /// Execution type (IMMEDIATE, SCHEDULED, etc.)
+    pub execution_type: String,
+
+    /// Input values for script interpolation
+    pub input_values: serde_json::Value,
+
+    /// Timeout in seconds
+    pub timeout_seconds: u32,
+
+    /// Optional user to run as
+    pub run_as: Option<String>,
+}
+
+/// Script completion message sent to host
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ScriptCompletionMessage {
+    /// Execution ID for correlation
+    pub execution_id: String,
+
+    /// Exit code from script execution
+    pub exit_code: i32,
+
+    /// Standard output
+    pub stdout: String,
+
+    /// Standard error
+    pub stderr: String,
+
+    /// Optional log file path
+    pub log_file: Option<String>,
 }
 
 /// Command execution response

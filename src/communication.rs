@@ -1845,11 +1845,59 @@ impl VirtioSerial {
     /// Send a command response to the host
     pub async fn send_command_response(&self, response: &CommandResponse) -> Result<()> {
         debug!("Sending command response: id={}, success={}", response.id, response.success);
-        
+
         let serialized = serde_json::to_string(&response)
             .with_context(|| "Failed to serialize command response")?;
 
         self.send_raw_message(&serialized, true).await
+    }
+
+    /// Send a request for pending scripts to the host
+    pub async fn request_pending_scripts(&self, vm_id: &str) -> Result<()> {
+        info!("Requesting pending scripts for VM: {}", vm_id);
+
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let request = crate::commands::RequestPendingScripts {
+            vm_id: vm_id.to_string(),
+            timestamp: timestamp.clone(),
+            request_timestamp: timestamp,
+        };
+
+        let mut request_json = serde_json::to_value(&request)
+            .with_context(|| "Failed to serialize request_pending_scripts")?;
+
+        // Add the "type" field to the JSON
+        if let Some(obj) = request_json.as_object_mut() {
+            obj.insert("type".to_string(), serde_json::Value::String("request_pending_scripts".to_string()));
+        }
+
+        let message_str = serde_json::to_string(&request_json)
+            .with_context(|| "Failed to serialize request to string")?;
+
+        debug!("Sending pending scripts request: {}", message_str);
+
+        self.send_raw_message(&message_str, true).await
+    }
+
+    /// Send a script completion message to the host
+    pub async fn send_script_completion(&self, completion: &crate::commands::ScriptCompletionMessage) -> Result<()> {
+        info!("Sending script completion: execution_id={}, exit_code={}",
+              completion.execution_id, completion.exit_code);
+
+        let completion_message = serde_json::json!({
+            "type": "script_completion",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "execution_id": completion.execution_id,
+            "exit_code": completion.exit_code,
+            "stdout": completion.stdout,
+            "stderr": completion.stderr,
+            "log_file": completion.log_file,
+        });
+
+        let message_str = completion_message.to_string();
+        debug!("Sending script completion: {}", message_str);
+
+        self.send_raw_message(&message_str, true).await
     }
 
     /// Classify Windows error codes for intelligent retry logic
@@ -3102,6 +3150,9 @@ impl VirtioSerial {
                         debug!("Received keep-alive response: seq={}", response.sequence_number);
                         self.handle_keep_alive_response(response.sequence_number);
                     }
+                    IncomingMessage::PendingScriptsResponse(response) => {
+                        info!("Received pending scripts response: {} scripts", response.scripts.len());
+                    }
                 }
                 Ok(Some(msg))
             }
@@ -3141,6 +3192,11 @@ impl VirtioSerial {
     /// Check if there is an established persistent connection
     pub fn is_connected(&self) -> bool {
         self.is_connected.load(Ordering::SeqCst)
+    }
+
+    /// Get the VM ID
+    pub fn vm_id(&self) -> &str {
+        &self.vm_id
     }
 
     /// Send connection status updates to host

@@ -54,6 +54,9 @@ All messages are JSON objects with newline delimiters:
 | `error` | VM → Host | Error reporting |
 | `command` | Host → VM | Command request |
 | `response` | VM → Host | Command response |
+| `request_pending_scripts` | VM → Host | Request pending script executions |
+| `pending_scripts_response` | Host → VM | Response with pending scripts to execute |
+| `script_completion` | VM → Host | Script execution completion notification |
 
 ## Protocol Messages
 
@@ -331,6 +334,71 @@ Unsafe commands allow raw command execution with full control:
 ```
 
 **Note**: The `id` field is mandatory for tracking command responses. Without it, the host cannot correlate responses with requests.
+
+### 6. Request Pending Scripts (VM → Host)
+
+Sent by InfiniService on boot or periodically to request pending script executions:
+
+```json
+{
+  "type": "request_pending_scripts",
+  "timestamp": "2024-01-15T10:30:00Z",
+  "vm_id": "550e8400-e29b-41d4-a716-446655440000",
+  "request_timestamp": "2024-01-15T10:30:00Z"
+}
+```
+
+### 7. Pending Scripts Response (Host → VM)
+
+Host responds with scripts that are ready to execute:
+
+```json
+{
+  "type": "pending_scripts_response",
+  "timestamp": "2024-01-15T10:30:01Z",
+  "scripts": [
+    {
+      "execution_id": "exec-123e4567-e89b-12d3-a456-426614174000",
+      "script_id": "script-987f6543-a21b-34c5-d678-123456789abc",
+      "script_name": "Install Software",
+      "script_content": "# Interpolated script content here\nWrite-Host 'Installing...'",
+      "shell": "POWERSHELL",
+      "execution_type": "FIRST_BOOT",
+      "input_values": {"version": "1.2.3"},
+      "timeout_seconds": 600,
+      "run_as": "administrator"
+    }
+  ]
+}
+```
+
+**Scheduling Behavior:**
+- Scripts with `scheduledFor` NULL or past date are returned immediately
+- Scripts with future `scheduledFor` are not returned until that time
+- Repeating scripts (with `repeatIntervalMinutes`) are returned if enough time has passed since `lastExecutedAt`
+- InfiniService should execute each script and send `script_completion` message for each `execution_id`
+
+### 8. Script Completion (VM → Host)
+
+Sent after a script execution completes:
+
+```json
+{
+  "type": "script_completion",
+  "timestamp": "2024-01-15T10:35:00Z",
+  "execution_id": "exec-123e4567-e89b-12d3-a456-426614174000",
+  "exit_code": 0,
+  "stdout": "Installation completed successfully",
+  "stderr": "",
+  "log_file": "C:\\ProgramData\\InfiniService\\logs\\script-exec-123.log"
+}
+```
+
+**Repeating Scripts:**
+- For repeating scripts (with `repeatIntervalMinutes` set), the host will automatically reschedule the script after completion
+- If `maxExecutions` is set and reached, the script will not be rescheduled
+- On successful completion, `executionCount` is incremented and `lastExecutedAt` is updated
+- On failure, repeating scripts are not rescheduled (status remains FAILED)
 
 ## Error Handling
 

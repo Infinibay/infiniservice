@@ -263,6 +263,21 @@ impl InfiniService {
             self.emit_connection_state_change(ConnectionState::Disconnected).await;
         }
 
+        // Request and execute pending scripts if VirtIO is connected
+        if self.virtio_connected {
+            match self.request_and_execute_pending_scripts().await {
+                Ok(_) => {
+                    info!("Pending scripts execution completed successfully");
+                },
+                Err(e) => {
+                    warn!("Failed to execute pending scripts: {}", e);
+                    // Non-fatal, continue service initialization
+                }
+            }
+        } else {
+            debug!("Skipping pending scripts execution - VirtIO not connected");
+        }
+
         info!("Infiniservice initialized successfully");
         Ok(())
     }
@@ -891,13 +906,187 @@ impl InfiniService {
         }
     }
     
+    /// Map incoming shell string to a constrained set of known shell types
+    /// Returns None if the shell type is unknown, allowing OS-appropriate default selection
+    fn normalize_shell_type(shell: &str) -> Option<String> {
+        match shell.to_lowercase().as_str() {
+            "bash" => Some("bash".to_string()),
+            "sh" => Some("sh".to_string()),
+            "powershell" | "pwsh" => Some("powershell".to_string()),
+            "cmd" | "cmd.exe" => Some("cmd".to_string()),
+            _ => {
+                warn!("Unknown shell type '{}', will use OS default", shell);
+                None
+            }
+        }
+    }
+
+    /// Request and execute pending scripts from the host
+    async fn request_and_execute_pending_scripts(&mut self) -> Result<()> {
+        const MAX_RETRY_ATTEMPTS: u32 = 3;
+        const TIMEOUT_SECS: u64 = 10;
+        const POLL_INTERVAL_MS: u64 = 100;
+
+        let mut attempt = 0;
+
+        while attempt < MAX_RETRY_ATTEMPTS {
+            attempt += 1;
+
+            // Request scripts from host
+            match self.communication.request_pending_scripts(self.communication.vm_id()).await {
+                Ok(_) => {
+                    info!("Pending scripts request sent (attempt {}/{})", attempt, MAX_RETRY_ATTEMPTS);
+
+                    // Wait for response with timeout
+                    let timeout_start = std::time::Instant::now();
+                    let timeout_duration = Duration::from_secs(TIMEOUT_SECS);
+
+                    while timeout_start.elapsed() < timeout_duration {
+                        match self.communication.read_command().await {
+                            Ok(Some(IncomingMessage::PendingScriptsResponse(response))) => {
+                                info!("Received pending scripts response with {} scripts", response.scripts.len());
+
+                                // Execute each script
+                                for script in &response.scripts {
+                                    info!("Executing script: execution_id={}, name={}",
+                                          script.execution_id, script.script_name);
+
+                                    // Create UnsafeCommandRequest from script info
+                                    let command_request = crate::commands::UnsafeCommandRequest {
+                                        id: script.execution_id.clone(),
+                                        raw_command: script.script_content.clone(),
+                                        shell: Self::normalize_shell_type(&script.shell),
+                                        timeout: Some(script.timeout_seconds),
+                                        working_dir: None,
+                                        env_vars: None,
+                                    };
+
+                                    // Execute the script
+                                    match self.command_executor.execute(IncomingMessage::UnsafeCommand(command_request)).await {
+                                        Ok(cmd_response) => {
+                                            // Create script completion message
+                                            let completion = crate::commands::ScriptCompletionMessage {
+                                                execution_id: script.execution_id.clone(),
+                                                exit_code: cmd_response.exit_code.unwrap_or(-1),
+                                                stdout: cmd_response.stdout,
+                                                stderr: cmd_response.stderr,
+                                                log_file: None,
+                                            };
+
+                                            // Send completion to host
+                                            match self.communication.send_script_completion(&completion).await {
+                                                Ok(_) => {
+                                                    let status = if completion.exit_code == 0 { "SUCCESS" } else { "FAILED" };
+                                                    info!("Script execution completed: execution_id={}, status={}, exit_code={}",
+                                                          completion.execution_id, status, completion.exit_code);
+                                                },
+                                                Err(e) => {
+                                                    error!("Failed to send script completion: {}", e);
+                                                }
+                                            }
+                                        },
+                                        Err(e) => {
+                                            error!("Script execution failed: execution_id={}, error={}",
+                                                   script.execution_id, e);
+
+                                            // Send failure completion
+                                            let completion = crate::commands::ScriptCompletionMessage {
+                                                execution_id: script.execution_id.clone(),
+                                                exit_code: -1,
+                                                stdout: String::new(),
+                                                stderr: format!("Execution error: {}", e),
+                                                log_file: None,
+                                            };
+
+                                            let _ = self.communication.send_script_completion(&completion).await;
+                                        }
+                                    }
+                                }
+
+                                info!("Pending scripts execution completed successfully");
+                                return Ok(());
+                            },
+                            Ok(Some(message)) => {
+                                // Process other messages synchronously to avoid dropping them
+                                debug!("Received non-script message while waiting for pending scripts response");
+
+                                match &message {
+                                    IncomingMessage::Metrics => {
+                                        info!("Processing immediate metrics request during script wait");
+                                        match self.collect_and_send().await {
+                                            Ok(_) => info!("Immediate metrics sent successfully"),
+                                            Err(e) => error!("Failed to send immediate metrics: {}", e),
+                                        }
+                                    },
+                                    IncomingMessage::SafeCommand(_) | IncomingMessage::UnsafeCommand(_) => {
+                                        info!("Processing command during script wait");
+                                        match self.command_executor.execute(message).await {
+                                            Ok(response) => {
+                                                if let Err(e) = self.communication.send_command_response(&response).await {
+                                                    error!("Failed to send command response: {}", e);
+                                                } else {
+                                                    info!("Command response sent: id={}, success={}", response.id, response.success);
+                                                }
+                                            },
+                                            Err(e) => {
+                                                error!("Command execution failed: {}", e);
+                                            }
+                                        }
+                                    },
+                                    IncomingMessage::KeepAliveResponse(response) => {
+                                        debug!("Processing keep-alive response during script wait: seq={}", response.sequence_number);
+                                        // Keep-alive state is already updated in communication layer during read
+                                    },
+                                    IncomingMessage::PendingScriptsResponse(_) => {
+                                        // Already handled above, should not reach here
+                                    }
+                                }
+                            },
+                            Ok(None) => {
+                                // No message yet, continue polling
+                            },
+                            Err(e) => {
+                                debug!("Error reading message while waiting for pending scripts: {}", e);
+                            }
+                        }
+
+                        // Small sleep to avoid busy waiting
+                        tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                    }
+
+                    // Timeout occurred
+                    warn!("Timeout waiting for pending scripts response (attempt {}/{})", attempt, MAX_RETRY_ATTEMPTS);
+
+                    if attempt < MAX_RETRY_ATTEMPTS {
+                        // Exponential backoff: 2s, 4s, 8s
+                        let backoff_secs = 2u64.pow(attempt);
+                        warn!("Retrying in {}s...", backoff_secs);
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to send pending scripts request (attempt {}/{}): {}", attempt, MAX_RETRY_ATTEMPTS, e);
+
+                    if attempt < MAX_RETRY_ATTEMPTS {
+                        let backoff_secs = 2u64.pow(attempt);
+                        warn!("Retrying in {}s...", backoff_secs);
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    }
+                }
+            }
+        }
+
+        error!("Failed to execute pending scripts after {} attempts", MAX_RETRY_ATTEMPTS);
+        Ok(()) // Non-fatal, allow service to continue
+    }
+
     /// Check for and execute incoming commands
     async fn check_and_execute_command(&mut self) -> Result<bool> {
         // Try to read a command from the communication channel
         match self.communication.read_command().await {
             Ok(Some(message)) => {
                 debug!("Received command message");
-                
+
                 // Handle different message types
                 match &message {
                     IncomingMessage::Metrics => {
@@ -923,9 +1112,13 @@ impl InfiniService {
                     },
                     IncomingMessage::KeepAliveResponse(_) => {
                         debug!("Received keep-alive response");
+                    },
+                    IncomingMessage::PendingScriptsResponse(_) => {
+                        debug!("Received pending scripts response (handled separately)");
+                        return Ok(true);
                     }
                 }
-                
+
                 Ok(true)
             },
             Ok(None) => {

@@ -106,7 +106,7 @@ if ($qemuService) {
 
 # Check InfiniService
 Write-Host "`n7. Checking InfiniService..." -ForegroundColor Green
-$infiniServicePath = "C:\Program Files\InfiniService\infiniservice.exe"
+$infiniServicePath = "$env:ProgramFiles\Infiniservice\infiniservice.exe"
 if (Test-Path $infiniServicePath) {
     Write-Host "   ✓ InfiniService binary found at: $infiniServicePath" -ForegroundColor Green
     
@@ -138,7 +138,7 @@ Write-Host "   - Install QEMU Guest Agent from the VirtIO drivers package"
 Write-Host "   - Ensure the service is running: Start-Service 'QEMU Guest Agent'"
 
 Write-Host "`n4. If InfiniService is missing:" -ForegroundColor Yellow
-Write-Host "   - Install InfiniService binary to C:\Program Files\InfiniService\"
+Write-Host "   - Install InfiniService binary to $env:ProgramFiles\Infiniservice\"
 Write-Host "   - Register as Windows service"
 Write-Host "   - Configure to start automatically"
 

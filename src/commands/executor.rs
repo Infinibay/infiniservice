@@ -76,6 +76,10 @@ impl CommandExecutor {
             IncomingMessage::KeepAliveResponse(_) => {
                 // Keep-alive responses are handled separately in the main loop
                 Err(anyhow!("Keep-alive responses should be handled in the main service loop"))
+            },
+            IncomingMessage::PendingScriptsResponse(_) => {
+                // Pending scripts responses are handled separately in the main loop
+                Err(anyhow!("Pending scripts responses should be handled in the main service loop"))
             }
         }
     }
