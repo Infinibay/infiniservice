@@ -921,6 +921,71 @@ impl InfiniService {
         }
     }
 
+    /// Execute pending scripts received from the host
+    /// This method handles both boot-time and immediate script execution
+    async fn execute_pending_scripts(&mut self, response: &crate::commands::PendingScriptsResponse) -> Result<()> {
+        info!("Executing {} pending scripts", response.scripts.len());
+
+        for script in &response.scripts {
+            info!("Executing script: execution_id={}, name={}",
+                  script.execution_id, script.script_name);
+
+            // Create UnsafeCommandRequest from script info
+            let command_request = crate::commands::UnsafeCommandRequest {
+                id: script.execution_id.clone(),
+                raw_command: script.script_content.clone(),
+                shell: Self::normalize_shell_type(&script.shell),
+                timeout: Some(script.timeout_seconds),
+                working_dir: None,
+                env_vars: None,
+            };
+
+            // Execute the script
+            match self.command_executor.execute(IncomingMessage::UnsafeCommand(command_request)).await {
+                Ok(cmd_response) => {
+                    // Create script completion message
+                    let completion = crate::commands::ScriptCompletionMessage {
+                        execution_id: script.execution_id.clone(),
+                        exit_code: cmd_response.exit_code.unwrap_or(-1),
+                        stdout: cmd_response.stdout,
+                        stderr: cmd_response.stderr,
+                        log_file: None,
+                    };
+
+                    // Send completion to host
+                    match self.communication.send_script_completion(&completion).await {
+                        Ok(_) => {
+                            let status = if completion.exit_code == 0 { "SUCCESS" } else { "FAILED" };
+                            info!("Script execution completed: execution_id={}, status={}, exit_code={}",
+                                  completion.execution_id, status, completion.exit_code);
+                        },
+                        Err(e) => {
+                            error!("Failed to send script completion: {}", e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("Script execution failed: execution_id={}, error={}",
+                           script.execution_id, e);
+
+                    // Send failure completion
+                    let completion = crate::commands::ScriptCompletionMessage {
+                        execution_id: script.execution_id.clone(),
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: format!("Execution error: {}", e),
+                        log_file: None,
+                    };
+
+                    let _ = self.communication.send_script_completion(&completion).await;
+                }
+            }
+        }
+
+        info!("Pending scripts execution completed: {} scripts processed", response.scripts.len());
+        Ok(())
+    }
+
     /// Request and execute pending scripts from the host
     async fn request_and_execute_pending_scripts(&mut self) -> Result<()> {
         const MAX_RETRY_ATTEMPTS: u32 = 3;
@@ -946,64 +1011,9 @@ impl InfiniService {
                             Ok(Some(IncomingMessage::PendingScriptsResponse(response))) => {
                                 info!("Received pending scripts response with {} scripts", response.scripts.len());
 
-                                // Execute each script
-                                for script in &response.scripts {
-                                    info!("Executing script: execution_id={}, name={}",
-                                          script.execution_id, script.script_name);
+                                // Execute all pending scripts using the unified handler
+                                self.execute_pending_scripts(&response).await?;
 
-                                    // Create UnsafeCommandRequest from script info
-                                    let command_request = crate::commands::UnsafeCommandRequest {
-                                        id: script.execution_id.clone(),
-                                        raw_command: script.script_content.clone(),
-                                        shell: Self::normalize_shell_type(&script.shell),
-                                        timeout: Some(script.timeout_seconds),
-                                        working_dir: None,
-                                        env_vars: None,
-                                    };
-
-                                    // Execute the script
-                                    match self.command_executor.execute(IncomingMessage::UnsafeCommand(command_request)).await {
-                                        Ok(cmd_response) => {
-                                            // Create script completion message
-                                            let completion = crate::commands::ScriptCompletionMessage {
-                                                execution_id: script.execution_id.clone(),
-                                                exit_code: cmd_response.exit_code.unwrap_or(-1),
-                                                stdout: cmd_response.stdout,
-                                                stderr: cmd_response.stderr,
-                                                log_file: None,
-                                            };
-
-                                            // Send completion to host
-                                            match self.communication.send_script_completion(&completion).await {
-                                                Ok(_) => {
-                                                    let status = if completion.exit_code == 0 { "SUCCESS" } else { "FAILED" };
-                                                    info!("Script execution completed: execution_id={}, status={}, exit_code={}",
-                                                          completion.execution_id, status, completion.exit_code);
-                                                },
-                                                Err(e) => {
-                                                    error!("Failed to send script completion: {}", e);
-                                                }
-                                            }
-                                        },
-                                        Err(e) => {
-                                            error!("Script execution failed: execution_id={}, error={}",
-                                                   script.execution_id, e);
-
-                                            // Send failure completion
-                                            let completion = crate::commands::ScriptCompletionMessage {
-                                                execution_id: script.execution_id.clone(),
-                                                exit_code: -1,
-                                                stdout: String::new(),
-                                                stderr: format!("Execution error: {}", e),
-                                                log_file: None,
-                                            };
-
-                                            let _ = self.communication.send_script_completion(&completion).await;
-                                        }
-                                    }
-                                }
-
-                                info!("Pending scripts execution completed successfully");
                                 return Ok(());
                             },
                             Ok(Some(message)) => {
@@ -1113,9 +1123,18 @@ impl InfiniService {
                     IncomingMessage::KeepAliveResponse(_) => {
                         debug!("Received keep-alive response");
                     },
-                    IncomingMessage::PendingScriptsResponse(_) => {
-                        debug!("Received pending scripts response (handled separately)");
-                        return Ok(true);
+                    IncomingMessage::PendingScriptsResponse(response) => {
+                        info!("Received immediate pending scripts response with {} scripts", response.scripts.len());
+
+                        // Execute scripts immediately using the unified handler
+                        match self.execute_pending_scripts(&response).await {
+                            Ok(_) => {
+                                info!("Immediate pending scripts executed successfully");
+                            },
+                            Err(e) => {
+                                error!("Failed to execute immediate pending scripts: {}", e);
+                            }
+                        }
                     }
                 }
 
