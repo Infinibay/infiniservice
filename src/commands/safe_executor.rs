@@ -3,12 +3,13 @@
 use super::{SafeCommandRequest, SafeCommandType, CommandResponse, ServiceOperation, create_response};
 use crate::os_detection::{get_os_info, OsType};
 use anyhow::{Result, anyhow, Context};
-use log::{debug, warn};
-use std::process::Command;
+use log::{debug, warn, error};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use serde_json::json;
 use std::path::Path;
 use std::time::SystemTime;
+use std::collections::HashMap;
 
 // Progress artifact detection patterns
 const PROGRESS_BAR_CHARS: [char; 2] = ['█', '▒'];
@@ -135,26 +136,78 @@ impl SafeCommandExecutor {
     
     /// Check if PowerShell is available on the system
     fn is_powershell_available(&self) -> bool {
-        // Common PowerShell installation paths on Windows
-        let powershell_paths = vec![
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
+        self.get_powershell_command().is_some()
+    }
+
+    /// Check if the current process is running as SYSTEM or with elevated privileges
+    ///
+    /// On Windows, this checks if we're running as NT AUTHORITY\SYSTEM.
+    /// When running as SYSTEM, UAC elevation via -Verb RunAs will fail because
+    /// CreateProcessWithLogonW cannot be called from LocalSystem (no logon SID).
+    /// Since SYSTEM already has the highest privileges, we can skip UAC entirely.
+    #[cfg(target_os = "windows")]
+    fn is_running_as_system() -> bool {
+        // Use whoami to check if we're running as SYSTEM
+        if let Ok(output) = Command::new("whoami")
+            .output()
+        {
+            if output.status.success() {
+                let username = String::from_utf8_lossy(&output.stdout).to_lowercase();
+                // NT AUTHORITY\SYSTEM or just "system"
+                if username.contains("nt authority\\system") || username.trim() == "system" {
+                    debug!("Running as SYSTEM account - UAC elevation not needed and would fail");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn is_running_as_system() -> bool {
+        // On non-Windows systems, check if running as root (uid 0)
+        unsafe { libc::getuid() == 0 }
+    }
+
+    /// Get the best available PowerShell executable command
+    ///
+    /// Returns the path or name of the PowerShell executable to use, trying in order:
+    /// 1. PowerShell Core (pwsh.exe) - newer, cross-platform version
+    /// 2. Windows PowerShell (powershell.exe) - legacy but widely available
+    ///
+    /// Returns None if no PowerShell variant is available on the system.
+    fn get_powershell_command(&self) -> Option<&'static str> {
+        // Try PowerShell Core (pwsh) first - it's newer and preferred
+        let pwsh_paths = [
             r"C:\Program Files\PowerShell\7\pwsh.exe",
             r"C:\Program Files\PowerShell\6\pwsh.exe",
         ];
-        
-        // First try the generic detection methods
-        if Self::is_executable_available("powershell.exe", Some(&powershell_paths)) {
-            return true;
+
+        if Self::is_executable_available("pwsh.exe", Some(&pwsh_paths)) {
+            return Some("pwsh.exe");
         }
-        
-        // PowerShell-specific fallback: try to execute a simple command
-        // Using echo instead of -Version which might fail on some systems  
-        Command::new("powershell")
+
+        // Fall back to Windows PowerShell
+        let powershell_paths = [
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
+        ];
+
+        if Self::is_executable_available("powershell.exe", Some(&powershell_paths)) {
+            return Some("powershell.exe");
+        }
+
+        // Final fallback: try to execute a simple command to verify availability
+        if Command::new("powershell.exe")
             .args(&["-NoProfile", "-NonInteractive", "-Command", "echo 1"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+        {
+            return Some("powershell.exe");
+        }
+
+        None
     }
     
     /// Filter progress artifacts from command output
@@ -433,6 +486,25 @@ impl SafeCommandExecutor {
             SafeCommandType::DiskCleanup { drive, targets } => {
                 self.disk_cleanup(drive, targets).await
             },
+            SafeCommandType::ExecutePowerShellScript {
+                script,
+                script_type,
+                timeout_seconds,
+                working_directory,
+                environment_vars,
+                run_as_admin,
+            } => {
+                self.execute_powershell_script(
+                    script,
+                    script_type,
+                    *timeout_seconds,
+                    working_directory.as_deref(),
+                    environment_vars.as_ref(),
+                    *run_as_admin,
+                ).await
+            },
+
+            SafeCommandType::UserList => self.list_users().await,
         };
         
         // Build response
@@ -979,7 +1051,130 @@ impl SafeCommandExecutor {
             Some(data),
         ))
     }
-    
+
+    /// List system users
+    /// On Windows: Uses WMI to query Win32_UserAccount for all local users
+    /// On Linux: Parses /etc/passwd to get all users with UID >= 1000 (regular users)
+    async fn list_users(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        #[cfg(target_os = "windows")]
+        {
+            self.list_users_windows().await
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.list_users_linux().await
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn list_users_windows(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        use serde::Deserialize;
+        use wmi::{COMLibrary, WMIConnection};
+
+        #[derive(Deserialize, Debug)]
+        #[serde(rename = "Win32_UserAccount")]
+        #[serde(rename_all = "PascalCase")]
+        struct Win32UserAccount {
+            name: String,
+            full_name: Option<String>,
+            description: Option<String>,
+            disabled: Option<bool>,
+            local_account: Option<bool>,
+            lockout: Option<bool>,
+            sid: Option<String>,
+            status: Option<String>,
+        }
+
+        // Initialize COM and WMI connection
+        let com = COMLibrary::new()
+            .map_err(|e| anyhow!("Failed to initialize COM library: {}", e))?;
+        let wmi_conn = WMIConnection::new(com)
+            .map_err(|e| anyhow!("Failed to create WMI connection: {}", e))?;
+
+        // Query for local user accounts
+        let users: Vec<Win32UserAccount> = wmi_conn
+            .raw_query("SELECT * FROM Win32_UserAccount WHERE LocalAccount = True")
+            .map_err(|e| anyhow!("WMI query failed: {}", e))?;
+
+        let user_list: Vec<serde_json::Value> = users
+            .iter()
+            .map(|user| {
+                json!({
+                    "name": user.name,
+                    "full_name": user.full_name,
+                    "description": user.description,
+                    "disabled": user.disabled.unwrap_or(false),
+                    "locked": user.lockout.unwrap_or(false),
+                    "sid": user.sid,
+                    "status": user.status,
+                })
+            })
+            .collect();
+
+        let count = user_list.len();
+        let data = json!({
+            "users": user_list,
+            "count": count
+        });
+
+        Ok((
+            format!("Found {} local users", count),
+            String::new(),
+            Some(data),
+        ))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    async fn list_users_linux(&self) -> Result<(String, String, Option<serde_json::Value>)> {
+        // Parse /etc/passwd to get users
+        // Format: username:x:uid:gid:description:home:shell
+        let passwd_content = tokio::fs::read_to_string("/etc/passwd").await
+            .map_err(|e| anyhow!("Failed to read /etc/passwd: {}", e))?;
+
+        let user_list: Vec<serde_json::Value> = passwd_content
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() >= 7 {
+                    let uid: u32 = parts[2].parse().unwrap_or(0);
+                    let name = parts[0].to_string();
+
+                    // Include:
+                    // - Regular users (UID >= 1000)
+                    // - Root (UID 0)
+                    // Exclude system users (UID 1-999) unless they're common service accounts
+                    if uid >= 1000 || uid == 0 {
+                        Some(json!({
+                            "name": name,
+                            "uid": uid,
+                            "gid": parts[3].parse::<u32>().unwrap_or(0),
+                            "description": parts[4],
+                            "home": parts[5],
+                            "shell": parts[6],
+                        }))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let count = user_list.len();
+        let data = json!({
+            "users": user_list,
+            "count": count
+        });
+
+        Ok((
+            format!("Found {} users", count),
+            String::new(),
+            Some(data),
+        ))
+    }
+
     /// Kill a process
     async fn kill_process(&self, pid: u32, force: Option<bool>) -> Result<(String, String, Option<serde_json::Value>)> {
         use sysinfo::{System, Pid};
@@ -1913,13 +2108,13 @@ impl SafeCommandExecutor {
     /// Perform disk cleanup
     async fn disk_cleanup(&self, drive: &str, _targets: &[String]) -> Result<(String, String, Option<serde_json::Value>)> {
         use crate::commands::autochecks::remediation::{RemediationEngine, RemediationAction};
-        
+
         let mut engine = RemediationEngine::new(true);
         let action = RemediationAction::CleanupDisk {
             drive: drive.to_string(),
             estimated_recovery_gb: 1.0, // This would be calculated based on targets
         };
-        
+
         match engine.apply_remediation(action, true).await {
             Ok(result) => {
                 let result_json = serde_json::to_value(&result)?;
@@ -1927,6 +2122,375 @@ impl SafeCommandExecutor {
                 Ok((message, String::new(), Some(result_json)))
             }
             Err(e) => Err(anyhow!("Failed to perform disk cleanup: {}", e))
+        }
+    }
+
+    /// Execute a PowerShell script with optional elevation and environment customization
+    ///
+    /// # Arguments
+    /// * `script` - The PowerShell script content (inline) or file path
+    /// * `script_type` - Either "inline" for script content or "file" for script path
+    /// * `timeout_seconds` - Optional timeout in seconds (default: 600)
+    /// * `working_directory` - Optional working directory for script execution
+    /// * `environment_vars` - Optional environment variables to set
+    /// * `run_as_admin` - Whether to run with elevated privileges (UAC prompt)
+    async fn execute_powershell_script(
+        &self,
+        script: &str,
+        script_type: &str,
+        timeout_seconds: Option<u32>,
+        working_directory: Option<&str>,
+        environment_vars: Option<&HashMap<String, String>>,
+        run_as_admin: bool,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        // Validate OS - PowerShell script execution is Windows-only
+        if self.os_info.os_type != OsType::Windows {
+            return Err(anyhow!("ExecutePowerShellScript is only supported on Windows"));
+        }
+
+        // Validate script_type
+        if script_type != "inline" && script_type != "file" {
+            return Err(anyhow!(
+                "Invalid script_type '{}'. Expected 'inline' or 'file'",
+                script_type
+            ));
+        }
+
+        // Validate file exists if script_type is "file"
+        if script_type == "file" && !Path::new(script).exists() {
+            return Err(anyhow!("Script file not found: {}", script));
+        }
+
+        // Determine timeout (default: 600 seconds / 10 minutes)
+        let timeout = Duration::from_secs(timeout_seconds.unwrap_or(600) as u64);
+
+        debug!(
+            "Executing PowerShell script: type={}, timeout={:?}, elevated={}, working_dir={:?}",
+            script_type, timeout, run_as_admin, working_directory
+        );
+
+        // Route to appropriate execution path based on elevation requirement
+        // Note: If running as SYSTEM (e.g., as a Windows service), skip UAC elevation
+        // because Start-Process -Verb RunAs uses CreateProcessWithLogonW which fails
+        // from LocalSystem (no logon SID). SYSTEM already has highest privileges anyway.
+        let skip_elevation = run_as_admin && Self::is_running_as_system();
+
+        if skip_elevation {
+            debug!("Skipping UAC elevation - already running as SYSTEM with highest privileges");
+        }
+
+        if run_as_admin && !skip_elevation {
+            self.execute_powershell_elevated(
+                script,
+                script_type,
+                timeout,
+                working_directory,
+                environment_vars,
+            ).await
+        } else {
+            self.execute_powershell_non_elevated(
+                script,
+                script_type,
+                timeout,
+                working_directory,
+                environment_vars,
+            ).await
+        }
+    }
+
+    /// Execute PowerShell script without elevation using direct process execution
+    async fn execute_powershell_non_elevated(
+        &self,
+        script: &str,
+        script_type: &str,
+        timeout: Duration,
+        working_directory: Option<&str>,
+        environment_vars: Option<&HashMap<String, String>>,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        // Get the PowerShell executable
+        let ps_command = self.get_powershell_command()
+            .ok_or_else(|| anyhow!("PowerShell is not available on this system. Tried 'pwsh.exe' and 'powershell.exe' but neither was found."))?;
+
+        // Build the command
+        let mut cmd = Command::new(ps_command);
+        cmd.args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass"]);
+
+        // Add script argument based on type
+        if script_type == "file" {
+            cmd.args(&["-File", script]);
+        } else {
+            cmd.args(&["-Command", script]);
+        }
+
+        // Apply working directory if specified
+        if let Some(working_dir) = working_directory {
+            cmd.current_dir(working_dir);
+        }
+
+        // Apply environment variables if specified
+        if let Some(env_vars) = environment_vars {
+            for (key, value) in env_vars {
+                cmd.env(key, value);
+            }
+        }
+
+        // Configure stdio
+        cmd.stdout(Stdio::piped())
+           .stderr(Stdio::piped())
+           .stdin(Stdio::null());
+
+        // Spawn the child process using tokio
+        let child = tokio::process::Command::from(cmd)
+            .spawn()
+            .with_context(|| format!("Failed to spawn PowerShell process using '{}'", ps_command))?;
+
+        // Get the PID before moving child
+        let pid = child.id().unwrap_or(0);
+
+        // Use tokio for async timeout
+        let result = tokio::time::timeout(timeout, async {
+            let output = child.wait_with_output().await
+                .context("Failed to wait for PowerShell process")?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let exit_code = output.status.code().unwrap_or(-1);
+
+            Ok::<_, anyhow::Error>((stdout, stderr, exit_code))
+        }).await;
+
+        match result {
+            Ok(Ok((stdout, stderr, exit_code))) => {
+                debug!("PowerShell script completed with exit code: {}", exit_code);
+                if exit_code != 0 {
+                    warn!("PowerShell script exited with non-zero code: {}", exit_code);
+                }
+                Ok((stdout, stderr, Some(json!({ "exit_code": exit_code }))))
+            },
+            Ok(Err(e)) => {
+                error!("PowerShell script execution error: {}", e);
+                Err(e)
+            },
+            Err(_) => {
+                // Timeout occurred, try to kill the process
+                warn!("PowerShell script timed out after {:?}, attempting to kill process PID {}", timeout, pid);
+
+                // Try to kill the process using the PID we saved earlier
+                if pid > 0 {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(&["/PID", &pid.to_string(), "/F"])
+                        .output();
+                }
+
+                Err(anyhow!("PowerShell script timed out after {:?}", timeout))
+            }
+        }
+    }
+
+    /// Execute PowerShell script with elevation using Start-Process -Verb RunAs
+    ///
+    /// Since Start-Process -Verb RunAs cannot directly capture stdout/stderr,
+    /// we use a wrapper script that redirects output to temporary files.
+    async fn execute_powershell_elevated(
+        &self,
+        script: &str,
+        script_type: &str,
+        timeout: Duration,
+        working_directory: Option<&str>,
+        environment_vars: Option<&HashMap<String, String>>,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        // Get the PowerShell executable for the wrapper process
+        let ps_command = self.get_powershell_command()
+            .ok_or_else(|| anyhow!("PowerShell is not available on this system. Tried 'pwsh.exe' and 'powershell.exe' but neither was found."))?;
+
+        // Generate unique temporary file paths
+        let temp_dir = std::env::temp_dir();
+        let unique_id = uuid::Uuid::new_v4().to_string();
+        let temp_script_path = temp_dir.join(format!("infinibay_ps_{}.ps1", unique_id));
+        let temp_stdout_path = temp_dir.join(format!("infinibay_ps_{}_stdout.txt", unique_id));
+        let temp_stderr_path = temp_dir.join(format!("infinibay_ps_{}_stderr.txt", unique_id));
+
+        debug!("Elevated execution using temp files: script={:?}, stdout={:?}, stderr={:?}",
+            temp_script_path, temp_stdout_path, temp_stderr_path);
+
+        // Build the actual script content with optional working directory and env vars
+        let mut script_content = String::new();
+
+        // Add working directory change if specified
+        if let Some(working_dir) = working_directory {
+            script_content.push_str(&format!("Set-Location '{}'\n", working_dir.replace('\'', "''")));
+        }
+
+        // Add environment variables if specified
+        if let Some(env_vars) = environment_vars {
+            for (key, value) in env_vars {
+                script_content.push_str(&format!(
+                    "$env:{} = '{}'\n",
+                    key,
+                    value.replace('\'', "''")
+                ));
+            }
+        }
+
+        // Add the actual script content
+        if script_type == "file" {
+            // If it's a file, read and execute it
+            script_content.push_str(&format!("& '{}'\n", script.replace('\'', "''")));
+        } else {
+            // For inline scripts, add the content directly
+            script_content.push_str(script);
+            script_content.push('\n');
+        }
+
+        // Write the script to temporary file
+        tokio::fs::write(&temp_script_path, &script_content).await
+            .context("Failed to write temporary script file")?;
+
+        // Build the wrapper script that will invoke Start-Process with elevation
+        let wrapper_script = format!(
+            r#"
+$scriptPath = '{script_path}'
+$stdoutPath = '{stdout_path}'
+$stderrPath = '{stderr_path}'
+
+# Create empty output files first
+'' | Out-File -FilePath $stdoutPath -Encoding UTF8
+'' | Out-File -FilePath $stderrPath -Encoding UTF8
+
+# Build the argument list for the elevated PowerShell
+$innerArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" > `"$stdoutPath`" 2> `"$stderrPath`""
+
+# Start the elevated process and wait for it to complete
+$process = Start-Process powershell.exe -Verb RunAs -ArgumentList $innerArgs -Wait -WindowStyle Hidden -PassThru
+
+# Return the exit code
+exit $process.ExitCode
+"#,
+            script_path = temp_script_path.to_string_lossy().replace('\'', "''"),
+            stdout_path = temp_stdout_path.to_string_lossy().replace('\'', "''"),
+            stderr_path = temp_stderr_path.to_string_lossy().replace('\'', "''"),
+        );
+
+        // Execute the wrapper script using non-elevated PowerShell
+        // The Start-Process -Verb RunAs will trigger UAC prompt
+        let mut cmd = Command::new(ps_command);
+        cmd.args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &wrapper_script]);
+        cmd.stdout(Stdio::piped())
+           .stderr(Stdio::piped())
+           .stdin(Stdio::null());
+
+        let child = tokio::process::Command::from(cmd)
+            .spawn()
+            .with_context(|| format!("Failed to spawn PowerShell wrapper process using '{}'", ps_command))?;
+
+        let pid = child.id().unwrap_or(0);
+
+        // Execute with timeout
+        let result = tokio::time::timeout(timeout, async {
+            let output = child.wait_with_output().await
+                .context("Failed to wait for PowerShell wrapper process")?;
+            let exit_code = output.status.code().unwrap_or(-1);
+            Ok::<_, anyhow::Error>((output, exit_code))
+        }).await;
+
+        // Read output from temporary files and cleanup
+        match result {
+            Ok(Ok((output, exit_code))) => {
+                // Check for UAC cancellation or elevation failure
+                // Exit code 1 with specific patterns indicates UAC was cancelled
+                let wrapper_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let wrapper_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+                if exit_code != 0 {
+                    warn!("Elevated PowerShell wrapper exited with code: {}. stdout: {}, stderr: {}",
+                        exit_code, wrapper_stdout, wrapper_stderr);
+
+                    // Check for UAC cancellation indicators
+                    let is_uac_cancelled = wrapper_stderr.contains("The operation was canceled by the user")
+                        || wrapper_stderr.contains("User Account Control")
+                        || wrapper_stderr.contains("elevation")
+                        || (exit_code == 1 && wrapper_stdout.is_empty() && wrapper_stderr.is_empty());
+
+                    if is_uac_cancelled {
+                        // Cleanup temp files before returning error
+                        let _ = tokio::fs::remove_file(&temp_script_path).await;
+                        let _ = tokio::fs::remove_file(&temp_stdout_path).await;
+                        let _ = tokio::fs::remove_file(&temp_stderr_path).await;
+
+                        return Err(anyhow!(
+                            "Elevated execution failed: UAC prompt was cancelled or elevation was denied (exit code: {})",
+                            exit_code
+                        ));
+                    }
+                }
+
+                // Read output from temp files with explicit error handling
+                let mut stdout_read_failed = false;
+                let mut stderr_read_failed = false;
+
+                let stdout = match tokio::fs::read_to_string(&temp_stdout_path).await {
+                    Ok(content) => content,
+                    Err(e) => {
+                        error!("Failed to read elevated script stdout from {:?}: {}", temp_stdout_path, e);
+                        stdout_read_failed = true;
+                        String::new()
+                    }
+                };
+
+                let stderr = match tokio::fs::read_to_string(&temp_stderr_path).await {
+                    Ok(content) => content,
+                    Err(e) => {
+                        error!("Failed to read elevated script stderr from {:?}: {}", temp_stderr_path, e);
+                        stderr_read_failed = true;
+                        String::new()
+                    }
+                };
+
+                // Cleanup temp files (always cleanup after read attempts)
+                let _ = tokio::fs::remove_file(&temp_script_path).await;
+                let _ = tokio::fs::remove_file(&temp_stdout_path).await;
+                let _ = tokio::fs::remove_file(&temp_stderr_path).await;
+
+                // Build the result with capture status
+                let capture_failed = stdout_read_failed || stderr_read_failed;
+                let data = json!({
+                    "exit_code": exit_code,
+                    "output_capture_failed": capture_failed,
+                    "stdout_read_failed": stdout_read_failed,
+                    "stderr_read_failed": stderr_read_failed
+                });
+
+                debug!("Elevated PowerShell script completed with exit code: {}, capture_failed: {}",
+                    exit_code, capture_failed);
+
+                return Ok((stdout, stderr, Some(data)));
+            },
+            Ok(Err(e)) => {
+                // Cleanup temp files before returning error
+                let _ = tokio::fs::remove_file(&temp_script_path).await;
+                let _ = tokio::fs::remove_file(&temp_stdout_path).await;
+                let _ = tokio::fs::remove_file(&temp_stderr_path).await;
+
+                error!("Elevated PowerShell execution error: {}", e);
+                return Err(e);
+            },
+            Err(_) => {
+                // Timeout - try to kill the process
+                warn!("Elevated PowerShell script timed out after {:?}", timeout);
+
+                if pid > 0 {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(&["/PID", &pid.to_string(), "/F"])
+                        .output();
+                }
+
+                // Cleanup temp files
+                let _ = tokio::fs::remove_file(&temp_script_path).await;
+                let _ = tokio::fs::remove_file(&temp_stdout_path).await;
+                let _ = tokio::fs::remove_file(&temp_stderr_path).await;
+
+                return Err(anyhow!("Elevated PowerShell script timed out after {:?}", timeout));
+            }
         }
     }
 }

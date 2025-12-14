@@ -155,6 +155,20 @@ pub enum SafeCommandType {
         drive: String,
         targets: Vec<String>
     },
+
+    // PowerShell script execution (Windows)
+    // Executes PowerShell scripts with optional elevation and environment customization
+    ExecutePowerShellScript {
+        script: String,
+        script_type: String,
+        timeout_seconds: Option<u32>,
+        working_directory: Option<String>,
+        environment_vars: Option<HashMap<String, String>>,
+        run_as_admin: bool,
+    },
+
+    // User listing
+    UserList,
 }
 
 /// Service control parameters
