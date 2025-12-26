@@ -47,6 +47,11 @@ pub enum RemediationAction {
     UpdateApplications {
         applications: Vec<String>,
     },
+
+    // Linux-specific operations
+    EnableFirewall {
+        firewall_type: String,
+    },
 }
 
 /// Defender scan type for remediation
@@ -188,6 +193,9 @@ impl RemediationEngine {
             RemediationAction::UpdateApplications { applications } => {
                 self.update_applications(applications).await
             }
+            RemediationAction::EnableFirewall { firewall_type } => {
+                self.enable_firewall(firewall_type).await
+            }
         };
         
         let duration = start_time.elapsed().unwrap_or(Duration::from_millis(0));
@@ -266,6 +274,7 @@ impl RemediationEngine {
             
             RemediationAction::EnableDefender => RiskLevel::Medium,
             RemediationAction::UpdateApplications { .. } => RiskLevel::Medium,
+            RemediationAction::EnableFirewall { .. } => RiskLevel::Medium,
             
             RemediationAction::RestartService { .. } => RiskLevel::High,
             RemediationAction::InstallSecurityUpdates { .. } => RiskLevel::High,
@@ -286,6 +295,7 @@ impl RemediationEngine {
             RemediationAction::UpdateApplications { .. } => Duration::from_secs(600),
             RemediationAction::InstallSecurityUpdates { .. } => Duration::from_secs(1800),
             RemediationAction::OptimizeResources { .. } => Duration::from_secs(0), // Manual action
+            RemediationAction::EnableFirewall { .. } => Duration::from_secs(30),
         }
     }
     
@@ -1026,6 +1036,106 @@ impl RemediationEngine {
             "updated_applications": results,
             "total_duration_ms": applications.len() as u64 * 2000,
         }))
+    }
+
+    async fn enable_firewall(&self, firewall_type: &str) -> Result<serde_json::Value> {
+        info!("Enabling firewall: {}", firewall_type);
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+
+            let start_time = std::time::Instant::now();
+
+            match firewall_type {
+                "ufw" => {
+                    info!("Enabling UFW firewall");
+
+                    // Enable UFW
+                    let enable_result = Command::new("ufw")
+                        .args(&["--force", "enable"])
+                        .output();
+
+                    match enable_result {
+                        Ok(output) => {
+                            if output.status.success() {
+                                let duration_ms = start_time.elapsed().as_millis() as u64;
+                                info!("UFW enabled successfully");
+
+                                Ok(json!({
+                                    "action": "enable_firewall",
+                                    "firewall_type": "ufw",
+                                    "status": "success",
+                                    "duration_ms": duration_ms,
+                                    "details": "UFW firewall enabled with default deny policy"
+                                }))
+                            } else {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                Err(anyhow!("Failed to enable UFW: {}", stderr))
+                            }
+                        }
+                        Err(e) => {
+                            Err(anyhow!("Failed to execute ufw command: {}", e))
+                        }
+                    }
+                }
+                "firewalld" => {
+                    info!("Enabling firewalld");
+
+                    // Start and enable firewalld
+                    let start_result = Command::new("systemctl")
+                        .args(&["start", "firewalld"])
+                        .output();
+
+                    let enable_result = Command::new("systemctl")
+                        .args(&["enable", "firewalld"])
+                        .output();
+
+                    match (start_result, enable_result) {
+                        (Ok(start_out), Ok(enable_out)) => {
+                            if start_out.status.success() {
+                                let duration_ms = start_time.elapsed().as_millis() as u64;
+                                info!("Firewalld started and enabled successfully");
+
+                                Ok(json!({
+                                    "action": "enable_firewall",
+                                    "firewall_type": "firewalld",
+                                    "status": "success",
+                                    "duration_ms": duration_ms,
+                                    "enabled_on_boot": enable_out.status.success(),
+                                    "details": "Firewalld started and enabled"
+                                }))
+                            } else {
+                                let stderr = String::from_utf8_lossy(&start_out.stderr);
+                                Err(anyhow!("Failed to start firewalld: {}", stderr))
+                            }
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            Err(anyhow!("Failed to execute systemctl command: {}", e))
+                        }
+                    }
+                }
+                "iptables" => {
+                    info!("iptables requires manual configuration");
+
+                    Ok(json!({
+                        "action": "enable_firewall",
+                        "firewall_type": "iptables",
+                        "status": "manual_action_required",
+                        "details": "iptables requires manual configuration. Consider using ufw or firewalld for easier management."
+                    }))
+                }
+                _ => {
+                    Err(anyhow!("Unsupported firewall type: {}", firewall_type))
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = firewall_type; // Suppress unused variable warning
+            Err(anyhow!("Linux firewall enablement is only available on Linux"))
+        }
     }
 }
 

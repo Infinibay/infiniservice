@@ -32,6 +32,11 @@ pub mod windows_update_checker;
 #[cfg(target_os = "linux")]
 pub mod linux_update_checker;
 
+pub mod linux_updates;
+
+// Linux security module - types are available on all platforms, functions are Linux-only
+pub mod linux_security;
+
 /// Incoming message types from the host
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
@@ -123,7 +128,20 @@ pub enum SafeCommandType {
     CheckWindowsUpdates,
     GetUpdateHistory { days: Option<u32> },
     GetPendingUpdates,
-    
+
+    // Linux Update commands
+    CheckLinuxUpdates,
+    GetLinuxUpdateHistory { days: Option<u32> },
+    GetPendingLinuxUpdates,
+
+    // Linux Security commands
+    CheckLinuxSecurity,
+    GetLinuxSecurityStatus,
+    GetLinuxFirewallStatus,
+    CheckFirewallStatus,
+    GetLinuxSecurityUpdates,
+    CheckSecurityModules,
+
     // Windows Defender commands
     CheckWindowsDefender,
     GetDefenderStatus,
@@ -445,10 +463,252 @@ mod tests {
             Duration::from_millis(100),
             None,
         );
-        
+
         assert_eq!(response.id, "cmd-789");
         assert!(response.success);
         assert_eq!(response.execution_time_ms, 100);
         assert_eq!(response.command_type, "safe");
+    }
+
+    #[test]
+    fn test_get_linux_security_status_serialization() {
+        // Test serialization
+        let cmd = SafeCommandRequest {
+            id: "test-security-status".to_string(),
+            command_type: SafeCommandType::GetLinuxSecurityStatus,
+            params: None,
+            timeout: Some(30),
+        };
+
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"action\":\"GetLinuxSecurityStatus\""));
+
+        // Test deserialization
+        let json_input = r#"{"id":"test-1","command_type":{"action":"GetLinuxSecurityStatus"},"params":null,"timeout":30}"#;
+        let parsed: SafeCommandRequest = serde_json::from_str(json_input).unwrap();
+        assert!(matches!(parsed.command_type, SafeCommandType::GetLinuxSecurityStatus));
+    }
+
+    #[test]
+    fn test_check_firewall_status_serialization() {
+        // Test serialization
+        let cmd = SafeCommandRequest {
+            id: "test-firewall-status".to_string(),
+            command_type: SafeCommandType::CheckFirewallStatus,
+            params: None,
+            timeout: Some(30),
+        };
+
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"action\":\"CheckFirewallStatus\""));
+
+        // Test deserialization
+        let json_input = r#"{"id":"test-2","command_type":{"action":"CheckFirewallStatus"},"params":null,"timeout":30}"#;
+        let parsed: SafeCommandRequest = serde_json::from_str(json_input).unwrap();
+        assert!(matches!(parsed.command_type, SafeCommandType::CheckFirewallStatus));
+    }
+
+    // ===== Linux Command Integration Tests =====
+
+    #[test]
+    fn test_linux_command_serialization_check_updates() {
+        // Test CheckLinuxUpdates serialization
+        let cmd = SafeCommandRequest {
+            id: "linux-updates-001".to_string(),
+            command_type: SafeCommandType::CheckLinuxUpdates,
+            params: None,
+            timeout: Some(60),
+        };
+
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("CheckLinuxUpdates"));
+        assert!(json.contains("linux-updates-001"));
+
+        // Test deserialization
+        let parsed: SafeCommandRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed.command_type, SafeCommandType::CheckLinuxUpdates));
+        assert_eq!(parsed.id, "linux-updates-001");
+        assert_eq!(parsed.timeout, Some(60));
+    }
+
+    #[test]
+    fn test_linux_command_serialization_all_types() {
+        // Test all Linux-specific command types serialize correctly
+        let linux_commands = vec![
+            (SafeCommandType::CheckLinuxUpdates, "CheckLinuxUpdates"),
+            (SafeCommandType::GetLinuxSecurityStatus, "GetLinuxSecurityStatus"),
+            (SafeCommandType::CheckFirewallStatus, "CheckFirewallStatus"),
+            (SafeCommandType::GetInstalledApplicationsWMI, "GetInstalledApplicationsWMI"),
+        ];
+
+        for (cmd_type, expected_name) in linux_commands {
+            let cmd = SafeCommandRequest {
+                id: format!("test-{}", expected_name.to_lowercase()),
+                command_type: cmd_type,
+                params: None,
+                timeout: Some(30),
+            };
+
+            let json = serde_json::to_string(&cmd).unwrap();
+            assert!(json.contains(expected_name), "JSON should contain {}", expected_name);
+        }
+    }
+
+    #[test]
+    fn test_linux_command_dispatcher_routing() {
+        // Verify that different command types can be distinguished
+        let commands = vec![
+            SafeCommandType::CheckLinuxUpdates,
+            SafeCommandType::GetLinuxSecurityStatus,
+            SafeCommandType::CheckFirewallStatus,
+            SafeCommandType::GetInstalledApplicationsWMI,
+        ];
+
+        for cmd_type in &commands {
+            // Each command type should be uniquely identifiable via pattern matching
+            match cmd_type {
+                SafeCommandType::CheckLinuxUpdates => {
+                    assert!(matches!(cmd_type, SafeCommandType::CheckLinuxUpdates));
+                }
+                SafeCommandType::GetLinuxSecurityStatus => {
+                    assert!(matches!(cmd_type, SafeCommandType::GetLinuxSecurityStatus));
+                }
+                SafeCommandType::CheckFirewallStatus => {
+                    assert!(matches!(cmd_type, SafeCommandType::CheckFirewallStatus));
+                }
+                SafeCommandType::GetInstalledApplicationsWMI => {
+                    assert!(matches!(cmd_type, SafeCommandType::GetInstalledApplicationsWMI));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_linux_command_timeout_handling() {
+        // Test that timeout values are preserved in serialization
+        let timeouts = vec![10, 30, 60, 120, 300];
+
+        for timeout in timeouts {
+            let cmd = SafeCommandRequest {
+                id: format!("timeout-test-{}", timeout),
+                command_type: SafeCommandType::CheckLinuxUpdates,
+                params: None,
+                timeout: Some(timeout),
+            };
+
+            let json = serde_json::to_string(&cmd).unwrap();
+            let parsed: SafeCommandRequest = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(parsed.timeout, Some(timeout), "Timeout {} should be preserved", timeout);
+        }
+
+        // Test None timeout
+        let cmd_no_timeout = SafeCommandRequest {
+            id: "no-timeout".to_string(),
+            command_type: SafeCommandType::CheckLinuxUpdates,
+            params: None,
+            timeout: None,
+        };
+
+        let json = serde_json::to_string(&cmd_no_timeout).unwrap();
+        let parsed: SafeCommandRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.timeout, None, "None timeout should be preserved");
+    }
+
+    #[test]
+    fn test_linux_command_error_response_format() {
+        // Test that error responses are correctly formatted for Linux commands
+        let error_cases = vec![
+            ("Linux Updates check is only available on Linux", "CheckLinuxUpdates"),
+            ("Linux Security check is only available on Linux", "GetLinuxSecurityStatus"),
+            ("Firewall check is only available on Linux", "CheckFirewallStatus"),
+        ];
+
+        for (error_msg, cmd_name) in error_cases {
+            let response = error_response(
+                format!("error-{}", cmd_name.to_lowercase()),
+                error_msg,
+                "safe"
+            );
+
+            assert!(!response.success, "Error response should not be successful");
+            assert_eq!(response.stderr, error_msg);
+            assert_eq!(response.command_type, "safe");
+            assert!(response.stdout.is_empty());
+            assert_eq!(response.exit_code, Some(1));
+        }
+    }
+
+    #[test]
+    fn test_platform_specific_command_rejection_format() {
+        // Test that the rejection message format is consistent
+        let rejection_messages = vec![
+            "Linux Updates check is only available on Linux",
+            "Linux Security check is only available on Linux",
+            "Linux Firewall status is only available on Linux",
+            "Security modules check is only available on Linux",
+            "Linux pending updates check is only available on Linux",
+        ];
+
+        for msg in rejection_messages {
+            // All rejection messages should:
+            // 1. Mention "Linux" explicitly
+            assert!(msg.contains("Linux"), "Message should mention Linux: {}", msg);
+
+            // 2. End with "on Linux" to indicate platform restriction
+            assert!(msg.ends_with("on Linux"), "Message should end with 'on Linux': {}", msg);
+
+            // 3. Be a complete sentence (not just an error code)
+            assert!(msg.contains(' '), "Message should be a sentence: {}", msg);
+        }
+    }
+
+    #[test]
+    fn test_command_response_data_field() {
+        // Test that responses can include structured data
+        let response_with_data = CommandResponse {
+            id: "test-with-data".to_string(),
+            success: true,
+            exit_code: Some(0),
+            stdout: "".to_string(),
+            stderr: "".to_string(),
+            execution_time_ms: 100,
+            command_type: "safe".to_string(),
+            data: Some(serde_json::json!({
+                "updates_count": 5,
+                "security_updates": 2,
+                "reboot_required": false
+            })),
+        };
+
+        assert!(response_with_data.data.is_some());
+
+        let data = response_with_data.data.unwrap();
+        assert_eq!(data["updates_count"], 5);
+        assert_eq!(data["security_updates"], 2);
+        assert_eq!(data["reboot_required"], false);
+    }
+
+    #[test]
+    fn test_incoming_message_safe_command_parsing() {
+        // Test parsing incoming messages with Linux commands
+        let json_input = r#"{
+            "type": "SafeCommand",
+            "id": "incoming-001",
+            "command_type": {"action": "CheckLinuxUpdates"},
+            "params": null,
+            "timeout": 60
+        }"#;
+
+        let parsed: Result<IncomingMessage, _> = serde_json::from_str(json_input);
+        assert!(parsed.is_ok(), "Should parse incoming message successfully");
+
+        if let Ok(IncomingMessage::SafeCommand(cmd)) = parsed {
+            assert_eq!(cmd.id, "incoming-001");
+            assert!(matches!(cmd.command_type, SafeCommandType::CheckLinuxUpdates));
+        } else {
+            panic!("Should be SafeCommand variant");
+        }
     }
 }

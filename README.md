@@ -11,6 +11,49 @@ Infiniservice is designed to be installed on every VM in the Infinibay infrastru
 - Runs continuously with configurable collection intervals
 - Supports both Windows and Linux platforms
 
+## Linux Command Support
+
+InfiniService includes comprehensive support for Linux-specific operations. These commands are automatically detected based on the distribution (Ubuntu, Debian, Fedora, CentOS, RHEL) and use the appropriate tools.
+
+### Available Commands
+
+| Command Category | Description | Ubuntu/Debian | Fedora/RHEL |
+|------------------|-------------|---------------|-------------|
+| **Update Management** | Check for pending updates | `apt list --upgradable` | `dnf check-update` |
+| **Update History** | View installed updates | `/var/log/apt/history.log` | `/var/log/dnf.log` |
+| **Security Updates** | Identify security-critical updates | `apt -s upgrade` (security filter) | `dnf updateinfo list security` |
+| **Firewall Status** | Check firewall configuration | UFW | firewalld |
+| **Security Modules** | Check SELinux/AppArmor | AppArmor | SELinux |
+| **Application Inventory** | List installed software | dpkg + snap + flatpak | rpm + snap + flatpak |
+| **Disk Cleanup** | Estimate reclaimable space | apt cache + autoremove | dnf cache + autoremove |
+
+### Package Sources Scanned
+
+- **DEB packages**: dpkg-query for installed packages
+- **RPM packages**: rpm -qa for installed packages
+- **Snap packages**: Universal snap packages
+- **Flatpak applications**: Universal flatpak applications
+
+### Security Features
+
+- **Firewall Detection**: Automatically detects UFW (Ubuntu) or firewalld (Fedora/RHEL)
+- **Security Module Status**: Reports SELinux mode (Enforcing/Permissive) or AppArmor profile count
+- **Security Update Identification**: Flags packages from security repositories
+
+### Permission Requirements
+
+Some operations require elevated privileges:
+- Update installation: `sudo apt upgrade` or `sudo dnf upgrade`
+- Firewall management: `sudo ufw enable` or `sudo firewall-cmd`
+- Package removal: `sudo apt autoremove` or `sudo dnf autoremove`
+
+### Running the Linux Example
+
+```bash
+# Test all Linux command functionality
+cargo run --example test_linux_commands
+```
+
 ## Architecture
 
 The service is structured into several modules:

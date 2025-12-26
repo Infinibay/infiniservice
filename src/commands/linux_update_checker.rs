@@ -148,71 +148,84 @@ impl UpdateChecker for LinuxUpdateChecker {
 /// APT update checker for Debian/Ubuntu systems
 struct AptUpdateChecker {
     cache: Option<HashMap<String, String>>, // package_name -> available_version
+    security_packages: Vec<String>,         // packages with security updates
 }
 
 impl AptUpdateChecker {
     fn new() -> Result<Self> {
-        Ok(Self { cache: None })
+        Ok(Self {
+            cache: None,
+            security_packages: Vec::new(),
+        })
     }
-    
+
     async fn initialize(&mut self) -> UpdateCheckResult<()> {
-        debug!("Initializing APT update checker using native library bindings");
-        
-        // Use APT library instead of command-line calls
-        #[cfg(target_os = "linux")]
-        {
-            
-            // Initialize APT cache using native bindings
-            tokio::task::spawn_blocking(move || -> UpdateCheckResult<()> {
-                debug!("Updating APT package cache via native library");
-                
-                // This would use apt-pkg-native library to update the cache
-                // For now, we simulate the behavior without command-line calls
-                
-                debug!("APT cache updated successfully via native library");
-                Ok(())
-            }).await
-            .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to spawn APT cache update task: {}", e)))?
-            .map_err(|e| e)?;
-        }
-        
-        // Build cache of upgradeable packages
+        debug!("Initializing APT update checker");
+
+        // Build cache of upgradeable packages using apt list --upgradable
         self.cache = Some(self.build_upgrade_cache().await?);
-        
+
         Ok(())
     }
-    
-    async fn build_upgrade_cache(&self) -> UpdateCheckResult<HashMap<String, String>> {
-        debug!("Building APT upgrade cache using native library bindings");
-        
+
+    async fn build_upgrade_cache(&mut self) -> UpdateCheckResult<HashMap<String, String>> {
+        debug!("Building APT upgrade cache");
+
         #[cfg(target_os = "linux")]
         {
-            // Use native APT library bindings instead of command-line calls
+            use std::process::Command;
+
             let cache = tokio::task::spawn_blocking(move || -> UpdateCheckResult<HashMap<String, String>> {
-                let packages = HashMap::new();
-                
-                // This would use apt-pkg-native library to enumerate upgradeable packages
-                // For production use, we would initialize the APT cache and iterate through packages
-                // checking if they have upgradeable versions
-                
-                debug!("Scanning APT cache for upgradeable packages via native library");
-                
-                // For now, we return an empty cache since we're removing command-line dependency
-                // In a full implementation, this would:
-                // 1. Initialize APT cache
-                // 2. Iterate through all packages  
-                // 3. Check if package has candidate version > installed version
-                // 4. Add to upgradeable packages map
-                
-                debug!("Found {} upgradeable packages via native APT library", packages.len());
+                let mut packages = HashMap::new();
+
+                // Run apt list --upgradable to get available updates
+                let output = Command::new("apt")
+                    .args(["list", "--upgradable"])
+                    .output()
+                    .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to run apt list: {}", e)))?;
+
+                if !output.status.success() {
+                    debug!("apt list --upgradable failed, returning empty cache");
+                    return Ok(packages);
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+
+                for line in stdout.lines() {
+                    // Skip header and empty lines
+                    if line.starts_with("Listing") || line.is_empty() {
+                        continue;
+                    }
+
+                    // Format: package/repo version arch [upgradable from: old_version]
+                    // Example: vim/jammy-updates 2:8.2.3995-1ubuntu2.17 amd64 [upgradable from: 2:8.2.3995-1ubuntu2.16]
+                    if let Some((package_part, rest)) = line.split_once('/') {
+                        let package_name = package_part.to_string();
+                        let parts: Vec<&str> = rest.split_whitespace().collect();
+
+                        if parts.len() >= 2 {
+                            // parts[0] contains repo info, parts[1] contains version
+                            // Need to extract version from the line more carefully
+                            // The version is the first whitespace-separated item after the slash
+                            if let Some(version_start) = rest.find(char::is_whitespace) {
+                                let after_repo = rest[version_start..].trim();
+                                if let Some(version) = after_repo.split_whitespace().next() {
+                                    packages.insert(package_name, version.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                debug!("Found {} upgradeable packages via apt", packages.len());
                 Ok(packages)
             }).await
             .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to spawn APT cache building task: {}", e)))?
             .map_err(|e| e)?;
-            
+
             return Ok(cache);
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             debug!("APT not available on non-Linux platforms");
@@ -324,163 +337,467 @@ impl AptUpdateChecker {
 }
 
 /// RPM update checker for Red Hat/Fedora/CentOS systems
-struct RpmUpdateChecker;
+struct RpmUpdateChecker {
+    cache: Option<HashMap<String, String>>, // package_name -> available_version
+    security_packages: Vec<String>,         // packages with security updates
+}
 
 impl RpmUpdateChecker {
     fn new() -> Result<Self> {
-        Ok(Self)
+        Ok(Self {
+            cache: None,
+            security_packages: Vec::new(),
+        })
     }
-    
+
     async fn initialize(&mut self) -> UpdateCheckResult<()> {
         debug!("Initializing RPM update checker");
+
+        // Build cache of upgradeable packages
+        self.cache = Some(self.build_upgrade_cache().await?);
+
         Ok(())
     }
-    
+
+    async fn build_upgrade_cache(&mut self) -> UpdateCheckResult<HashMap<String, String>> {
+        debug!("Building RPM upgrade cache");
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+
+            // Try dnf first, fall back to yum
+            let cache = tokio::task::spawn_blocking(move || -> UpdateCheckResult<HashMap<String, String>> {
+                let mut packages = HashMap::new();
+
+                // Try dnf check-update first
+                let output = Command::new("dnf")
+                    .args(["check-update", "-q"])
+                    .output();
+
+                let output = match output {
+                    Ok(o) => o,
+                    Err(_) => {
+                        // Fall back to yum
+                        Command::new("yum")
+                            .args(["check-update", "-q"])
+                            .output()
+                            .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to run yum/dnf: {}", e)))?
+                    }
+                };
+
+                // dnf/yum check-update returns exit code 100 if updates are available
+                let stdout = String::from_utf8_lossy(&output.stdout);
+
+                for line in stdout.lines() {
+                    // Skip empty lines, headers, and metadata lines
+                    if line.is_empty()
+                        || line.starts_with("Last metadata")
+                        || line.starts_with("Obsoleting")
+                        || !line.contains('.')
+                    {
+                        continue;
+                    }
+
+                    // Format: package_name.arch   version   repository
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let package_arch = parts[0];
+                        let available_version = parts[1].to_string();
+
+                        // Split package name and architecture
+                        let package_name = if let Some(pos) = package_arch.rfind('.') {
+                            package_arch[..pos].to_string()
+                        } else {
+                            package_arch.to_string()
+                        };
+
+                        packages.insert(package_name, available_version);
+                    }
+                }
+
+                debug!("Found {} upgradeable packages via dnf/yum", packages.len());
+                Ok(packages)
+            }).await
+            .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to spawn RPM cache building task: {}", e)))?
+            .map_err(|e| e)?;
+
+            // Also check for security updates
+            self.security_packages = self.get_security_packages().await?;
+
+            return Ok(cache);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            debug!("RPM not available on non-Linux platforms");
+            Ok(HashMap::new())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn get_security_packages(&self) -> UpdateCheckResult<Vec<String>> {
+        use std::process::Command;
+
+        tokio::task::spawn_blocking(move || -> UpdateCheckResult<Vec<String>> {
+            let mut security_packages = Vec::new();
+
+            // Try to get security updates
+            let output = Command::new("dnf")
+                .args(["updateinfo", "list", "security", "-q"])
+                .output();
+
+            if let Ok(output) = output {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        // Extract package name from security advisory line
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if parts.len() >= 3 {
+                            let package_full = parts[2];
+                            // Extract package name (before version)
+                            if let Some(name) = extract_rpm_package_name(package_full) {
+                                security_packages.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(security_packages)
+        }).await
+        .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to get security packages: {}", e)))?
+    }
+
     async fn check_package_update(
         &self,
         app: &Application,
         _config: &UpdateCheckConfig,
     ) -> UpdateCheckResult<Option<UpdateInfo>> {
-        debug!("Checking RPM updates for: {} using native library bindings", app.name);
-        
-        #[cfg(target_os = "linux")]
-        {
-            let possible_names = self.generate_package_names(&app.name);
-            
-            // Use native RPM library bindings instead of command-line calls
-            for package_name in possible_names {
-                debug!("Checking package {} via native RPM library", package_name);
-                
-                // This would use rpm-rs or similar library to query package database
-                // For now, we return None since we're removing command-line dependencies
-                
-                // In a full implementation, this would:
-                // 1. Open RPM database
-                // 2. Query for installed package
-                // 3. Query repositories for available versions
-                // 4. Compare versions to determine if update is available
-                // 5. Return UpdateInfo with version details
-                
-                debug!("No update found for {} via native RPM library", package_name);
+        let cache = match &self.cache {
+            Some(cache) => cache,
+            None => return Ok(None),
+        };
+
+        let possible_names = self.generate_package_names(&app.name);
+
+        for package_name in possible_names {
+            if let Some(available_version) = cache.get(&package_name) {
+                // Check if this is actually an update
+                if let Some(ref current_version) = app.version {
+                    if !super::update_checker::utils::is_version_newer(current_version, available_version) {
+                        continue;
+                    }
+                }
+
+                let is_security = self.security_packages.iter().any(|sp| sp == &package_name);
+
+                debug!("Found update for {}: {} -> {}",
+                       app.name, app.version.as_deref().unwrap_or("unknown"), available_version);
+
+                return Ok(Some(UpdateInfo {
+                    current_version: app.version.clone(),
+                    available_version: available_version.clone(),
+                    update_size_bytes: None,
+                    update_source: "RPM Repository".to_string(),
+                    update_url: None,
+                    is_security_update: is_security,
+                    release_notes: None,
+                    last_checked: SystemTime::now(),
+                }));
             }
         }
-        
+
         Ok(None)
     }
-    
+
     fn generate_package_names(&self, app_name: &str) -> Vec<String> {
         let mut names = Vec::new();
         let normalized = app_name.to_lowercase().replace(' ', "-");
-        
+
         names.push(normalized.clone());
         names.push(app_name.to_lowercase().replace(' ', ""));
         names.push(app_name.to_lowercase());
-        
+
         names
     }
-    
-    fn parse_update_output(&self, output: &str, package_name: &str) -> Option<UpdateInfo> {
-        for line in output.lines() {
-            if line.starts_with(package_name) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    return Some(UpdateInfo {
-                        current_version: None,
-                        available_version: parts[1].to_string(),
-                        update_size_bytes: None,
-                        update_source: "RPM Repository".to_string(),
-                        update_url: None,
-                        is_security_update: false,
-                        release_notes: None,
-                        last_checked: SystemTime::now(),
-                    });
-                }
-            }
+}
+
+/// Extract package name from NEVRA format (Name-Epoch:Version-Release.Arch)
+#[cfg(target_os = "linux")]
+fn extract_rpm_package_name(nevra: &str) -> Option<String> {
+    let parts: Vec<&str> = nevra.split('-').collect();
+    let mut name_parts = Vec::new();
+
+    for part in parts.iter() {
+        // If this part starts with a digit or contains ':', it's likely the version
+        if part.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+           || part.contains(':') {
+            break;
         }
+        name_parts.push(*part);
+    }
+
+    if name_parts.is_empty() {
         None
+    } else {
+        Some(name_parts.join("-"))
     }
 }
 
 /// Snap update checker
-struct SnapUpdateChecker;
+struct SnapUpdateChecker {
+    cache: Option<HashMap<String, String>>, // snap_name -> available_version
+}
 
 impl SnapUpdateChecker {
     fn new() -> Result<Self> {
-        Ok(Self)
+        Ok(Self { cache: None })
     }
-    
+
     async fn initialize(&mut self) -> UpdateCheckResult<()> {
         debug!("Initializing Snap update checker");
+
+        // Build cache of snaps with pending updates
+        self.cache = Some(self.build_refresh_cache().await?);
+
         Ok(())
     }
-    
+
+    async fn build_refresh_cache(&self) -> UpdateCheckResult<HashMap<String, String>> {
+        debug!("Building Snap refresh cache");
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+
+            let cache = tokio::task::spawn_blocking(move || -> UpdateCheckResult<HashMap<String, String>> {
+                let mut packages = HashMap::new();
+
+                // Run snap refresh --list to get pending updates
+                let output = Command::new("snap")
+                    .args(["refresh", "--list"])
+                    .output();
+
+                let output = match output {
+                    Ok(o) => o,
+                    Err(e) => {
+                        debug!("snap refresh --list failed: {}", e);
+                        return Ok(packages);
+                    }
+                };
+
+                if !output.status.success() {
+                    // No updates available or snap not available
+                    return Ok(packages);
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut is_header = true;
+
+                for line in stdout.lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    // Skip header line
+                    if is_header {
+                        is_header = false;
+                        continue;
+                    }
+
+                    // Format: Name  Version  Rev  Publisher  Notes
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let name = parts[0].to_string();
+                        let version = parts[1].to_string();
+                        packages.insert(name, version);
+                    }
+                }
+
+                debug!("Found {} snaps with pending updates", packages.len());
+                Ok(packages)
+            }).await
+            .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to spawn Snap cache building task: {}", e)))?
+            .map_err(|e| e)?;
+
+            return Ok(cache);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            debug!("Snap not available on non-Linux platforms");
+            Ok(HashMap::new())
+        }
+    }
+
     async fn check_snap_update(
         &self,
         app: &Application,
         _config: &UpdateCheckConfig,
     ) -> UpdateCheckResult<Option<UpdateInfo>> {
-        debug!("Checking Snap updates for: {} using native library bindings", app.name);
-        
-        #[cfg(target_os = "linux")]
-        {
-            let snap_name = app.name.to_lowercase();
-            
-            // Use native Snap library bindings instead of command-line calls
-            debug!("Querying Snap daemon for package {} via D-Bus API", snap_name);
-            
-            // This would use snap-rs or D-Bus bindings to communicate with snapd
-            // For now, we return None since we're removing command-line dependencies
-            
-            // In a full implementation, this would:
-            // 1. Connect to snapd via D-Bus or REST API
-            // 2. Query installed snaps and their refresh status
-            // 3. Check if the application has pending updates
-            // 4. Return UpdateInfo with version details
-            
-            debug!("No snap update found for {} via native library", snap_name);
+        let cache = match &self.cache {
+            Some(cache) => cache,
+            None => return Ok(None),
+        };
+
+        let snap_name = app.name.to_lowercase();
+
+        if let Some(available_version) = cache.get(&snap_name) {
+            debug!("Found snap update for {}: {} -> {}",
+                   app.name, app.version.as_deref().unwrap_or("unknown"), available_version);
+
+            return Ok(Some(UpdateInfo {
+                current_version: app.version.clone(),
+                available_version: available_version.clone(),
+                update_size_bytes: None,
+                update_source: "Snap Store".to_string(),
+                update_url: None,
+                is_security_update: false,
+                release_notes: None,
+                last_checked: SystemTime::now(),
+            }));
         }
-        
+
         Ok(None)
     }
 }
 
 /// Flatpak update checker
-struct FlatpakUpdateChecker;
+struct FlatpakUpdateChecker {
+    cache: Option<HashMap<String, String>>, // app_id -> available_version
+}
 
 impl FlatpakUpdateChecker {
     fn new() -> Result<Self> {
-        Ok(Self)
+        Ok(Self { cache: None })
     }
-    
+
     async fn initialize(&mut self) -> UpdateCheckResult<()> {
         debug!("Initializing Flatpak update checker");
+
+        // Build cache of flatpaks with pending updates
+        self.cache = Some(self.build_update_cache().await?);
+
         Ok(())
     }
-    
+
+    async fn build_update_cache(&self) -> UpdateCheckResult<HashMap<String, String>> {
+        debug!("Building Flatpak update cache");
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::process::Command;
+
+            let cache = tokio::task::spawn_blocking(move || -> UpdateCheckResult<HashMap<String, String>> {
+                let mut packages = HashMap::new();
+
+                // Run flatpak remote-ls --updates to get pending updates
+                let output = Command::new("flatpak")
+                    .args(["remote-ls", "--updates", "--columns=application,version"])
+                    .output();
+
+                let output = match output {
+                    Ok(o) => o,
+                    Err(e) => {
+                        debug!("flatpak remote-ls --updates failed: {}", e);
+                        return Ok(packages);
+                    }
+                };
+
+                if !output.status.success() {
+                    // No updates available or flatpak not available
+                    return Ok(packages);
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+
+                for line in stdout.lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    // Format: app_id\tversion
+                    let parts: Vec<&str> = line.split('\t').collect();
+                    if parts.len() >= 2 {
+                        let app_id = parts[0].to_string();
+                        let version = parts[1].to_string();
+                        packages.insert(app_id, version);
+                    } else if parts.len() == 1 {
+                        // Sometimes only app_id is returned
+                        packages.insert(parts[0].to_string(), "available".to_string());
+                    }
+                }
+
+                debug!("Found {} flatpaks with pending updates", packages.len());
+                Ok(packages)
+            }).await
+            .map_err(|e| UpdateCheckError::PlatformError(format!("Failed to spawn Flatpak cache building task: {}", e)))?
+            .map_err(|e| e)?;
+
+            return Ok(cache);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            debug!("Flatpak not available on non-Linux platforms");
+            Ok(HashMap::new())
+        }
+    }
+
     async fn check_flatpak_update(
         &self,
         app: &Application,
         _config: &UpdateCheckConfig,
     ) -> UpdateCheckResult<Option<UpdateInfo>> {
-        debug!("Checking Flatpak updates for: {} using native library bindings", app.name);
-        
-        #[cfg(target_os = "linux")]
-        {
-            // Use native Flatpak library bindings instead of command-line calls
-            debug!("Querying Flatpak for package {} via native library", app.name);
-            
-            // This would use flatpak-rs or similar library to query Flatpak installations
-            // For now, we return None since we're removing command-line dependencies
-            
-            // In a full implementation, this would:
-            // 1. Connect to Flatpak via D-Bus or native library
-            // 2. Query installed applications and their update status
-            // 3. Check if the application has pending updates from remotes
-            // 4. Return UpdateInfo with version details
-            
-            debug!("No flatpak update found for {} via native library", app.name);
+        let cache = match &self.cache {
+            Some(cache) => cache,
+            None => return Ok(None),
+        };
+
+        // Try to match by registry_key (which contains the app_id for flatpaks)
+        // or by name
+        let app_id = app.registry_key.as_ref().unwrap_or(&app.name);
+
+        if let Some(available_version) = cache.get(app_id) {
+            debug!("Found flatpak update for {}: {} -> {}",
+                   app.name, app.version.as_deref().unwrap_or("unknown"), available_version);
+
+            return Ok(Some(UpdateInfo {
+                current_version: app.version.clone(),
+                available_version: available_version.clone(),
+                update_size_bytes: None,
+                update_source: "Flathub".to_string(),
+                update_url: None,
+                is_security_update: false,
+                release_notes: None,
+                last_checked: SystemTime::now(),
+            }));
         }
-        
+
+        // Also try matching by name (case-insensitive)
+        let app_name_lower = app.name.to_lowercase();
+        for (cached_id, available_version) in cache.iter() {
+            if cached_id.to_lowercase().contains(&app_name_lower) {
+                debug!("Found flatpak update for {} (matched by name): {} -> {}",
+                       app.name, app.version.as_deref().unwrap_or("unknown"), available_version);
+
+                return Ok(Some(UpdateInfo {
+                    current_version: app.version.clone(),
+                    available_version: available_version.clone(),
+                    update_size_bytes: None,
+                    update_source: "Flathub".to_string(),
+                    update_url: None,
+                    is_security_update: false,
+                    release_notes: None,
+                    last_checked: SystemTime::now(),
+                }));
+            }
+        }
+
         Ok(None)
     }
 }

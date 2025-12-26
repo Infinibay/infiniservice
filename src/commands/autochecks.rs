@@ -86,13 +86,25 @@ pub struct AutoCheckConfig {
 
 impl Default for AutoCheckConfig {
     fn default() -> Self {
+        let mut enabled_checks = vec![
+            "disk_space".to_string(),
+            "resource_optimization".to_string(),
+        ];
+
+        #[cfg(target_os = "windows")]
+        {
+            enabled_checks.push("windows_updates".to_string());
+            enabled_checks.push("windows_defender".to_string());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            enabled_checks.push("linux_updates".to_string());
+            enabled_checks.push("linux_security".to_string());
+        }
+
         Self {
-            enabled_checks: vec![
-                "disk_space".to_string(),
-                "resource_optimization".to_string(),
-                "windows_updates".to_string(),
-                "windows_defender".to_string(),
-            ],
+            enabled_checks,
             disk_warning_threshold: 30.0,
             disk_critical_threshold: 10.0,
             cpu_underutilized_threshold: 5.0,
@@ -145,12 +157,23 @@ impl AutoCheckEngine {
             if config.enabled_checks.contains(&"windows_updates".to_string()) {
                 checks.push(Box::new(WindowsUpdatesCheck::new()));
             }
-            
+
             if config.enabled_checks.contains(&"windows_defender".to_string()) {
                 checks.push(Box::new(WindowsDefenderCheck::new()));
             }
         }
-        
+
+        #[cfg(target_os = "linux")]
+        {
+            if config.enabled_checks.contains(&"linux_updates".to_string()) {
+                checks.push(Box::new(LinuxUpdatesCheck::new()));
+            }
+
+            if config.enabled_checks.contains(&"linux_security".to_string()) {
+                checks.push(Box::new(LinuxSecurityCheck::new()));
+            }
+        }
+
         Self {
             checks,
             remediation_engine: RemediationEngine::new(config.auto_remediation_enabled),

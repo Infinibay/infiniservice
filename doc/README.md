@@ -103,6 +103,12 @@ InfiniService supports two types of command execution:
    - Package management (install, remove, update, search)
    - Process control (list, kill, top)
    - System information queries
+   - **Linux-specific Commands**:
+     - `CheckLinuxUpdates` - Check for pending system updates
+     - `GetLinuxUpdateHistory` - Retrieve update history from package manager logs
+     - `GetLinuxSecurityStatus` - Check firewall and security module status
+     - `CheckFirewallStatus` - Query UFW or firewalld configuration
+     - `GetInstalledApplications` - Inventory from dpkg/rpm/snap/flatpak
 
 2. **Unsafe Commands**: Raw command execution for administrative tasks
    - Direct shell command execution
@@ -118,11 +124,26 @@ InfiniService is designed to run seamlessly on:
   - Runs as Windows Service
   - PowerShell command execution
   - WMI integration for system metrics
+  - Windows Defender integration
+  - winget package management
 
 - **Linux**: Ubuntu, Debian, RHEL, Fedora, CentOS
   - Systemd service integration
   - procfs/sysfs for metrics collection
-  - Package manager detection (apt, yum, dnf)
+  - Package manager detection (apt, dnf, yum, pacman, zypper)
+  - Multiple package sources: dpkg/rpm + snap + flatpak
+  - Firewall detection: UFW (Ubuntu/Debian), firewalld (Fedora/RHEL)
+  - Security module support: AppArmor (Ubuntu), SELinux (Fedora/RHEL)
+
+#### Linux Distribution Compatibility
+
+| Feature | Ubuntu/Debian | Fedora | CentOS/RHEL |
+|---------|--------------|--------|-------------|
+| Updates | apt | dnf | yum/dnf |
+| Packages | dpkg | rpm | rpm |
+| Firewall | UFW | firewalld | firewalld |
+| Security | AppArmor | SELinux | SELinux |
+| Universal | snap, flatpak | snap, flatpak | snap, flatpak |
 
 ## Documentation Structure
 
