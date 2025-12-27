@@ -16,6 +16,23 @@ pub mod service_control;
 pub mod package_management;
 pub mod process_control;
 
+// Common utilities
+pub mod common;
+
+// Trait abstractions for package managers and platform operations
+pub mod traits;
+
+// Platform factory for creating platform-specific implementations
+pub mod platform_factory;
+
+// Linux package manager implementations
+#[cfg(target_os = "linux")]
+pub mod linux;
+
+// Windows package manager implementations
+#[cfg(target_os = "windows")]
+pub mod windows;
+
 // Auto-check modules
 pub mod autochecks;
 pub mod windows_updates;
@@ -80,21 +97,24 @@ pub struct SafeCommandRequest {
 pub struct UnsafeCommandRequest {
     /// Unique command ID for tracking
     pub id: String,
-    
+
     /// Raw command string to execute
     pub raw_command: String,
-    
+
     /// Shell to use (bash, sh, powershell, cmd)
     pub shell: Option<String>,
-    
+
     /// Command timeout in seconds
     pub timeout: Option<u32>,
-    
+
     /// Working directory for execution
     pub working_dir: Option<String>,
-    
+
     /// Environment variables
     pub env_vars: Option<HashMap<String, String>>,
+
+    /// User to run the command as (for Linux: uses su -c)
+    pub run_as: Option<String>,
 }
 
 /// Types of safe commands
@@ -300,27 +320,31 @@ pub struct ScriptCompletionMessage {
 /// Command execution response
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CommandResponse {
+    /// Message type (always "response")
+    #[serde(rename = "type")]
+    pub message_type: String,
+
     /// Command ID for correlation
     pub id: String,
-    
+
     /// Whether the command succeeded
     pub success: bool,
-    
+
     /// Exit code if applicable
     pub exit_code: Option<i32>,
-    
+
     /// Standard output
     pub stdout: String,
-    
+
     /// Standard error
     pub stderr: String,
-    
+
     /// Execution time in milliseconds
     pub execution_time_ms: u64,
-    
+
     /// Type of command executed ("safe" or "unsafe")
     pub command_type: String,
-    
+
     /// Optional structured data result
     pub data: Option<serde_json::Value>,
 }
@@ -377,6 +401,7 @@ pub fn create_response(
     data: Option<serde_json::Value>,
 ) -> CommandResponse {
     CommandResponse {
+        message_type: "response".to_string(),
         id,
         success,
         exit_code,
@@ -406,6 +431,7 @@ pub fn log_command_execution(message: &IncomingMessage) {
 /// Create an error response
 pub fn error_response(id: String, error: &str, command_type: &str) -> CommandResponse {
     CommandResponse {
+        message_type: "response".to_string(),
         id,
         success: false,
         exit_code: Some(1),
@@ -444,6 +470,7 @@ mod tests {
             timeout: Some(60),
             working_dir: None,
             env_vars: None,
+            run_as: None,
         };
         
         let json = serde_json::to_string(&cmd).unwrap();
@@ -464,6 +491,7 @@ mod tests {
             None,
         );
 
+        assert_eq!(response.message_type, "response");
         assert_eq!(response.id, "cmd-789");
         assert!(response.success);
         assert_eq!(response.execution_time_ms, 100);
@@ -632,6 +660,7 @@ mod tests {
                 "safe"
             );
 
+            assert_eq!(response.message_type, "response");
             assert!(!response.success, "Error response should not be successful");
             assert_eq!(response.stderr, error_msg);
             assert_eq!(response.command_type, "safe");
@@ -668,6 +697,7 @@ mod tests {
     fn test_command_response_data_field() {
         // Test that responses can include structured data
         let response_with_data = CommandResponse {
+            message_type: "response".to_string(),
             id: "test-with-data".to_string(),
             success: true,
             exit_code: Some(0),
@@ -682,6 +712,7 @@ mod tests {
             })),
         };
 
+        assert_eq!(response_with_data.message_type, "response");
         assert!(response_with_data.data.is_some());
 
         let data = response_with_data.data.unwrap();

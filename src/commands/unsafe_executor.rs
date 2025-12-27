@@ -21,30 +21,83 @@ impl UnsafeCommandExecutor {
         }
     }
     
+    /// Escape a string for use in shell single quotes
+    /// Uses the standard shell escaping technique: replace ' with '\''
+    fn escape_for_shell(s: &str) -> String {
+        s.replace("'", "'\\''")
+    }
+
     /// Execute an unsafe command request
     /// WARNING: This executes raw commands without any validation or sanitization
     pub async fn execute(&self, request: UnsafeCommandRequest) -> Result<CommandResponse> {
         let start_time = Instant::now();
-        
+
         warn!("⚠️ UNSAFE COMMAND EXECUTION STARTED");
         warn!("⚠️ Command ID: {}", request.id);
         warn!("⚠️ Raw command: {}", request.raw_command);
         warn!("⚠️ Shell: {:?}", request.shell);
         warn!("⚠️ Working directory: {:?}", request.working_dir);
-        
+        warn!("⚠️ Run as user: {:?}", request.run_as);
+
         // Get shell command based on OS and request
         let (shell_cmd, shell_args) = self.os_info.get_shell_command(request.shell.as_deref());
-        
+
         debug!("Using shell: {} with args: {:?}", shell_cmd, shell_args);
-        
-        // Build the command
-        let mut cmd = Command::new(shell_cmd);
-        
-        // Add shell arguments and the command
-        for arg in shell_args {
-            cmd.arg(arg);
-        }
-        cmd.arg(&request.raw_command);
+
+        // Build the command - with user switching if run_as is specified
+        let mut cmd = if let Some(ref user) = request.run_as {
+            // Check if we need to switch users (not root/system)
+            if user != "root" && user != "system" && !user.is_empty() {
+                warn!("⚠️ Running command as user: {}", user);
+
+                // Validate username (alphanumeric, underscore, hyphen only)
+                if !user.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                    return Ok(create_response(
+                        request.id,
+                        false,
+                        String::new(),
+                        format!("Invalid username: {}. Username can only contain alphanumeric characters, underscores, and hyphens.", user),
+                        Some(1),
+                        "unsafe",
+                        start_time.elapsed(),
+                        None,
+                    ));
+                }
+
+                // Build the command with user switching using su -c
+                // Format: su -c 'shell shell_args '\''escaped_command'\''' username
+                let escaped_command = Self::escape_for_shell(&request.raw_command);
+                let full_cmd = format!("{} {} '{}'",
+                    shell_cmd,
+                    shell_args.join(" "),
+                    escaped_command
+                );
+
+                debug!("Constructed su command: su -c '{}' {}", full_cmd, user);
+
+                let mut su_cmd = Command::new("su");
+                su_cmd.arg("-c");
+                su_cmd.arg(&full_cmd);
+                su_cmd.arg(user);
+                su_cmd
+            } else {
+                // root/system - execute directly without su
+                let mut c = Command::new(shell_cmd);
+                for arg in shell_args {
+                    c.arg(arg);
+                }
+                c.arg(&request.raw_command);
+                c
+            }
+        } else {
+            // No user specified - execute as service user (root)
+            let mut c = Command::new(shell_cmd);
+            for arg in shell_args {
+                c.arg(arg);
+            }
+            c.arg(&request.raw_command);
+            c
+        };
         
         // Set working directory if specified
         if let Some(working_dir) = &request.working_dir {
@@ -246,6 +299,7 @@ mod tests {
             timeout: Some(5),
             working_dir: None,
             env_vars: None,
+            run_as: None,
         };
         
         let result = executor.execute(request).await;
@@ -276,6 +330,7 @@ mod tests {
             timeout: Some(5),
             working_dir: None,
             env_vars: Some(env_vars),
+            run_as: None,
         };
         
         let result = executor.execute(request).await;
@@ -303,6 +358,7 @@ mod tests {
             timeout: Some(1), // 1 second timeout
             working_dir: None,
             env_vars: None,
+            run_as: None,
         };
         
         let start = std::time::Instant::now();

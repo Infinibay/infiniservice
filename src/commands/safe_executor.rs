@@ -1,6 +1,8 @@
 //! Safe command executor with validation and restrictions
 
 use super::{SafeCommandRequest, SafeCommandType, CommandResponse, ServiceOperation, create_response};
+use super::platform_factory::PlatformFactory;
+use super::traits::SystemOperations;
 use crate::os_detection::{get_os_info, OsType};
 use anyhow::{Result, anyhow, Context};
 use log::{debug, warn, error};
@@ -77,23 +79,10 @@ for ($i = $startIndex; $i -lt $lines.Count; $i++) {
 
 $results | ConvertTo-Json -Compress"#;
 
-/// Disk space information structure
-#[derive(Debug, Clone)]
-#[cfg(target_os = "linux")]
-struct DiskSpaceInfo {
-    #[allow(dead_code)]
-    mount_point: String,
-    #[allow(dead_code)]
-    total_gb: f64,
-    available_gb: f64,
-    #[allow(dead_code)]
-    used_gb: f64,
-    usage_percent: f64,
-}
-
 /// Executor for safe, validated commands
 pub struct SafeCommandExecutor {
     os_info: &'static crate::os_detection::OsInfo,
+    system_ops: Box<dyn SystemOperations>,
 }
 
 impl SafeCommandExecutor {
@@ -101,6 +90,7 @@ impl SafeCommandExecutor {
     pub fn new() -> Result<Self> {
         Ok(Self {
             os_info: get_os_info(),
+            system_ops: PlatformFactory::create_system_operations(),
         })
     }
     
@@ -469,28 +459,37 @@ impl SafeCommandExecutor {
                 self.get_top_processes(*limit, sort_by.as_deref()).await
             },
             
-            // Auto-check commands
-            SafeCommandType::CheckWindowsUpdates => self.check_windows_updates().await,
-            SafeCommandType::GetUpdateHistory { days } => self.get_update_history(*days).await,
-            SafeCommandType::GetPendingUpdates => self.get_pending_updates().await,
+            // Update commands - delegated to SystemOperations
+            SafeCommandType::CheckWindowsUpdates | SafeCommandType::CheckLinuxUpdates => {
+                self.system_ops.check_updates().await
+            },
+            SafeCommandType::GetUpdateHistory { days } | SafeCommandType::GetLinuxUpdateHistory { days } => {
+                self.system_ops.get_update_history(days.unwrap_or(30)).await
+            },
+            SafeCommandType::GetPendingUpdates | SafeCommandType::GetPendingLinuxUpdates => {
+                self.system_ops.get_pending_updates().await
+            },
 
-            // Linux Update commands
-            SafeCommandType::CheckLinuxUpdates => self.check_linux_updates().await,
-            SafeCommandType::GetLinuxUpdateHistory { days } => self.get_linux_update_history(*days).await,
-            SafeCommandType::GetPendingLinuxUpdates => self.get_pending_linux_updates().await,
-
-            // Linux Security commands
-            SafeCommandType::CheckLinuxSecurity => self.check_linux_security().await,
-            SafeCommandType::GetLinuxSecurityStatus => self.check_linux_security().await,
-            SafeCommandType::GetLinuxFirewallStatus => self.get_linux_firewall_status().await,
-            SafeCommandType::CheckFirewallStatus => self.get_linux_firewall_status().await,
-            SafeCommandType::GetLinuxSecurityUpdates => self.get_linux_security_updates().await,
-            SafeCommandType::CheckSecurityModules => self.check_security_modules().await,
-
-            SafeCommandType::CheckWindowsDefender => self.check_windows_defender().await,
-            SafeCommandType::GetDefenderStatus => self.get_defender_status().await,
-            SafeCommandType::RunDefenderQuickScan => self.run_defender_quick_scan().await,
-            SafeCommandType::GetThreatHistory => self.get_threat_history().await,
+            // Security commands - delegated to SystemOperations
+            SafeCommandType::CheckLinuxSecurity | SafeCommandType::GetLinuxSecurityStatus |
+            SafeCommandType::CheckWindowsDefender | SafeCommandType::GetDefenderStatus => {
+                self.system_ops.check_security().await
+            },
+            SafeCommandType::GetLinuxFirewallStatus | SafeCommandType::CheckFirewallStatus => {
+                self.system_ops.get_firewall_status().await
+            },
+            SafeCommandType::GetLinuxSecurityUpdates => {
+                self.system_ops.get_security_updates().await
+            },
+            SafeCommandType::CheckSecurityModules => {
+                self.system_ops.check_security_modules().await
+            },
+            SafeCommandType::RunDefenderQuickScan => {
+                self.system_ops.run_security_scan().await
+            },
+            SafeCommandType::GetThreatHistory => {
+                self.system_ops.get_threat_history().await
+            },
             
             SafeCommandType::GetInstalledApplicationsWMI => self.get_installed_applications_wmi().await,
             SafeCommandType::CheckApplicationUpdates => self.check_application_updates().await,
@@ -498,8 +497,10 @@ impl SafeCommandExecutor {
             SafeCommandType::CheckSpecificAppUpdates { app_id } => self.check_specific_app_updates(app_id).await,
             SafeCommandType::EstimateUpdateSize { app_id } => self.estimate_update_size(app_id).await,
             SafeCommandType::GetAvailableUpdates => self.get_available_updates().await,
-            SafeCommandType::GetSecurityUpdates => self.get_security_updates().await,
-            
+            SafeCommandType::GetSecurityUpdates => {
+                self.system_ops.get_security_updates().await
+            },
+
             SafeCommandType::CheckDiskSpace { warning_threshold, critical_threshold } => {
                 self.check_disk_space(*warning_threshold, *critical_threshold).await
             },
@@ -511,7 +512,7 @@ impl SafeCommandExecutor {
             },
             SafeCommandType::RunAllHealthChecks => self.run_all_health_checks().await,
             SafeCommandType::DiskCleanup { drive, targets } => {
-                self.disk_cleanup(drive, targets).await
+                self.system_ops.disk_cleanup(drive, targets).await
             },
             SafeCommandType::ExecutePowerShellScript {
                 script,
@@ -1609,339 +1610,6 @@ impl SafeCommandExecutor {
         
         packages
     }
-    
-    // ===== Auto-Check Command Handlers =====
-    
-    /// Check Windows Updates
-    async fn check_windows_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "windows")]
-        {
-            use crate::commands::windows_updates;
-            
-            match windows_updates::check_windows_updates().await {
-                Ok(update_status) => {
-                    let status_json = serde_json::to_value(&update_status)?;
-                    let summary = format!(
-                        "Found {} installed updates, {} pending updates", 
-                        update_status.installed_updates.len(),
-                        update_status.pending_updates.len()
-                    );
-                    Ok((summary, String::new(), Some(status_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to check Windows updates: {}", e))
-            }
-        }
-        
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(anyhow!("Windows Updates check is only available on Windows"))
-        }
-    }
-    
-    /// Get Windows Update history
-    async fn get_update_history(&self, #[allow(unused_variables)] days: Option<u32>) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "windows")]
-        {
-            use crate::commands::windows_updates;
-
-            let days = days.unwrap_or(30);
-            match windows_updates::get_update_history(days).await {
-                Ok(updates) => {
-                    let updates_json = serde_json::to_value(&updates)?;
-                    let summary = format!("Found {} updates in the last {} days", updates.len(), days);
-                    Ok((summary, String::new(), Some(updates_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to get update history: {}", e))
-            }
-        }
-        
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(anyhow!("Windows Update history is only available on Windows"))
-        }
-    }
-    
-    /// Get pending Windows Updates
-    async fn get_pending_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        // This is a subset of check_windows_updates, focusing on pending updates only
-        self.check_windows_updates().await
-    }
-    
-    /// Check Windows Defender status
-    async fn check_windows_defender(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "windows")]
-        {
-            use crate::commands::windows_defender;
-            
-            match windows_defender::check_windows_defender().await {
-                Ok(defender_status) => {
-                    let status_json = serde_json::to_value(&defender_status)?;
-                    let summary = format!(
-                        "Defender enabled: {}, Real-time protection: {}, Threats: {}",
-                        defender_status.enabled,
-                        defender_status.real_time_protection,
-                        defender_status.threats_detected
-                    );
-                    Ok((summary, String::new(), Some(status_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to check Windows Defender: {}", e))
-            }
-        }
-        
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(anyhow!("Windows Defender check is only available on Windows"))
-        }
-    }
-    
-    /// Get Windows Defender status (alias for check_windows_defender)
-    async fn get_defender_status(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        self.check_windows_defender().await
-    }
-    
-    /// Run Windows Defender quick scan
-    async fn run_defender_quick_scan(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "windows")]
-        {
-            use crate::commands::windows_defender::{self, DefenderScanType};
-            
-            match windows_defender::run_defender_scan(DefenderScanType::Quick).await {
-                Ok(scan_result) => {
-                    let result_json = serde_json::to_value(&scan_result)?;
-                    let summary = format!("Quick scan started: {:?}", scan_result.status);
-                    Ok((summary, String::new(), Some(result_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to start Defender scan: {}", e))
-            }
-        }
-        
-        #[cfg(not(target_os = "windows"))]
-        {
-            Err(anyhow!("Windows Defender scan is only available on Windows"))
-        }
-    }
-    
-    /// Get Windows Defender threat history
-    async fn get_threat_history(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        // This is included in the defender status check
-        self.check_windows_defender().await
-    }
-
-    // ===== Linux Update Command Handlers =====
-
-    /// Check Linux Updates
-    async fn check_linux_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "linux")]
-        {
-            use crate::commands::linux_updates;
-
-            match linux_updates::check_linux_updates().await {
-                Ok(update_status) => {
-                    let status_json = serde_json::to_value(&update_status)?;
-                    let summary = format!(
-                        "Found {} pending updates ({} security updates) via {}",
-                        update_status.total_pending_count,
-                        update_status.security_updates_count,
-                        update_status.package_manager
-                    );
-                    Ok((summary, String::new(), Some(status_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to check Linux updates: {}", e))
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(anyhow!("Linux Updates check is only available on Linux"))
-        }
-    }
-
-    /// Get Linux Update history
-    async fn get_linux_update_history(&self, #[allow(unused_variables)] days: Option<u32>) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "linux")]
-        {
-            use crate::commands::linux_updates;
-
-            let days = days.unwrap_or(30);
-            match linux_updates::get_linux_update_history(days).await {
-                Ok(updates) => {
-                    let updates_json = serde_json::to_value(&updates)?;
-                    let summary = format!("Found {} updates in the last {} days", updates.len(), days);
-                    Ok((summary, String::new(), Some(updates_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to get Linux update history: {}", e))
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(anyhow!("Linux Update history is only available on Linux"))
-        }
-    }
-
-    /// Get pending Linux updates
-    async fn get_pending_linux_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "linux")]
-        {
-            use crate::commands::linux_updates;
-
-            match linux_updates::get_pending_linux_updates().await {
-                Ok(pending_updates) => {
-                    let security_count = pending_updates.iter().filter(|u| u.is_security).count();
-                    let updates_json = serde_json::to_value(&pending_updates)?;
-                    let summary = format!(
-                        "Found {} pending updates ({} security updates)",
-                        pending_updates.len(),
-                        security_count
-                    );
-                    Ok((summary, String::new(), Some(updates_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to get pending Linux updates: {}", e))
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(anyhow!("Pending Linux updates check is only available on Linux"))
-        }
-    }
-
-    // ===== Linux Security Command Handlers =====
-
-    /// Check complete Linux security status
-    async fn check_linux_security(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "linux")]
-        {
-            use crate::commands::linux_security;
-
-            match linux_security::check_linux_security().await {
-                Ok(security_status) => {
-                    let status_json = serde_json::to_value(&security_status)?;
-                    let firewall_status = if security_status.firewall.enabled {
-                        "active"
-                    } else {
-                        "inactive"
-                    };
-                    let security_module = format!("{:?}", security_status.security_module.module_type);
-                    let summary = format!(
-                        "Firewall: {} ({}), Security module: {}, Security updates: {}",
-                        firewall_status,
-                        format!("{:?}", security_status.firewall.firewall_type).to_lowercase(),
-                        security_module.to_lowercase(),
-                        security_status.security_updates_count
-                    );
-                    Ok((summary, String::new(), Some(status_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to check Linux security: {}", e))
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(anyhow!("Linux Security check is only available on Linux"))
-        }
-    }
-
-    /// Get Linux firewall status
-    async fn get_linux_firewall_status(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "linux")]
-        {
-            use crate::commands::linux_security;
-
-            match linux_security::get_linux_firewall_status().await {
-                Ok(firewall_status) => {
-                    let status_json = serde_json::to_value(&firewall_status)?;
-                    let status = if firewall_status.enabled { "active" } else { "inactive" };
-                    let summary = format!(
-                        "Firewall: {} ({:?}), Rules: {}, Default incoming: {}",
-                        status,
-                        firewall_status.firewall_type,
-                        firewall_status.rules_count,
-                        firewall_status.default_incoming.as_deref().unwrap_or("unknown")
-                    );
-                    Ok((summary, String::new(), Some(status_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to get Linux firewall status: {}", e))
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(anyhow!("Linux Firewall status is only available on Linux"))
-        }
-    }
-
-    /// Get Linux security updates
-    async fn get_linux_security_updates(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "linux")]
-        {
-            use crate::commands::linux_security;
-
-            match linux_security::get_linux_security_updates().await {
-                Ok(security_updates) => {
-                    let updates_json = serde_json::to_value(&security_updates)?;
-                    let critical_count = security_updates.iter()
-                        .filter(|u| u.severity.as_deref() == Some("Critical") || u.severity.as_deref() == Some("Important"))
-                        .count();
-                    let summary = format!(
-                        "Found {} security updates ({} critical/important)",
-                        security_updates.len(),
-                        critical_count
-                    );
-                    Ok((summary, String::new(), Some(updates_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to get Linux security updates: {}", e))
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(anyhow!("Linux Security updates check is only available on Linux"))
-        }
-    }
-
-    /// Check security modules status (SELinux/AppArmor)
-    async fn check_security_modules(&self) -> Result<(String, String, Option<serde_json::Value>)> {
-        #[cfg(target_os = "linux")]
-        {
-            use crate::commands::linux_security;
-
-            match linux_security::check_security_modules().await {
-                Ok(module_status) => {
-                    let status_json = serde_json::to_value(&module_status)?;
-                    let summary = match &module_status.module_type {
-                        linux_security::SecurityModuleType::SELinux => {
-                            format!(
-                                "SELinux: {} (mode: {:?}, policy: {})",
-                                if module_status.enabled { "enabled" } else { "disabled" },
-                                module_status.selinux_mode.as_ref().unwrap_or(&linux_security::SELinuxMode::Unknown),
-                                module_status.selinux_policy.as_deref().unwrap_or("unknown")
-                            )
-                        }
-                        linux_security::SecurityModuleType::AppArmor => {
-                            format!(
-                                "AppArmor: {} (profiles loaded: {}, enforce: {}, complain: {})",
-                                if module_status.enabled { "enabled" } else { "disabled" },
-                                module_status.profiles_loaded.unwrap_or(0),
-                                module_status.profiles_enforce.unwrap_or(0),
-                                module_status.profiles_complain.unwrap_or(0)
-                            )
-                        }
-                        linux_security::SecurityModuleType::None => {
-                            "No security module detected (SELinux/AppArmor)".to_string()
-                        }
-                    };
-                    Ok((summary, String::new(), Some(status_json)))
-                }
-                Err(e) => Err(anyhow!("Failed to check security modules: {}", e))
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            Err(anyhow!("Security modules check is only available on Linux"))
-        }
-    }
 
     /// Get installed applications via WMI
     async fn get_installed_applications_wmi(&self) -> Result<(String, String, Option<serde_json::Value>)> {
@@ -2347,734 +2015,11 @@ impl SafeCommandExecutor {
             Err(e) => Err(anyhow!("Failed to run health checks: {}", e))
         }
     }
-    
-    /// Perform disk cleanup with distribution-specific commands
-    ///
-    /// # Arguments
-    /// * `drive` - The mount point to clean (e.g., "/" or "C:\")
-    /// * `targets` - List of cleanup targets: "cache", "old-kernels", "temp-files", "logs"
-    ///
-    /// # Linux Support
-    /// - Ubuntu/Debian: Uses apt-get clean, autoremove, journalctl
-    /// - Fedora/RHEL: Uses dnf/yum clean, autoremove, journalctl
-    ///
-    /// # Returns
-    /// JSON with space freed, operations performed, and any warnings
-    #[cfg(target_os = "linux")]
-    async fn disk_cleanup(&self, drive: &str, targets: &[String]) -> Result<(String, String, Option<serde_json::Value>)> {
-        use crate::os_detection::PackageManager;
-        use log::info;
 
-        // Valid cleanup targets
-        const VALID_TARGETS: &[&str] = &["cache", "old-kernels", "temp-files", "logs"];
-
-        // Validate targets
-        if targets.is_empty() {
-            return Err(anyhow!(
-                "No cleanup targets specified. Valid targets: {}",
-                VALID_TARGETS.join(", ")
-            ));
-        }
-
-        let invalid_targets: Vec<&String> = targets
-            .iter()
-            .filter(|t| !VALID_TARGETS.contains(&t.as_str()))
-            .collect();
-
-        if !invalid_targets.is_empty() {
-            return Err(anyhow!(
-                "Invalid cleanup targets: {:?}. Valid targets: {}",
-                invalid_targets,
-                VALID_TARGETS.join(", ")
-            ));
-        }
-
-        // Get disk space before cleanup
-        let space_before = self.get_disk_space_info(drive)?;
-
-        // Check minimum space requirement (1GB) for safe operation
-        if space_before.available_gb < 1.0 {
-            warn!("Very low disk space ({:.2} GB available). Proceeding with caution.", space_before.available_gb);
-        }
-
-        // Detect package manager
-        let package_manager = self.detect_linux_package_manager();
-        info!("Using package manager: {:?}", package_manager);
-
-        // Execute cleanup based on package manager
-        let operations = match package_manager {
-            Some(PackageManager::Apt) => {
-                self.cleanup_disk_ubuntu(targets).await?
-            }
-            Some(PackageManager::Dnf) | Some(PackageManager::Yum) => {
-                self.cleanup_disk_fedora(targets, package_manager.as_ref().unwrap()).await?
-            }
-            _ => {
-                // Fallback to generic Linux cleanup
-                self.cleanup_disk_generic_linux(targets).await?
-            }
-        };
-
-        // Get disk space after cleanup
-        let space_after = self.get_disk_space_info(drive)?;
-        let space_freed_gb = space_after.available_gb - space_before.available_gb;
-
-        // Build response - count successes and failures
-        let targets_processed: Vec<&String> = targets.iter().filter(|t|
-            operations.iter().any(|op| op.get("target").and_then(|v| v.as_str()) == Some(t.as_str()))
-        ).collect();
-
-        let warnings: Vec<String> = operations
-            .iter()
-            .filter_map(|op| op.get("warning").and_then(|v| v.as_str()).map(String::from))
-            .collect();
-
-        // Count successful and failed operations
-        let successful_ops: usize = operations.iter()
-            .filter(|op| op.get("success").and_then(|v| v.as_bool()).unwrap_or(false))
-            .count();
-        let failed_ops: usize = operations.iter()
-            .filter(|op| !op.get("success").and_then(|v| v.as_bool()).unwrap_or(false))
-            .count();
-
-        // Collect error messages, especially permission errors
-        let errors: Vec<String> = operations
-            .iter()
-            .filter_map(|op| op.get("error").and_then(|v| v.as_str()).map(String::from))
-            .filter(|e| !e.is_empty())
-            .collect();
-
-        let permission_errors: Vec<&String> = errors
-            .iter()
-            .filter(|e| e.contains("sudo") || e.contains("Permission denied") || e.contains("Operation not permitted"))
-            .collect();
-
-        let success = successful_ops > 0;
-
-        let response_data = json!({
-            "success": success,
-            "drive": drive,
-            "targets_processed": targets_processed,
-            "successful_operations": successful_ops,
-            "failed_operations": failed_ops,
-            "space_before": {
-                "available_gb": space_before.available_gb,
-                "usage_percent": space_before.usage_percent
-            },
-            "space_after": {
-                "available_gb": space_after.available_gb,
-                "usage_percent": space_after.usage_percent
-            },
-            "space_freed_gb": if space_freed_gb > 0.0 { space_freed_gb } else { 0.0 },
-            "operations": operations,
-            "warnings": warnings,
-            "errors": errors,
-            "requires_elevation": !permission_errors.is_empty(),
-            "package_manager": package_manager.map(|pm| format!("{:?}", pm)).unwrap_or_else(|| "generic".to_string())
-        });
-
-        // If no operations succeeded, return an error with details
-        if !success {
-            let error_summary = if !permission_errors.is_empty() {
-                format!(
-                    "All {} cleanup operation(s) failed. {} require elevated privileges (sudo). Errors: {}",
-                    failed_ops,
-                    permission_errors.len(),
-                    errors.join("; ")
-                )
-            } else if !errors.is_empty() {
-                format!(
-                    "All {} cleanup operation(s) failed. Errors: {}",
-                    failed_ops,
-                    errors.join("; ")
-                )
-            } else {
-                format!(
-                    "All {} cleanup operation(s) failed or were skipped. Check warnings: {}",
-                    failed_ops,
-                    warnings.join("; ")
-                )
-            };
-
-            error!("{}", error_summary);
-            return Err(anyhow!(error_summary));
-        }
-
-        let message = format!(
-            "Disk cleanup completed: {:.2} GB freed on {} ({} succeeded, {} failed)",
-            if space_freed_gb > 0.0 { space_freed_gb } else { 0.0 },
-            drive,
-            successful_ops,
-            failed_ops
-        );
-
-        // Return stderr with permission warnings if any operations failed due to permissions
-        let stderr = if !permission_errors.is_empty() {
-            format!("Warning: {} operation(s) require elevated privileges (sudo)", permission_errors.len())
-        } else {
-            String::new()
-        };
-
-        Ok((message, stderr, Some(response_data)))
-    }
-
-    /// Disk cleanup for non-Linux platforms
-    #[cfg(not(target_os = "linux"))]
-    async fn disk_cleanup(&self, _drive: &str, _targets: &[String]) -> Result<(String, String, Option<serde_json::Value>)> {
-        Err(anyhow!("Disk cleanup with targets is only supported on Linux. For Windows, use the Windows Disk Cleanup utility."))
-    }
-
-    /// Get disk space information for a mount point
-    #[cfg(target_os = "linux")]
-    fn get_disk_space_info(&self, mount_point: &str) -> Result<DiskSpaceInfo> {
-        use sysinfo::Disks;
-
-        let disks = Disks::new_with_refreshed_list();
-
-        // Find the disk matching the mount point, or find the closest parent mount
-        let mut best_match: Option<&sysinfo::Disk> = None;
-        let mut best_match_len = 0;
-
-        for disk in &disks {
-            let disk_mount = disk.mount_point().to_string_lossy();
-            if mount_point.starts_with(disk_mount.as_ref()) && disk_mount.len() > best_match_len {
-                best_match = Some(disk);
-                best_match_len = disk_mount.len();
-            }
-        }
-
-        if let Some(disk) = best_match {
-            let total_bytes = disk.total_space();
-            let available_bytes = disk.available_space();
-            let used_bytes = total_bytes.saturating_sub(available_bytes);
-            let usage_percent = if total_bytes > 0 {
-                (used_bytes as f64 / total_bytes as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            Ok(DiskSpaceInfo {
-                mount_point: disk.mount_point().to_string_lossy().to_string(),
-                total_gb: total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                available_gb: available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                used_gb: used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                usage_percent,
-            })
-        } else {
-            Err(anyhow!("Could not find disk information for mount point: {}", mount_point))
-        }
-    }
-
-    /// Detect the Linux package manager available on the system
-    #[cfg(target_os = "linux")]
-    fn detect_linux_package_manager(&self) -> Option<crate::os_detection::PackageManager> {
-        use crate::os_detection::PackageManager;
-
-        // Check from OS info first
-        if self.os_info.available_package_managers.contains(&PackageManager::Apt) {
-            return Some(PackageManager::Apt);
-        }
-        if self.os_info.available_package_managers.contains(&PackageManager::Dnf) {
-            return Some(PackageManager::Dnf);
-        }
-        if self.os_info.available_package_managers.contains(&PackageManager::Yum) {
-            return Some(PackageManager::Yum);
-        }
-
-        // Fallback: check executables directly
-        if Self::is_executable_available("apt-get", None) {
-            return Some(PackageManager::Apt);
-        }
-        if Self::is_executable_available("dnf", None) {
-            return Some(PackageManager::Dnf);
-        }
-        if Self::is_executable_available("yum", None) {
-            return Some(PackageManager::Yum);
-        }
-
-        None
-    }
-
-    /// Ubuntu/Debian disk cleanup using APT
-    #[cfg(target_os = "linux")]
-    async fn cleanup_disk_ubuntu(&self, targets: &[String]) -> Result<Vec<serde_json::Value>> {
-        use log::info;
-
-        let mut operations = Vec::new();
-
-        for target in targets {
-            match target.as_str() {
-                "cache" => {
-                    // Clean apt cache
-                    info!("Cleaning APT package cache");
-
-                    let clean_result = self.execute_linux_command("apt-get", &["clean"]).await;
-                    operations.push(json!({
-                        "target": "cache",
-                        "command": "apt-get clean",
-                        "success": clean_result.is_ok(),
-                        "output": clean_result.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-                        "error": clean_result.as_ref().err().map(|e| e.to_string())
-                    }));
-
-                    // Also run autoclean for obsolete packages
-                    let autoclean_result = self.execute_linux_command("apt-get", &["autoclean", "-y"]).await;
-                    operations.push(json!({
-                        "target": "cache",
-                        "command": "apt-get autoclean",
-                        "success": autoclean_result.is_ok(),
-                        "output": autoclean_result.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-                        "error": autoclean_result.as_ref().err().map(|e| e.to_string())
-                    }));
-                }
-                "old-kernels" => {
-                    // Check current kernel to ensure we don't remove it
-                    let current_kernel = self.get_current_kernel_version().await;
-                    info!("Current kernel: {:?}. Checking kernel count before removal.", current_kernel);
-
-                    // Count installed kernels using dpkg
-                    let kernel_count = self.count_installed_kernels_apt().await;
-                    info!("Found {} installed kernel(s)", kernel_count);
-
-                    if kernel_count <= 2 {
-                        // Skip removal to ensure at least 2 kernels remain
-                        warn!("Only {} kernel(s) installed. Skipping old kernel removal to maintain system safety.", kernel_count);
-                        operations.push(json!({
-                            "target": "old-kernels",
-                            "command": "apt-get autoremove --purge (SKIPPED)",
-                            "success": false,
-                            "warning": format!(
-                                "Skipped: Only {} kernel(s) installed. At least 2 kernels must be kept for system safety. Current kernel: {:?}",
-                                kernel_count,
-                                current_kernel
-                            ),
-                            "current_kernel": current_kernel,
-                            "kernel_count": kernel_count
-                        }));
-                    } else {
-                        // Safe to proceed with autoremove
-                        info!("Proceeding with old kernel removal. {} kernels installed.", kernel_count);
-                        let autoremove_result = self.execute_linux_command("apt-get", &["autoremove", "--purge", "-y"]).await;
-                        operations.push(json!({
-                            "target": "old-kernels",
-                            "command": "apt-get autoremove --purge",
-                            "success": autoremove_result.is_ok(),
-                            "output": autoremove_result.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-                            "error": autoremove_result.as_ref().err().map(|e| e.to_string()),
-                            "current_kernel": current_kernel,
-                            "kernel_count_before": kernel_count
-                        }));
-                    }
-                }
-                "temp-files" => {
-                    // Clean temporary files with safety exclusions
-                    info!("Cleaning temporary files");
-                    let temp_result = self.cleanup_temp_files().await;
-                    operations.push(json!({
-                        "target": "temp-files",
-                        "command": "rm -rf /tmp/* (with exclusions)",
-                        "success": temp_result.is_ok(),
-                        "output": temp_result.as_ref().map(|r| r.clone()).unwrap_or_default(),
-                        "error": temp_result.as_ref().err().map(|e| e.to_string())
-                    }));
-                }
-                "logs" => {
-                    // Clean old journal logs
-                    info!("Cleaning old journal logs");
-                    let journal_result = self.execute_linux_command("journalctl", &["--vacuum-time=7d"]).await;
-                    operations.push(json!({
-                        "target": "logs",
-                        "command": "journalctl --vacuum-time=7d",
-                        "success": journal_result.is_ok(),
-                        "output": journal_result.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-                        "error": journal_result.as_ref().err().map(|e| e.to_string())
-                    }));
-                }
-                _ => {
-                    warn!("Unknown cleanup target: {}", target);
-                }
-            }
-        }
-
-        Ok(operations)
-    }
-
-    /// Fedora/RHEL disk cleanup using DNF or YUM
-    #[cfg(target_os = "linux")]
-    async fn cleanup_disk_fedora(&self, targets: &[String], pkg_mgr: &crate::os_detection::PackageManager) -> Result<Vec<serde_json::Value>> {
-        use crate::os_detection::PackageManager;
-        use log::info;
-
-        let mut operations = Vec::new();
-        let cmd = match pkg_mgr {
-            PackageManager::Dnf => "dnf",
-            PackageManager::Yum => "yum",
-            _ => return Err(anyhow!("Unsupported package manager for Fedora cleanup")),
-        };
-
-        for target in targets {
-            match target.as_str() {
-                "cache" => {
-                    info!("Cleaning {} package cache", cmd);
-                    let clean_result = self.execute_linux_command(cmd, &["clean", "all", "-y"]).await;
-                    operations.push(json!({
-                        "target": "cache",
-                        "command": format!("{} clean all", cmd),
-                        "success": clean_result.is_ok(),
-                        "output": clean_result.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-                        "error": clean_result.as_ref().err().map(|e| e.to_string())
-                    }));
-                }
-                "old-kernels" => {
-                    let current_kernel = self.get_current_kernel_version().await;
-                    info!("Current kernel: {:?}. Checking kernel count before removal.", current_kernel);
-
-                    // Count installed kernels using rpm
-                    let kernel_count = self.count_installed_kernels_rpm().await;
-                    info!("Found {} installed kernel(s)", kernel_count);
-
-                    if kernel_count <= 2 {
-                        // Skip removal to ensure at least 2 kernels remain
-                        warn!("Only {} kernel(s) installed. Skipping old kernel removal to maintain system safety.", kernel_count);
-                        operations.push(json!({
-                            "target": "old-kernels",
-                            "command": format!("{} autoremove (SKIPPED)", cmd),
-                            "success": false,
-                            "warning": format!(
-                                "Skipped: Only {} kernel(s) installed. At least 2 kernels must be kept for system safety. Current kernel: {:?}",
-                                kernel_count,
-                                current_kernel
-                            ),
-                            "current_kernel": current_kernel,
-                            "kernel_count": kernel_count
-                        }));
-                    } else {
-                        // Safe to proceed - use package-cleanup if available for precise control
-                        if Self::is_executable_available("package-cleanup", None) {
-                            info!("Using package-cleanup to safely remove old kernels, keeping 2");
-                            let pkg_cleanup_result = self.execute_linux_command(
-                                "package-cleanup",
-                                &["--oldkernels", "--count=2", "-y"]
-                            ).await;
-                            operations.push(json!({
-                                "target": "old-kernels",
-                                "command": "package-cleanup --oldkernels --count=2",
-                                "success": pkg_cleanup_result.is_ok(),
-                                "output": pkg_cleanup_result.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-                                "error": pkg_cleanup_result.as_ref().err().map(|e| e.to_string()),
-                                "current_kernel": current_kernel,
-                                "kernel_count_before": kernel_count
-                            }));
-                        } else {
-                            // Fallback to autoremove
-                            info!("Proceeding with {} autoremove. {} kernels installed.", cmd, kernel_count);
-                            let autoremove_result = self.execute_linux_command(cmd, &["autoremove", "-y"]).await;
-                            operations.push(json!({
-                                "target": "old-kernels",
-                                "command": format!("{} autoremove", cmd),
-                                "success": autoremove_result.is_ok(),
-                                "output": autoremove_result.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-                                "error": autoremove_result.as_ref().err().map(|e| e.to_string()),
-                                "current_kernel": current_kernel,
-                                "kernel_count_before": kernel_count
-                            }));
-                        }
-                    }
-                }
-                "temp-files" => {
-                    info!("Cleaning temporary files");
-                    let temp_result = self.cleanup_temp_files().await;
-                    operations.push(json!({
-                        "target": "temp-files",
-                        "command": "rm -rf /tmp/* (with exclusions)",
-                        "success": temp_result.is_ok(),
-                        "output": temp_result.as_ref().map(|r| r.clone()).unwrap_or_default(),
-                        "error": temp_result.as_ref().err().map(|e| e.to_string())
-                    }));
-                }
-                "logs" => {
-                    info!("Cleaning old journal logs");
-                    let journal_result = self.execute_linux_command("journalctl", &["--vacuum-time=7d"]).await;
-                    operations.push(json!({
-                        "target": "logs",
-                        "command": "journalctl --vacuum-time=7d",
-                        "success": journal_result.is_ok(),
-                        "output": journal_result.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-                        "error": journal_result.as_ref().err().map(|e| e.to_string())
-                    }));
-                }
-                _ => {
-                    warn!("Unknown cleanup target: {}", target);
-                }
-            }
-        }
-
-        Ok(operations)
-    }
-
-    /// Generic Linux cleanup for systems without apt/dnf/yum
-    #[cfg(target_os = "linux")]
-    async fn cleanup_disk_generic_linux(&self, targets: &[String]) -> Result<Vec<serde_json::Value>> {
-        use log::info;
-
-        let mut operations = Vec::new();
-
-        for target in targets {
-            match target.as_str() {
-                "cache" => {
-                    operations.push(json!({
-                        "target": "cache",
-                        "command": "N/A",
-                        "success": false,
-                        "warning": "No supported package manager detected. Cannot clean package cache."
-                    }));
-                }
-                "old-kernels" => {
-                    operations.push(json!({
-                        "target": "old-kernels",
-                        "command": "N/A",
-                        "success": false,
-                        "warning": "No supported package manager detected. Cannot remove old kernels automatically."
-                    }));
-                }
-                "temp-files" => {
-                    info!("Cleaning temporary files");
-                    let temp_result = self.cleanup_temp_files().await;
-                    operations.push(json!({
-                        "target": "temp-files",
-                        "command": "rm -rf /tmp/* (with exclusions)",
-                        "success": temp_result.is_ok(),
-                        "output": temp_result.as_ref().map(|r| r.clone()).unwrap_or_default(),
-                        "error": temp_result.as_ref().err().map(|e| e.to_string())
-                    }));
-                }
-                "logs" => {
-                    info!("Cleaning old journal logs");
-                    let journal_result = self.execute_linux_command("journalctl", &["--vacuum-time=7d"]).await;
-                    operations.push(json!({
-                        "target": "logs",
-                        "command": "journalctl --vacuum-time=7d",
-                        "success": journal_result.is_ok(),
-                        "output": journal_result.as_ref().map(|r| r.0.clone()).unwrap_or_default(),
-                        "error": journal_result.as_ref().err().map(|e| e.to_string())
-                    }));
-                }
-                _ => {
-                    warn!("Unknown cleanup target: {}", target);
-                }
-            }
-        }
-
-        Ok(operations)
-    }
-
-    /// Execute a Linux command and return (stdout, stderr)
-    #[cfg(target_os = "linux")]
-    async fn execute_linux_command(&self, command: &str, args: &[&str]) -> Result<(String, String)> {
-        debug!("Executing Linux command: {} {:?}", command, args);
-
-        let output = Command::new(command)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .context(format!("Failed to execute command: {} {:?}", command, args))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if !output.status.success() {
-            // Check if it's a permission error
-            if stderr.contains("Permission denied") || stderr.contains("Operation not permitted") {
-                return Err(anyhow!(
-                    "Command '{}' requires elevated privileges (sudo). Error: {}",
-                    command,
-                    stderr
-                ));
-            }
-            return Err(anyhow!(
-                "Command '{}' failed with exit code {:?}: {}",
-                command,
-                output.status.code(),
-                stderr
-            ));
-        }
-
-        Ok((stdout, stderr))
-    }
-
-    /// Get the current running kernel version
-    #[cfg(target_os = "linux")]
-    async fn get_current_kernel_version(&self) -> Option<String> {
-        match Command::new("uname")
-            .arg("-r")
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-            }
-            _ => None,
-        }
-    }
-
-    /// Count installed kernel packages on APT-based systems (Debian/Ubuntu)
-    #[cfg(target_os = "linux")]
-    async fn count_installed_kernels_apt(&self) -> usize {
-        // Use dpkg to list installed linux-image packages
-        match Command::new("dpkg")
-            .args(&["-l", "linux-image-*"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                // Count lines that start with "ii" (installed packages)
-                // Filter to only count actual kernel images, not meta-packages
-                stdout
-                    .lines()
-                    .filter(|line| {
-                        line.starts_with("ii") &&
-                        line.contains("linux-image-") &&
-                        // Exclude meta-packages like linux-image-generic
-                        !line.contains("-generic ") &&
-                        !line.contains("-virtual ") &&
-                        !line.contains("-lowlatency ") &&
-                        // Must have a version number pattern (e.g., 5.15.0-91)
-                        line.chars().any(|c| c.is_ascii_digit())
-                    })
-                    .count()
-            }
-            _ => {
-                debug!("Failed to count kernels via dpkg, assuming 2 for safety");
-                2 // Assume minimum for safety
-            }
-        }
-    }
-
-    /// Count installed kernel packages on RPM-based systems (Fedora/RHEL/CentOS)
-    #[cfg(target_os = "linux")]
-    async fn count_installed_kernels_rpm(&self) -> usize {
-        // Use rpm to list installed kernel packages
-        match Command::new("rpm")
-            .args(&["-q", "kernel"])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                // Each line is a kernel package
-                stdout
-                    .lines()
-                    .filter(|line| !line.trim().is_empty() && line.starts_with("kernel-"))
-                    .count()
-            }
-            _ => {
-                // Try alternative: kernel-core for newer Fedora
-                match Command::new("rpm")
-                    .args(&["-q", "kernel-core"])
-                    .output()
-                {
-                    Ok(output) if output.status.success() => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        stdout
-                            .lines()
-                            .filter(|line| !line.trim().is_empty())
-                            .count()
-                    }
-                    _ => {
-                        debug!("Failed to count kernels via rpm, assuming 2 for safety");
-                        2 // Assume minimum for safety
-                    }
-                }
-            }
-        }
-    }
-
-    /// Clean temporary files with safety exclusions
-    #[cfg(target_os = "linux")]
-    async fn cleanup_temp_files(&self) -> Result<String> {
-        use std::fs;
-        use log::info;
-
-        // Directories to exclude from cleanup (critical system sockets)
-        const EXCLUDED_DIRS: &[&str] = &[
-            ".X11-unix",
-            ".ICE-unix",
-            ".font-unix",
-            ".XIM-unix",
-            "systemd-private-",
-        ];
-
-        let temp_dirs = vec!["/tmp", "/var/tmp"];
-        let mut total_freed: u64 = 0;
-        let mut files_removed: usize = 0;
-        let mut errors = Vec::new();
-
-        for temp_dir in temp_dirs {
-            let path = std::path::Path::new(temp_dir);
-            if !path.exists() {
-                continue;
-            }
-
-            match fs::read_dir(path) {
-                Ok(entries) => {
-                    for entry in entries.flatten() {
-                        let entry_name = entry.file_name().to_string_lossy().to_string();
-
-                        // Skip excluded directories
-                        if EXCLUDED_DIRS.iter().any(|exc| entry_name.starts_with(exc)) {
-                            debug!("Skipping excluded entry: {}", entry_name);
-                            continue;
-                        }
-
-                        // Only clean files/dirs older than 1 day
-                        if let Ok(metadata) = entry.metadata() {
-                            if let Ok(modified) = metadata.modified() {
-                                let age = std::time::SystemTime::now()
-                                    .duration_since(modified)
-                                    .unwrap_or(std::time::Duration::from_secs(0));
-
-                                if age > std::time::Duration::from_secs(86400) {
-                                    let size = metadata.len();
-                                    let entry_path = entry.path();
-
-                                    let result = if entry_path.is_dir() {
-                                        fs::remove_dir_all(&entry_path)
-                                    } else {
-                                        fs::remove_file(&entry_path)
-                                    };
-
-                                    match result {
-                                        Ok(_) => {
-                                            total_freed += size;
-                                            files_removed += 1;
-                                            debug!("Removed: {:?} ({} bytes)", entry_path, size);
-                                        }
-                                        Err(e) => {
-                                            // Don't fail on permission errors, just log them
-                                            if e.kind() != std::io::ErrorKind::PermissionDenied {
-                                                debug!("Failed to remove {:?}: {}", entry_path, e);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("Failed to read {}: {}", temp_dir, e));
-                }
-            }
-        }
-
-        info!("Temp cleanup: {} files removed, {} bytes freed", files_removed, total_freed);
-
-        Ok(format!(
-            "Removed {} files/directories, freed {} bytes. Errors: {}",
-            files_removed,
-            total_freed,
-            if errors.is_empty() { "none".to_string() } else { errors.join("; ") }
-        ))
-    }
+    // NOTE: disk_cleanup and related helper functions (get_disk_space_info, detect_linux_package_manager,
+    // cleanup_disk_ubuntu, cleanup_disk_fedora, cleanup_disk_generic_linux, get_current_kernel_version,
+    // count_installed_kernels_apt, count_installed_kernels_rpm, cleanup_temp_files) have been moved to
+    // LinuxSystemOperations and WindowsSystemOperations. The executor now delegates to self.system_ops.disk_cleanup().
 
     /// Execute a PowerShell script with optional elevation and environment customization
     ///
@@ -3467,7 +2412,7 @@ mod tests {
             default_shell: ShellType::PowerShell,
         }));
         
-        let executor = SafeCommandExecutor { os_info: os_info_ref };
+        let executor = SafeCommandExecutor::new().expect("Failed to create executor");
         
         // Real output format from the screenshot
         let real_output = r#"Name                            Id                                Version        Source
@@ -3516,7 +2461,7 @@ Slack Beta                      SlackTechnologies.Slack.Beta      4.26.0-beta2  
             default_shell: ShellType::PowerShell,
         }));
         
-        let executor = SafeCommandExecutor { os_info: os_info_ref };
+        let executor = SafeCommandExecutor::new().expect("Failed to create executor");
         
         // Test that parse_winget_search handles proper output format
         // Use same format as test_parse_winget_real_output_format which passes
@@ -3559,7 +2504,7 @@ Slack Beta                      SlackTechnologies.Slack.Beta     4.26.0         
             default_shell: ShellType::PowerShell,
         }));
         
-        let executor = SafeCommandExecutor { os_info: os_info_ref };
+        let executor = SafeCommandExecutor::new().expect("Failed to create executor");
         
         // Terms acceptance dialog that was being incorrectly parsed before the fix
         // With the acceptance flags added, this dialog should never appear
@@ -3598,7 +2543,7 @@ Do you agree to all the source agreements terms?
             default_shell: ShellType::PowerShell,
         }));
         
-        let executor = SafeCommandExecutor { os_info: os_info_ref };
+        let executor = SafeCommandExecutor::new().expect("Failed to create executor");
         
         // Empty search results - winget shows no packages after the separator line
         let empty_output = r#"Name  Id  Version  Source
@@ -3627,7 +2572,7 @@ Do you agree to all the source agreements terms?
             default_shell: ShellType::PowerShell,
         }));
         
-        let executor = SafeCommandExecutor { os_info: os_info_ref };
+        let executor = SafeCommandExecutor::new().expect("Failed to create executor");
         
         // Test JSON array parsing
         let json_output = r#"[
@@ -3685,7 +2630,7 @@ Do you agree to all the source agreements terms?
             default_shell: ShellType::PowerShell,
         }));
         
-        let executor = SafeCommandExecutor { os_info: os_info_ref };
+        let executor = SafeCommandExecutor::new().expect("Failed to create executor");
         
         // Test dangerous inputs are rejected
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3721,7 +2666,7 @@ Do you agree to all the source agreements terms?
             default_shell: ShellType::PowerShell,
         }));
         
-        let executor = SafeCommandExecutor { os_info: os_info_ref };
+        let executor = SafeCommandExecutor::new().expect("Failed to create executor");
         
         let input = r#"
 █████████████▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
@@ -3757,7 +2702,7 @@ Processing package list
             default_shell: ShellType::PowerShell,
         }));
         
-        let executor = SafeCommandExecutor { os_info: os_info_ref };
+        let executor = SafeCommandExecutor::new().expect("Failed to create executor");
         
         let input_with_progress = r#"Name                            Id                                Version        Source
 -------------------------------------------------------------------------------------------
@@ -3803,7 +2748,7 @@ Google Chrome                   Google.Chrome                     119.0.6045    
             default_shell: ShellType::PowerShell,
         }));
         
-        let executor = SafeCommandExecutor { os_info: os_info_ref };
+        let executor = SafeCommandExecutor::new().expect("Failed to create executor");
         
         // This simulates the actual output that was causing problems
         let problematic_output = r#"\ | / -

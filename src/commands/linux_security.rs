@@ -12,10 +12,10 @@ use std::time::SystemTime;
 use log::{debug, info};
 
 #[cfg(target_os = "linux")]
-use std::process::Command;
+use crate::os_detection::{get_os_info, LinuxDistro};
 
 #[cfg(target_os = "linux")]
-use crate::os_detection::{get_os_info, LinuxDistro};
+use super::common::shell::{execute_command, execute_command_allow_failure, command_exists};
 
 /// Type of firewall detected on the system
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -154,56 +154,6 @@ pub struct LinuxSecurityStatus {
 
     /// Linux distribution name
     pub distro: String,
-}
-
-/// Execute a command and return stdout if successful
-#[cfg(target_os = "linux")]
-fn execute_command(cmd: &str, args: &[&str]) -> Result<String> {
-    debug!("Executing command: {} {:?}", cmd, args);
-
-    let output = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| anyhow!("Failed to execute command {} {:?}: {}", cmd, args, e))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!("Command {} failed with stderr: {}", cmd, stderr);
-        Err(anyhow!("Command {} failed: {}", cmd, stderr))
-    }
-}
-
-/// Execute a command and return stdout even if exit code is non-zero (for status commands)
-#[cfg(target_os = "linux")]
-fn execute_command_allow_failure(cmd: &str, args: &[&str]) -> Option<String> {
-    debug!("Executing command (allow failure): {} {:?}", cmd, args);
-
-    match Command::new(cmd).args(args).output() {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            if !stdout.is_empty() {
-                Some(stdout)
-            } else {
-                Some(String::from_utf8_lossy(&output.stderr).to_string())
-            }
-        }
-        Err(e) => {
-            debug!("Command {} not available: {}", cmd, e);
-            None
-        }
-    }
-}
-
-/// Check if a command exists in PATH
-#[cfg(target_os = "linux")]
-fn command_exists(cmd: &str) -> bool {
-    Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 /// Detect which firewall is in use on the system

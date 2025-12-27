@@ -12,6 +12,9 @@ use log::{debug, info, warn};
 
 use crate::os_detection::{get_os_info, PackageManager, LinuxDistro};
 
+#[cfg(target_os = "linux")]
+use super::common::shell::execute_command;
+
 /// Linux package update information (installed update record)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LinuxUpdate {
@@ -79,37 +82,6 @@ pub struct LinuxUpdateStatus {
 
     /// Linux distribution name
     pub distro: String,
-}
-
-/// Execute a command and return stdout if successful
-#[cfg(target_os = "linux")]
-fn execute_command(cmd: &str, args: &[&str]) -> Result<String> {
-    debug!("Executing command: {} {:?}", cmd, args);
-
-    let output = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| anyhow!("Failed to execute command {} {:?}: {}", cmd, args, e))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        // Some commands like dnf check-update return exit code 100 when updates are available
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // dnf/yum check-update returns 100 if updates are available, 0 if not
-        if cmd == "dnf" || cmd == "yum" {
-            if let Some(code) = output.status.code() {
-                if code == 100 {
-                    return Ok(stdout.to_string());
-                }
-            }
-        }
-
-        debug!("Command failed with stderr: {}", stderr);
-        Err(anyhow!("Command {} failed: {}", cmd, stderr))
-    }
 }
 
 /// Parse apt list --upgradable output to extract pending updates

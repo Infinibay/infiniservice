@@ -627,10 +627,10 @@ pub async fn run_defender_scan(scan_type: DefenderScanType) -> Result<ScanResult
     // Execute scan through WMI method invocation
     match scan_type {
         DefenderScanType::Quick => {
-            execute_wmi_method(&defender_conn, "MSFT_MpScan", "Start", vec![("ScanType", 1)]).await?;
+            execute_wmi_method(&defender_conn, "MSFT_MpScan", "Start", vec![("ScanType", 1)])?;
         }
         DefenderScanType::Full => {
-            execute_wmi_method(&defender_conn, "MSFT_MpScan", "Start", vec![("ScanType", 2)]).await?;
+            execute_wmi_method(&defender_conn, "MSFT_MpScan", "Start", vec![("ScanType", 2)])?;
         }
         DefenderScanType::Custom(path) => {
             return run_custom_scan(&defender_conn, path);
@@ -648,7 +648,7 @@ pub async fn run_defender_scan(scan_type: DefenderScanType) -> Result<ScanResult
 
 /// Execute WMI method
 #[cfg(target_os = "windows")]
-async fn execute_wmi_method(
+fn execute_wmi_method(
     _conn: &WMIConnection,
     class: &str,
     method: &str,
@@ -798,6 +798,26 @@ pub async fn run_defender_scan(_scan_type: DefenderScanType) -> Result<ScanResul
 #[cfg(not(target_os = "windows"))]
 pub async fn check_windows_defender() -> Result<DefenderStatus> {
     Err(anyhow!("Windows Defender is only available on Windows"))
+}
+
+/// Get threat history (public async wrapper)
+#[cfg(target_os = "windows")]
+pub async fn get_threat_history_async() -> Result<Vec<MSFT_MpThreat>> {
+    let com_lib = COMLibrary::new()
+        .context("Failed to initialize COM library")?;
+
+    let defender_conn = WMIConnection::with_namespace_path(
+        "root\\Microsoft\\Windows\\Defender",
+        com_lib,
+    ).context("Failed to connect to Windows Defender WMI namespace")?;
+
+    get_threat_history(&defender_conn)
+}
+
+/// Non-Windows implementation (stub)
+#[cfg(not(target_os = "windows"))]
+pub async fn get_threat_history_async() -> Result<Vec<MSFT_MpThreat>> {
+    Err(anyhow!("Windows Defender threat history is only available on Windows"))
 }
 
 #[cfg(test)]

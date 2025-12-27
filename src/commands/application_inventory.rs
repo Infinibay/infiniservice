@@ -29,9 +29,9 @@ use windows::Win32::Foundation::WIN32_ERROR;
 use windows::core::PWSTR;
 
 #[cfg(target_os = "linux")]
-use std::process::Command;
-#[cfg(target_os = "linux")]
 use crate::os_detection::{get_os_info, PackageManager};
+#[cfg(target_os = "linux")]
+use super::common::shell::execute_command;
 
 /// Application information from Win32_Product (MSI-installed applications)
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -640,24 +640,6 @@ pub async fn get_available_updates() -> Result<Vec<Application>> {
 // =============================================================================
 // Linux-specific implementations
 // =============================================================================
-
-/// Execute a command and return stdout if successful
-#[cfg(target_os = "linux")]
-fn execute_command(cmd: &str, args: &[&str]) -> Result<String> {
-    debug!("Executing command: {} {:?}", cmd, args);
-
-    let output = Command::new(cmd)
-        .args(args)
-        .output()
-        .map_err(|e| anyhow!("Failed to execute command {} {:?}: {}", cmd, args, e))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(anyhow!("Command {} failed: {}", cmd, stderr))
-    }
-}
 
 /// Get applications installed via dpkg (Debian/Ubuntu)
 #[cfg(target_os = "linux")]

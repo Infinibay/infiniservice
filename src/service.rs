@@ -180,6 +180,13 @@ impl InfiniService {
         self.virtio_connected = match self.communication.connect().await {
             Ok(_) => {
                 info!("VirtIO communication established successfully");
+
+                // Send handshake immediately after connection
+                match self.communication.send_handshake().await {
+                    Ok(_) => info!("Handshake sent successfully"),
+                    Err(e) => warn!("Failed to send handshake: {}", e),
+                }
+
                 true
             }
             Err(e) => {
@@ -347,6 +354,7 @@ impl InfiniService {
                             }
                             Err(e) => {
                                 error!("Error during metrics collection/transmission: {}", e);
+                                self.send_error_if_connected(&format!("Metrics collection/transmission error: {}", e), "service_loop").await;
                                 // Continue running even if there are errors
                             }
                         }
@@ -364,6 +372,7 @@ impl InfiniService {
                             }
                             Err(e) => {
                                 error!("Error processing command: {}", e);
+                                self.send_error_if_connected(&format!("Command processing error: {}", e), "command_executor").await;
                             }
                         }
                     }
@@ -529,6 +538,7 @@ impl InfiniService {
                             }
                             Err(e) => {
                                 error!("Error during metrics collection/transmission: {}", e);
+                                self.send_error_if_connected(&format!("Metrics collection/transmission error: {}", e), "service_loop").await;
                                 // Continue running even if there are errors
                             }
                         }
@@ -546,6 +556,7 @@ impl InfiniService {
                             }
                             Err(e) => {
                                 error!("Error processing command: {}", e);
+                                self.send_error_if_connected(&format!("Command processing error: {}", e), "command_executor").await;
                             }
                         }
                     }
@@ -859,6 +870,7 @@ impl InfiniService {
                                 }
                                 Err(e) => {
                                     warn!("Initial metrics transmission failed after connection: {}", e);
+                                    self.send_error_if_connected("Initial metrics transmission failed after connection", "connection_verification").await;
                                     // Return false because transmission verification failed
                                     Ok(false)
                                 }
@@ -866,6 +878,7 @@ impl InfiniService {
                         }
                         Err(e) => {
                             warn!("Failed to collect metrics for connection verification: {}", e);
+                            self.send_error_if_connected(&format!("Failed to collect metrics for verification: {}", e), "connection_verification").await;
                             Ok(false)
                         }
                     }
@@ -938,6 +951,7 @@ impl InfiniService {
                 timeout: Some(script.timeout_seconds),
                 working_dir: None,
                 env_vars: None,
+                run_as: script.run_as.clone(),
             };
 
             // Execute the script
@@ -1040,6 +1054,7 @@ impl InfiniService {
                                             },
                                             Err(e) => {
                                                 error!("Command execution failed: {}", e);
+                                                self.send_error_if_connected(&format!("Command execution failed: {}", e), "command_executor").await;
                                             }
                                         }
                                     },
@@ -1117,6 +1132,7 @@ impl InfiniService {
                             },
                             Err(e) => {
                                 error!("Command execution failed: {}", e);
+                                self.send_error_if_connected(&format!("Command execution failed: {}", e), "command_executor").await;
                             }
                         }
                     },
@@ -1178,6 +1194,7 @@ impl InfiniService {
             Err(e) => {
                 let collection_time_ms = collection_start.elapsed().as_millis() as f64;
                 self.update_collection_metrics(collection_time_ms, false, false);
+                self.send_error_if_connected(&format!("Failed to collect metrics: {}", e), "collector").await;
                 return Err(e);
             }
         };
@@ -1272,6 +1289,7 @@ impl InfiniService {
                     // Connection broken during transmission - mark as disconnected
                     warn!("VirtIO connection broken during transmission: {}", e);
                     if was_connected {
+                        self.send_error_if_connected("VirtIO connection broken during transmission", "transmission").await;
                         self.virtio_connected = false;
                         self.emit_connection_state_change(ConnectionState::Disconnected).await;
                     }
@@ -1279,6 +1297,7 @@ impl InfiniService {
                 } else {
                     // Other transmission errors - simplified error handling for persistent connections
                     if was_connected {
+                        self.send_error_if_connected(&format!("VirtIO transmission error: {}", e), "transmission").await;
                         self.virtio_connected = false;
                         self.emit_connection_state_change(ConnectionState::Disconnected).await;
                     }
@@ -1351,6 +1370,17 @@ impl InfiniService {
             // Send connection status to host
             if let Err(e) = self.communication.send_connection_status(state_str, details).await {
                 debug!("Failed to send connection status to host: {}", e);
+            }
+        }
+    }
+
+    /// Send error message to host if connected
+    /// This is a helper to avoid duplicating error-sending logic across multiple failure points
+    async fn send_error_if_connected(&self, error: &str, component: &str) {
+        if self.virtio_connected {
+            let details = serde_json::json!({ "component": component });
+            if let Err(e) = self.communication.send_error(error.to_string(), Some(details)).await {
+                debug!("Failed to send error message (suppressed): {}", e);
             }
         }
     }

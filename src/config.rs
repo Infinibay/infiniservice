@@ -72,7 +72,7 @@ pub struct Config {
     pub circuit_breaker_success_threshold: u32,
 
     // Keep-Alive Configuration
-    /// Heartbeat interval in seconds - how often to send keep-alive messages (default: 30 seconds, env: INFINISERVICE_KEEP_ALIVE_INTERVAL)
+    /// Heartbeat interval in seconds - how often to send keep-alive messages (default: 120 seconds, env: INFINISERVICE_KEEP_ALIVE_INTERVAL)
     pub keep_alive_interval_secs: u64,
 
     /// Heartbeat response timeout in seconds - must be less than interval (default: 60 seconds, env: INFINISERVICE_KEEP_ALIVE_TIMEOUT)
@@ -100,7 +100,7 @@ impl Default for Config {
                 // Empty path triggers auto-detection on Windows
                 PathBuf::new()
             } else {
-                PathBuf::from("/dev/virtio-ports/org.infinibay.0")
+                PathBuf::from("/dev/virtio-ports/org.infinibay.agent")
             },
             log_level: "info".to_string(),
             service_name: "infiniservice".to_string(),
@@ -125,9 +125,9 @@ impl Default for Config {
             circuit_breaker_success_threshold: 2, // 2 successes needed to close circuit
 
             // Keep-Alive defaults
-            keep_alive_interval_secs: 30, // Send heartbeat every 30 seconds
+            keep_alive_interval_secs: 120, // Send heartbeat every 120 seconds (protocol requirement)
             keep_alive_timeout_secs: 60, // 60 second timeout for heartbeat response (increased from 10s for reliability)
-            connection_idle_timeout_secs: 30, // 30 seconds idle before proactive ping
+            connection_idle_timeout_secs: 120, // Match keep-alive interval for idle detection
 
             // Graceful Degradation defaults
             degraded_mode_collection_interval_secs: 120, // Slower collection when degraded

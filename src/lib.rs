@@ -19,3 +19,4 @@ pub use config::Config;
 pub use service::InfiniService;
 pub use os_detection::{OsInfo, OsType};
 pub use commands::{IncomingMessage, CommandResponse};
+pub use communication::{HandshakeMessage, ErrorMessage, KeepAliveMessage};

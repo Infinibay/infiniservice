@@ -177,6 +177,75 @@ struct MetricsData {
     system: SystemMetrics,
 }
 
+/// Handshake message sent immediately after connection establishment
+#[derive(Serialize, Debug, Clone)]
+pub struct HandshakeMessage {
+    #[serde(rename = "type")]
+    message_type: String,  // Always "handshake"
+    timestamp: String,
+    vm_id: String,
+    version: String,
+    platform: String,
+    capabilities: Vec<String>,
+}
+
+impl HandshakeMessage {
+    pub fn new(vm_id: String, platform: String) -> Self {
+        Self {
+            message_type: "handshake".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            vm_id,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            platform,
+            capabilities: vec![
+                "metrics".to_string(),
+                "safe_commands".to_string(),
+                "unsafe_commands".to_string(),
+            ],
+        }
+    }
+}
+
+/// Error message sent when errors occur
+#[derive(Serialize, Debug, Clone)]
+pub struct ErrorMessage {
+    #[serde(rename = "type")]
+    message_type: String,  // Always "error"
+    timestamp: String,
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
+}
+
+impl ErrorMessage {
+    pub fn new(error: String, details: Option<serde_json::Value>) -> Self {
+        Self {
+            message_type: "error".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            error,
+            details,
+        }
+    }
+}
+
+/// Keep-alive message sent periodically to host
+#[derive(Serialize, Debug, Clone)]
+pub struct KeepAliveMessage {
+    #[serde(rename = "type")]
+    message_type: String,  // Always "keep_alive"
+    timestamp: String,
+    sequence_number: u32,
+}
+
+impl KeepAliveMessage {
+    pub fn new(sequence_number: u32) -> Self {
+        Self {
+            message_type: "keep_alive".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            sequence_number,
+        }
+    }
+}
 
 pub struct VirtioSerial {
     device_path: std::path::PathBuf,
@@ -211,6 +280,13 @@ pub struct VirtioSerial {
     keep_alive_sequence: Arc<AtomicU32>, // Sequence number for keep-alive messages, incremented with each send
     #[cfg(target_os = "windows")]
     windows_handle: Arc<RwLock<Option<SendableHandle>>>,
+    // Persistent read buffer for Linux to handle message framing with O_NONBLOCK
+    // This accumulates partial reads until a complete newline-delimited message is received
+    #[cfg(target_os = "linux")]
+    linux_read_buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+    // Counter for buffer overflow events (for monitoring and debugging)
+    #[cfg(target_os = "linux")]
+    linux_buffer_overflows: Arc<AtomicU64>,
 }
 
 impl VirtioSerial {
@@ -341,6 +417,12 @@ impl VirtioSerial {
             // Windows handle initialization
             #[cfg(target_os = "windows")]
             windows_handle: Arc::new(RwLock::new(None)),
+            // Linux read buffer initialization (handles O_NONBLOCK message framing)
+            #[cfg(target_os = "linux")]
+            linux_read_buffer: Arc::new(std::sync::Mutex::new(Vec::with_capacity(8192))),
+            // Linux buffer overflow counter initialization
+            #[cfg(target_os = "linux")]
+            linux_buffer_overflows: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -440,6 +522,137 @@ impl VirtioSerial {
             }
         } else if debug_mode {
             debug!("/dev/virtio-ports directory does not exist");
+        }
+
+        // Scan /sys/class/virtio-ports/ for device metadata
+        let sys_virtio_dir = std::path::Path::new("/sys/class/virtio-ports");
+        if debug_mode {
+            debug!("Scanning /sys/class/virtio-ports/ for device metadata...");
+        }
+        if sys_virtio_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(sys_virtio_dir) {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    let name_file = entry_path.join("name");
+
+                    if debug_mode {
+                        debug!("Checking virtio-port entry: {:?}", entry_path);
+                    }
+
+                    // Read the 'name' file to identify the port purpose
+                    if let Ok(port_name) = std::fs::read_to_string(&name_file) {
+                        let port_name = port_name.trim().to_lowercase();
+                        if debug_mode {
+                            debug!("Port name: {}", port_name);
+                        }
+
+                        // Check if this port is relevant (infinibay, agent, qemu, guest_agent)
+                        if port_name.contains("infinibay") ||
+                           port_name.contains("agent") ||
+                           port_name.contains("qemu") ||
+                           port_name.contains("guest_agent") {
+
+                            // Construct device path from entry name
+                            if let Some(entry_name) = entry_path.file_name() {
+                                let entry_name_str = entry_name.to_string_lossy();
+
+                                // Try multiple device path patterns
+                                let candidate_paths = [
+                                    format!("/dev/{}", entry_name_str),
+                                    format!("/dev/virtio-ports/{}", port_name),
+                                    format!("/dev/virtio-ports/{}", entry_name_str),
+                                ];
+
+                                for candidate_path in &candidate_paths {
+                                    let device_path = std::path::Path::new(candidate_path);
+
+                                    if debug_mode {
+                                        debug!("Trying candidate device path: {}", candidate_path);
+                                    }
+
+                                    if device_path.exists() {
+                                        // Resolve symlinks to get the real device path
+                                        let resolved_path = match std::fs::canonicalize(device_path) {
+                                            Ok(p) => {
+                                                if debug_mode {
+                                                    debug!("Resolved symlink: {:?} -> {:?}", device_path, p);
+                                                }
+                                                p
+                                            }
+                                            Err(e) => {
+                                                if debug_mode {
+                                                    debug!("Could not resolve symlink for {:?}: {}", device_path, e);
+                                                }
+                                                device_path.to_path_buf()
+                                            }
+                                        };
+
+                                        // Verify it's a character device
+                                        if let Ok(metadata) = std::fs::metadata(&resolved_path) {
+                                            #[cfg(unix)]
+                                            {
+                                                use std::os::unix::fs::FileTypeExt;
+                                                if metadata.file_type().is_char_device() {
+                                                    info!("Found virtio-serial device via /sys scan: {:?} (port: {})", resolved_path, port_name);
+                                                    return Ok(resolved_path);
+                                                } else if debug_mode {
+                                                    debug!("Path {:?} exists but is not a character device", resolved_path);
+                                                }
+                                            }
+                                            #[cfg(not(unix))]
+                                            {
+                                                if metadata.is_file() {
+                                                    info!("Found virtio-serial device via /sys scan: {:?} (port: {})", resolved_path, port_name);
+                                                    return Ok(resolved_path);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if debug_mode {
+            debug!("/sys/class/virtio-ports directory does not exist");
+        }
+
+        // Fallback: search for /dev/vport* devices
+        if debug_mode {
+            debug!("Fallback: searching for /dev/vport* devices...");
+        }
+        let dev_dir = std::path::Path::new("/dev");
+        if let Ok(entries) = std::fs::read_dir(dev_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name() {
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("vport") {
+                        if debug_mode {
+                            debug!("Found vport device: {:?}", path);
+                        }
+                        // Verify it's a character device
+                        if let Ok(metadata) = std::fs::metadata(&path) {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::FileTypeExt;
+                                if metadata.file_type().is_char_device() {
+                                    info!("Found virtio-serial device at: {:?}", path);
+                                    return Ok(path);
+                                }
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                if metadata.is_file() {
+                                    info!("Found virtio-serial device at: {:?}", path);
+                                    return Ok(path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Err(anyhow!("No virtio-serial device found on Linux"))
@@ -1520,32 +1733,46 @@ impl VirtioSerial {
         {
             use std::os::unix::fs::OpenOptionsExt;
 
-            // Open with O_RDWR | O_NONBLOCK for Linux
-            let write_file = OpenOptions::new()
+            // CRITICAL FIX: Use a SINGLE file handle for both read and write operations.
+            //
+            // The Linux kernel's virtio_console driver (drivers/char/virtio_console.c) only allows
+            // ONE open at a time per port. In port_fops_open():
+            //   if (port->guest_connected) { return -EBUSY; }
+            //   port->guest_connected = true;
+            //
+            // Previously, we opened TWO separate file handles (write_file and read_file),
+            // which violated this restriction. The second open would fail with EBUSY,
+            // causing communication failures on Linux while Windows worked fine
+            // (Windows doesn't have this single-open restriction).
+            //
+            // Now we open a single file with O_RDWR | O_NONBLOCK and share it via Arc<File>
+            // for both read and write operations, matching the Windows approach of using
+            // a single HANDLE for both directions.
+            let file = OpenOptions::new()
+                .read(true)
                 .write(true)
-                .read(true)
                 .custom_flags(libc::O_NONBLOCK)
                 .open(&self.device_path)
-                .with_context(|| format!("Failed to open virtio-serial device for writing: {}", self.device_path.display()))?;
+                .with_context(|| format!("Failed to open virtio-serial device: {}", self.device_path.display()))?;
 
-            let read_file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&self.device_path)
-                .with_context(|| format!("Failed to open virtio-serial device for reading: {}", self.device_path.display()))?;
+            info!("Opened virtio-serial device {} with O_RDWR | O_NONBLOCK", self.device_path.display());
 
-            // Store persistent handles
+            // Share the same file handle for both read and write operations
+            let file_arc = Arc::new(file);
+
+            // Store the shared handle for write operations
             {
                 let mut write_handle = self.write_handle.write().unwrap();
-                *write_handle = Some(Arc::new(write_file));
+                *write_handle = Some(Arc::clone(&file_arc));
             }
+            // Store the same shared handle for read operations
             {
                 let mut read_handle = self.read_handle.write().unwrap();
-                *read_handle = Some(Arc::new(read_file));
+                *read_handle = Some(file_arc);
             }
 
             self.is_connected.store(true, Ordering::SeqCst);
-            info!("Virtio-serial persistent connection established successfully");
+            info!("Virtio-serial persistent connection established successfully (single shared handle)");
             return Ok(());
         }
 
@@ -1900,6 +2127,40 @@ impl VirtioSerial {
         self.send_raw_message(&message_str, true).await
     }
 
+    /// Send handshake message immediately after connection establishment
+    pub async fn send_handshake(&self) -> Result<()> {
+        let platform = if cfg!(target_os = "windows") { "windows" } else { "linux" };
+        let handshake = HandshakeMessage::new(self.vm_id.clone(), platform.to_string());
+
+        info!("Sending handshake: vm_id={}, platform={}, version={}",
+              handshake.vm_id, platform, env!("CARGO_PKG_VERSION"));
+
+        let message_str = serde_json::to_string(&handshake)
+            .with_context(|| "Failed to serialize handshake message")?;
+
+        self.send_raw_message(&message_str, true).await
+    }
+
+    /// Send error message to host
+    /// Note: Uses affects_circuit_breaker=false to avoid error loops
+    pub async fn send_error(&self, error: String, details: Option<serde_json::Value>) -> Result<()> {
+        let error_msg = ErrorMessage::new(error.clone(), details);
+
+        warn!("Sending error message: {}", error);
+
+        let message_str = serde_json::to_string(&error_msg)
+            .with_context(|| "Failed to serialize error message")?;
+
+        // Use affects_circuit_breaker=false to avoid loops when reporting errors
+        match self.send_raw_message(&message_str, false).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                debug!("Failed to send error message (suppressed): {}", e);
+                Ok(()) // Silently succeed to avoid error cascades
+            }
+        }
+    }
+
     /// Classify Windows error codes for intelligent retry logic
     fn classify_windows_error(error_code: i32) -> ClassifiedError {
         match error_code {
@@ -2004,6 +2265,14 @@ impl VirtioSerial {
                 retry_recommended: true,
                 recovery_suggestion: Some("Device not found, retrying".to_string()),
                 max_retries: 10,
+            },
+            std::io::ErrorKind::WouldBlock => ClassifiedError {
+                error_type: "IO_WOULD_BLOCK".to_string(),
+                severity: ErrorSeverity::Temporary,
+                windows_error_code: None,
+                retry_recommended: true,
+                recovery_suggestion: Some("Host not ready yet, waiting for connection".to_string()),
+                max_retries: 15,
             },
             _ => ClassifiedError {
                 error_type: format!("IO_ERROR_{:?}", error_kind),
@@ -2142,6 +2411,85 @@ impl VirtioSerial {
         Ok(())
     }
 
+    /// Check if an I/O error is an interrupted system call (EINTR on Linux)
+    #[cfg(target_os = "linux")]
+    fn is_interrupted_error(error: &std::io::Error) -> bool {
+        // EINTR is error code 4 on Linux
+        error.raw_os_error() == Some(4) ||
+        error.kind() == std::io::ErrorKind::Interrupted
+    }
+
+    /// Classify Linux-specific error codes for detailed error handling
+    #[cfg(target_os = "linux")]
+    fn classify_linux_error(error_code: i32) -> ClassifiedError {
+        match error_code {
+            4 => ClassifiedError { // EINTR - Interrupted system call
+                error_type: "LINUX_EINTR".to_string(),
+                severity: ErrorSeverity::Temporary,
+                windows_error_code: Some(error_code),
+                retry_recommended: true,
+                recovery_suggestion: Some("System call interrupted by signal, retrying immediately".to_string()),
+                max_retries: 3,
+            },
+            11 => ClassifiedError { // EAGAIN/EWOULDBLOCK - Resource temporarily unavailable
+                error_type: "LINUX_EAGAIN".to_string(),
+                severity: ErrorSeverity::Temporary,
+                windows_error_code: Some(error_code),
+                retry_recommended: true,
+                recovery_suggestion: Some("Resource temporarily unavailable, retrying".to_string()),
+                max_retries: 10,
+            },
+            32 => ClassifiedError { // EPIPE - Broken pipe
+                error_type: "LINUX_EPIPE".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: Some(error_code),
+                retry_recommended: true,
+                recovery_suggestion: Some("Broken pipe, connection lost".to_string()),
+                max_retries: 3,
+            },
+            104 => ClassifiedError { // ECONNRESET - Connection reset by peer
+                error_type: "LINUX_ECONNRESET".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: Some(error_code),
+                retry_recommended: true,
+                recovery_suggestion: Some("Connection reset by peer".to_string()),
+                max_retries: 3,
+            },
+            5 => ClassifiedError { // EIO - I/O error
+                error_type: "LINUX_EIO".to_string(),
+                severity: ErrorSeverity::Recoverable,
+                windows_error_code: Some(error_code),
+                retry_recommended: true,
+                recovery_suggestion: Some("I/O error on device, may need reconnection".to_string()),
+                max_retries: 2,
+            },
+            6 => ClassifiedError { // ENXIO - No such device or address
+                error_type: "LINUX_ENXIO".to_string(),
+                severity: ErrorSeverity::Fatal,
+                windows_error_code: Some(error_code),
+                retry_recommended: false,
+                recovery_suggestion: Some("Device not found, VirtIO port may be disconnected".to_string()),
+                max_retries: 0,
+            },
+            19 => ClassifiedError { // ENODEV - No such device
+                error_type: "LINUX_ENODEV".to_string(),
+                severity: ErrorSeverity::Fatal,
+                windows_error_code: Some(error_code),
+                retry_recommended: false,
+                recovery_suggestion: Some("Device removed, VirtIO port no longer exists".to_string()),
+                max_retries: 0,
+            },
+            _ => ClassifiedError {
+                error_type: format!("LINUX_ERRNO_{}", error_code),
+                severity: ErrorSeverity::Unknown,
+                windows_error_code: Some(error_code),
+                retry_recommended: true,
+                recovery_suggestion: Some(format!("Linux error code {}", error_code)),
+                max_retries: 2,
+            }
+        }
+    }
+
     /// Classify OS errors per platform to avoid misclassification
     fn classify_os_error(error: &std::io::Error) -> ClassifiedError {
         #[cfg(target_os = "windows")]
@@ -2150,7 +2498,13 @@ impl VirtioSerial {
                 return Self::classify_windows_error(code);
             }
         }
-        // For non-Windows or when raw_os_error() is None
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(code) = error.raw_os_error() {
+                return Self::classify_linux_error(code);
+            }
+        }
+        // Fallback when raw_os_error() is None
         Self::classify_io_error(error.kind())
     }
 
@@ -2750,8 +3104,68 @@ impl VirtioSerial {
             // Perform I/O operations outside of any locks
             use std::io::Write;
             let mut file_ref = file.as_ref();
+
+            // EINTR retry loop for Linux (signals can interrupt write operations)
+            #[cfg(target_os = "linux")]
+            let write_res = {
+                let mut last_error = None;
+                let mut success = false;
+                for attempt in 0..3 {
+                    match writeln!(file_ref, "{}", message) {
+                        Ok(_) => {
+                            success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            if Self::is_interrupted_error(&e) {
+                                debug!("Write interrupted by signal (EINTR), retrying... attempt {}/3", attempt + 1);
+                                continue;
+                            } else {
+                                last_error = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if success {
+                    Ok(())
+                } else {
+                    Err(last_error.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::Interrupted, "Max EINTR retries exceeded")))
+                }
+            };
+
+            #[cfg(not(target_os = "linux"))]
             let write_res = writeln!(file_ref, "{}", message);
+
             if write_res.is_ok() {
+                // EINTR retry loop for flush on Linux
+                #[cfg(target_os = "linux")]
+                {
+                    let mut last_error = None;
+                    for attempt in 0..3 {
+                        match file_ref.flush() {
+                            Ok(_) => {
+                                last_error = None;
+                                break;
+                            }
+                            Err(e) => {
+                                if Self::is_interrupted_error(&e) {
+                                    debug!("Flush interrupted by signal (EINTR), retrying... attempt {}/3", attempt + 1);
+                                    continue;
+                                } else {
+                                    last_error = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(e) = last_error {
+                        Err(e)
+                    } else {
+                        Ok(())
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
                 file_ref.flush()
             } else {
                 write_res
@@ -2777,6 +3191,75 @@ impl VirtioSerial {
                 Ok(())
             }
             Err(e) => {
+                // Enhanced logging with errno for Linux debugging
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(errno) = e.raw_os_error() {
+                        debug!("Write error on persistent connection: {} (errno: {})", e, errno);
+                    } else {
+                        debug!("Write error on persistent connection: {}", e);
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    debug!("Write error on persistent connection: {}", e);
+                }
+
+                // On Linux, handle EAGAIN/EWOULDBLOCK with immediate retries before global backoff
+                #[cfg(target_os = "linux")]
+                {
+                    let is_would_block = e.kind() == std::io::ErrorKind::WouldBlock ||
+                                         e.raw_os_error() == Some(11); // EAGAIN/EWOULDBLOCK
+                    if is_would_block {
+                        // Try immediate retries with tiny sleep (no global backoff yet)
+                        for attempt in 1..=5 {
+                            debug!("EAGAIN/EWOULDBLOCK on write, immediate retry {}/5", attempt);
+                            std::thread::sleep(std::time::Duration::from_micros(100)); // 100μs between retries
+
+                            // Re-attempt the write
+                            let file_handle = {
+                                let write_handle = self.write_handle.read().unwrap();
+                                if let Some(ref file) = *write_handle {
+                                    Some(Arc::clone(file))
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(file) = file_handle {
+                                use std::io::Write;
+                                let mut file_ref = file.as_ref();
+                                match writeln!(file_ref, "{}", message) {
+                                    Ok(_) => {
+                                        if let Ok(_) = file_ref.flush() {
+                                            debug!("Write succeeded on EAGAIN retry {}", attempt);
+                                            let latency_ms = start.elapsed().as_millis() as u64;
+                                            self.update_transmission_stats(message.len() as u64, latency_ms, true);
+                                            self.reset_error_tracking();
+                                            if affects_circuit_breaker {
+                                                self.record_circuit_breaker_success().await;
+                                            }
+                                            return Ok(());
+                                        }
+                                    }
+                                    Err(retry_err) => {
+                                        let still_would_block = retry_err.kind() == std::io::ErrorKind::WouldBlock ||
+                                                                retry_err.raw_os_error() == Some(11);
+                                        if !still_would_block {
+                                            // Different error, break and fall through to handle_error_with_retry
+                                            debug!("EAGAIN retry {} got different error: {}", attempt, retry_err);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                break; // No handle, fall through
+                            }
+                        }
+                        debug!("EAGAIN/EWOULDBLOCK retries exhausted, falling back to global backoff");
+                    }
+                }
+
                 // Use intelligent retry logic for persistent connection errors
                 match self.handle_error_with_retry(&e, "persistent connection write").await {
                     Ok(true) => {
@@ -3065,65 +3548,225 @@ impl VirtioSerial {
                         return Ok(None);
                     }
                 }
+            } else {
+                // Non-Global Windows paths - return Ok(None) as these are not currently supported
+                // Global objects (e.g., \\.\Global\org.qemu.guest_agent.0) are the standard VirtIO path
+                return Ok(None);
             }
         }
 
-        // Use persistent read handle for other device types
-        // Clone Arc<File> to avoid blocking I/O under locks
-        let file_handle = {
-            let read_handle = self.read_handle.read().unwrap();
-            if let Some(ref file) = *read_handle {
-                Some(Arc::clone(file))
-            } else {
-                None
-            }
-        }; // Lock is released here immediately
+        // Linux: Use persistent buffer to handle O_NONBLOCK message framing correctly
+        // This prevents data loss when messages arrive fragmented across multiple reads
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Read;
 
-        let read_result = if let Some(file) = file_handle {
-            // Perform I/O operations outside of any locks
-            use std::io::{BufReader, BufRead};
-            let mut reader = BufReader::new(file.as_ref());
-            let mut line = String::new();
-            reader.read_line(&mut line).map(|n| (n, line))
-        } else {
-            // No read handle available
-            self.is_connected.store(false, Ordering::SeqCst);
-            return Ok(None);
-        };
+            const MAX_BUFFER_SIZE: usize = 1024 * 1024; // 1MB max to prevent unbounded growth
+            const READ_CHUNK_SIZE: usize = 4096;
 
-        // Process the read result outside of the mutex lock
-        match read_result {
-            Ok((0, _)) => {
-                // No data available
-                Ok(None)
-            }
-            Ok((bytes_read, line)) => {
-                self.update_bytes_received(bytes_read as u64);
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
+            // Get file handle without holding lock during I/O
+            let file_handle = {
+                let read_handle = self.read_handle.read().unwrap();
+                if let Some(ref file) = *read_handle {
+                    Some(Arc::clone(file))
+                } else {
+                    None
+                }
+            };
+
+            let file = match file_handle {
+                Some(f) => f,
+                None => {
+                    self.is_connected.store(false, Ordering::SeqCst);
                     return Ok(None);
                 }
-                self.parse_incoming_message(trimmed)
+            };
+
+            // Read available data into temporary buffer (non-blocking)
+            // With EINTR retry loop for Linux
+            let mut temp_buffer = [0u8; READ_CHUNK_SIZE];
+            let read_result = {
+                let mut result = None;
+                for attempt in 0..3 {
+                    match (&*file).read(&mut temp_buffer) {
+                        Ok(n) => {
+                            result = Some(Ok(n));
+                            break;
+                        }
+                        Err(e) => {
+                            if Self::is_interrupted_error(&e) {
+                                debug!("Read interrupted by signal (EINTR), retrying... attempt {}/3", attempt + 1);
+                                continue;
+                            } else {
+                                result = Some(Err(e));
+                                break;
+                            }
+                        }
+                    }
+                }
+                result.unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Max EINTR retries exceeded")))
+            };
+
+            match read_result {
+                Ok(0) => {
+                    // EOF or no data - check buffer for any pending complete messages
+                    let mut buffer = self.linux_read_buffer.lock().unwrap();
+                    if let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+                        let message_bytes: Vec<u8> = buffer.drain(..=newline_pos).collect();
+                        if let Ok(message_str) = String::from_utf8(message_bytes) {
+                            let trimmed = message_str.trim();
+                            if !trimmed.is_empty() {
+                                return self.parse_incoming_message(trimmed);
+                            }
+                        }
+                    }
+                    return Ok(None);
+                }
+                Ok(bytes_read) => {
+                    self.update_bytes_received(bytes_read as u64);
+
+                    // Append to persistent buffer
+                    let mut buffer = self.linux_read_buffer.lock().unwrap();
+
+                    // Buffer overflow protection
+                    if buffer.len() + bytes_read > MAX_BUFFER_SIZE {
+                        // Increment overflow counter for monitoring
+                        let overflow_count = self.linux_buffer_overflows.fetch_add(1, Ordering::Relaxed) + 1;
+                        warn!("Linux read buffer overflow ({} bytes), clearing buffer (total overflows: {})", buffer.len(), overflow_count);
+                        buffer.clear();
+                        // Still append the new data
+                    }
+
+                    buffer.extend_from_slice(&temp_buffer[..bytes_read]);
+                    debug!("Read {} bytes, buffer now {} bytes", bytes_read, buffer.len());
+
+                    // Look for complete message (newline-delimited)
+                    if let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+                        // Extract complete message including newline, leave rest in buffer
+                        let message_bytes: Vec<u8> = buffer.drain(..=newline_pos).collect();
+
+                        match String::from_utf8(message_bytes) {
+                            Ok(message_str) => {
+                                let trimmed = message_str.trim();
+                                if trimmed.is_empty() {
+                                    return Ok(None);
+                                }
+                                debug!("Complete message received: {} bytes", trimmed.len());
+                                return self.parse_incoming_message(trimmed);
+                            }
+                            Err(e) => {
+                                warn!("Invalid UTF-8 in message: {}", e);
+                                return Ok(None);
+                            }
+                        }
+                    } else {
+                        // No complete message yet, waiting for more data
+                        debug!("Partial message in buffer ({} bytes), waiting for newline", buffer.len());
+                        return Ok(None);
+                    }
+                }
+                Err(e) => {
+                    match e.kind() {
+                        std::io::ErrorKind::WouldBlock |
+                        std::io::ErrorKind::TimedOut => {
+                            // Normal for non-blocking - check buffer for pending messages
+                            let mut buffer = self.linux_read_buffer.lock().unwrap();
+                            if let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+                                let message_bytes: Vec<u8> = buffer.drain(..=newline_pos).collect();
+                                if let Ok(message_str) = String::from_utf8(message_bytes) {
+                                    let trimmed = message_str.trim();
+                                    if !trimmed.is_empty() {
+                                        return self.parse_incoming_message(trimmed);
+                                    }
+                                }
+                            }
+                            return Ok(None);
+                        }
+                        std::io::ErrorKind::BrokenPipe |
+                        std::io::ErrorKind::ConnectionReset => {
+                            // Log with errno for detailed debugging
+                            if let Some(errno) = e.raw_os_error() {
+                                warn!("VirtIO connection broken during read: {} (errno: {})", e, errno);
+                            } else {
+                                warn!("VirtIO connection broken during read: {}", e);
+                            }
+                            self.is_connected.store(false, Ordering::SeqCst);
+                            // Clear buffer on disconnect
+                            if let Ok(mut buffer) = self.linux_read_buffer.lock() {
+                                buffer.clear();
+                            }
+                            return Ok(None);
+                        }
+                        _ => {
+                            // Enhanced logging with errno for Linux debugging
+                            if let Some(errno) = e.raw_os_error() {
+                                debug!("Read error (non-fatal): {} (errno: {})", e, errno);
+                                // Check if this is a fatal error that requires buffer cleanup
+                                let classified = Self::classify_linux_error(errno);
+                                if matches!(classified.severity, ErrorSeverity::Fatal) {
+                                    warn!("Fatal I/O error detected (errno: {}), clearing read buffer", errno);
+                                    if let Ok(mut buffer) = self.linux_read_buffer.lock() {
+                                        buffer.clear();
+                                    }
+                                    self.is_connected.store(false, Ordering::SeqCst);
+                                }
+                            } else {
+                                debug!("Read error (non-fatal): {}", e);
+                            }
+                            return Ok(None);
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                match e.kind() {
-                    std::io::ErrorKind::WouldBlock |
-                    std::io::ErrorKind::TimedOut |
-                    std::io::ErrorKind::UnexpectedEof => {
-                        // These are normal for non-blocking operations
-                        Ok(None)
+        }
+
+        // Non-Linux/non-Windows: Simple blocking read (fallback)
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let file_handle = {
+                let read_handle = self.read_handle.read().unwrap();
+                if let Some(ref file) = *read_handle {
+                    Some(Arc::clone(file))
+                } else {
+                    None
+                }
+            };
+
+            let read_result = if let Some(file) = file_handle {
+                use std::io::{BufReader, BufRead};
+                let mut reader = BufReader::new(file.as_ref());
+                let mut line = String::new();
+                reader.read_line(&mut line).map(|n| (n, line))
+            } else {
+                self.is_connected.store(false, Ordering::SeqCst);
+                return Ok(None);
+            };
+
+            match read_result {
+                Ok((0, _)) => Ok(None),
+                Ok((bytes_read, line)) => {
+                    self.update_bytes_received(bytes_read as u64);
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        return Ok(None);
                     }
-                    std::io::ErrorKind::BrokenPipe |
-                    std::io::ErrorKind::ConnectionReset => {
-                        // Connection broken - mark as disconnected
-                        warn!("VirtIO connection broken during read: {}", e);
-                        self.is_connected.store(false, Ordering::SeqCst);
-                        Ok(None)
-                    }
-                    _ => {
-                        // Other error - don't break the service loop
-                        debug!("Read error (non-fatal): {}", e);
-                        Ok(None)
+                    self.parse_incoming_message(trimmed)
+                }
+                Err(e) => {
+                    match e.kind() {
+                        std::io::ErrorKind::WouldBlock |
+                        std::io::ErrorKind::TimedOut |
+                        std::io::ErrorKind::UnexpectedEof => Ok(None),
+                        std::io::ErrorKind::BrokenPipe |
+                        std::io::ErrorKind::ConnectionReset => {
+                            warn!("VirtIO connection broken during read: {}", e);
+                            self.is_connected.store(false, Ordering::SeqCst);
+                            Ok(None)
+                        }
+                        _ => {
+                            debug!("Read error (non-fatal): {}", e);
+                            Ok(None)
+                        }
                     }
                 }
             }
@@ -3819,10 +4462,11 @@ impl VirtioSerial {
             "timestamp": timestamp
         });
 
-        self.keep_alive_last_sent.store(timestamp, Ordering::SeqCst);
-
         match self.send_raw_message(&keep_alive_message.to_string(), false).await {
             Ok(_) => {
+                // Only update keep_alive_last_sent AFTER successful transmission
+                // This prevents check_keep_alive_timeout() from triggering on unsent heartbeats
+                self.keep_alive_last_sent.store(timestamp, Ordering::SeqCst);
                 debug!("Keep-alive message sent successfully (seq: {}, timestamp: {})", sequence, timestamp);
                 Ok(())
             },
@@ -3832,6 +4476,7 @@ impl VirtioSerial {
                 // and its failures should not trigger circuit breaker state changes, which are
                 // reserved for actual data transmission failures.
                 // The affects_circuit_breaker=false parameter ensures no CB metrics are updated.
+                // NOTE: We do NOT update keep_alive_last_sent here to avoid false timeout detection
                 warn!("Keep-alive send failed (seq: {}): {} - not counting toward circuit breaker", sequence, e);
                 Err(e)
             }
@@ -3903,11 +4548,11 @@ impl VirtioSerial {
         let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
         let last_transmission = self.last_transmission_time.load(Ordering::SeqCst);
 
-        // Edge case: At startup, last_sent is 0. Treat this as "not due yet" to avoid
-        // sending keep-alive immediately. The first keep-alive will be sent after the
-        // normal interval has elapsed from the first transmission.
+        // Edge case: At startup, last_sent is 0. This means we haven't sent any keep-alive yet.
+        // We should send the first keep-alive to establish the heartbeat baseline.
         if last_sent == 0 {
-            return false;
+            info!("🚀 First keep-alive: no previous heartbeat sent, triggering initial keep-alive");
+            return true;
         }
 
         // Send keep-alive every keep_alive_interval_secs regardless of connection activity
@@ -4052,6 +4697,10 @@ impl Clone for VirtioSerial {
             keep_alive_sequence: Arc::clone(&self.keep_alive_sequence),
             #[cfg(target_os = "windows")]
             windows_handle: Arc::clone(&self.windows_handle),
+            #[cfg(target_os = "linux")]
+            linux_read_buffer: Arc::clone(&self.linux_read_buffer),
+            #[cfg(target_os = "linux")]
+            linux_buffer_overflows: Arc::clone(&self.linux_buffer_overflows),
         }
     }
 }

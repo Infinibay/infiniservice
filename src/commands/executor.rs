@@ -134,6 +134,7 @@ mod tests {
             timeout: Some(5),
             working_dir: None,
             env_vars: None,
+            run_as: None,
         };
         
         let message = IncomingMessage::UnsafeCommand(cmd);
