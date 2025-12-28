@@ -119,11 +119,12 @@ StandardError=journal
 SyslogIdentifier=$SERVICE_NAME
 
 # Security settings
-NoNewPrivileges=true
+# Note: Relaxed security settings because infiniservice needs to execute
+# arbitrary scripts that may write anywhere on the filesystem
+NoNewPrivileges=false
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$INSTALL_PATH
+ProtectSystem=false
+ProtectHome=false
 
 # Environment
 Environment=RUST_LOG=info
