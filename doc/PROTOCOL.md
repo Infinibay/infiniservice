@@ -111,7 +111,8 @@ Sent periodically (default 30s) with system metrics:
           "read_bytes_per_sec": 1048576,
           "write_bytes_per_sec": 524288,
           "read_ops_per_sec": 100,
-          "write_ops_per_sec": 50
+          "write_ops_per_sec": 50,
+          "io_utilization_percent": 42.5
         }
       },
       "network": {

@@ -87,6 +87,7 @@ pub struct DiskIO {
     pub write_bytes_per_sec: u64,
     pub read_ops_per_sec: u64,
     pub write_ops_per_sec: u64,
+    pub io_utilization_percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +181,7 @@ struct DiskIoSnapshot {
     write_bytes: u64,
     read_ops: u64,
     write_ops: u64,
+    io_time_ms: u64,
     timestamp: Instant,
 }
 
@@ -355,6 +357,7 @@ impl DataCollector {
                 write_bytes_per_sec: 0,
                 read_ops_per_sec: 0,
                 write_ops_per_sec: 0,
+                io_utilization_percent: 0.0,
             },
         });
         
@@ -553,6 +556,7 @@ impl DataCollector {
                 write_bytes_per_sec: 0,
                 read_ops_per_sec: 0,
                 write_ops_per_sec: 0,
+                io_utilization_percent: 0.0,
             }
         };
         
@@ -663,7 +667,8 @@ impl DataCollector {
             let read_sectors = fields[5].parse::<u64>().unwrap_or(0);
             let write_ops = fields[7].parse::<u64>().unwrap_or(0);
             let write_sectors = fields[9].parse::<u64>().unwrap_or(0);
-            
+            let io_time_ms = fields[12].parse::<u64>().unwrap_or(0);
+
             disk_stats.insert(
                 device_name.to_string(),
                 DiskIoSnapshot {
@@ -671,6 +676,7 @@ impl DataCollector {
                     write_bytes: write_sectors * 512,
                     read_ops,
                     write_ops,
+                    io_time_ms,
                     timestamp: now,
                 },
             );
@@ -733,8 +739,9 @@ impl DataCollector {
                 DiskWriteBytesPerSec: u64,
                 DiskReadsPerSec: u64,
                 DiskWritesPerSec: u64,
+                PercentDiskTime: u64,
             }
-            
+
             if let Ok(results) = wmi_conn.raw_query::<Win32PerfRawDataPerfDiskPhysicalDisk>(
                 "SELECT * FROM Win32_PerfRawData_PerfDisk_PhysicalDisk WHERE Name != '_Total'"
             ) {
@@ -746,6 +753,7 @@ impl DataCollector {
                             write_bytes: disk.DiskWriteBytesPerSec,
                             read_ops: disk.DiskReadsPerSec,
                             write_ops: disk.DiskWritesPerSec,
+                            io_time_ms: disk.PercentDiskTime / 10_000,
                             timestamp: now,
                         },
                     );
@@ -771,31 +779,39 @@ impl DataCollector {
         let mut total_write_bytes = 0u64;
         let mut total_read_ops = 0u64;
         let mut total_write_ops = 0u64;
-        
+        let mut max_io_utilization = 0.0f64;
+
         for (device, current_stats) in current {
             if let Some(prev_stats) = previous.get(device) {
                 let time_diff = current_stats.timestamp.duration_since(prev_stats.timestamp);
                 let seconds = time_diff.as_secs_f64();
-                
+
                 if seconds > 0.0 {
                     let read_bytes_diff = current_stats.read_bytes.saturating_sub(prev_stats.read_bytes);
                     let write_bytes_diff = current_stats.write_bytes.saturating_sub(prev_stats.write_bytes);
                     let read_ops_diff = current_stats.read_ops.saturating_sub(prev_stats.read_ops);
                     let write_ops_diff = current_stats.write_ops.saturating_sub(prev_stats.write_ops);
-                    
+
                     total_read_bytes += (read_bytes_diff as f64 / seconds) as u64;
                     total_write_bytes += (write_bytes_diff as f64 / seconds) as u64;
                     total_read_ops += (read_ops_diff as f64 / seconds) as u64;
                     total_write_ops += (write_ops_diff as f64 / seconds) as u64;
+
+                    let io_time_diff = current_stats.io_time_ms.saturating_sub(prev_stats.io_time_ms);
+                    let io_util = (io_time_diff as f64 / (seconds * 1000.0)) * 100.0;
+                    if io_util > max_io_utilization {
+                        max_io_utilization = io_util;
+                    }
                 }
             }
         }
-        
+
         DiskIO {
             read_bytes_per_sec: total_read_bytes,
             write_bytes_per_sec: total_write_bytes,
             read_ops_per_sec: total_read_ops,
             write_ops_per_sec: total_write_ops,
+            io_utilization_percent: max_io_utilization.min(100.0),
         }
     }
     
@@ -3019,6 +3035,7 @@ mod tests {
                         write_bytes_per_sec: 512000,
                         read_ops_per_sec: 100,
                         write_ops_per_sec: 50,
+                        io_utilization_percent: 0.0,
                     },
                 },
                 network: NetworkMetrics {
@@ -3243,6 +3260,7 @@ mod tests {
                     write_bytes_per_sec: 0,
                     read_ops_per_sec: 0,
                     write_ops_per_sec: 0,
+                    io_utilization_percent: 0.0,
                 },
             },
             network: NetworkMetrics {

@@ -4869,6 +4869,7 @@ mod tests {
                         write_bytes_per_sec: 0,
                         read_ops_per_sec: 0,
                         write_ops_per_sec: 0,
+                        io_utilization_percent: 0.0,
                     },
                 },
                 network: NetworkMetrics { interfaces: vec![] },
