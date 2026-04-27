@@ -431,14 +431,20 @@ impl SafeCommandExecutor {
     /// Execute a safe command request
     pub async fn execute(&self, request: SafeCommandRequest) -> Result<CommandResponse> {
         let start_time = Instant::now();
-        
+
         debug!("Executing safe command: {:?}", request.command_type);
-        
-        // Apply timeout if specified (future enhancement - not yet implemented)
-        let _timeout = request.timeout.map(|t| Duration::from_secs(t as u64));
-        
+
+        // Apply timeout: use the request's value when present, otherwise default
+        // to 600s (10 min). Without this guard a hanging handler blocks the
+        // single agent loop, freezing keep-alives and downstream scripts.
+        let timeout = request
+            .timeout
+            .map(|t| Duration::from_secs(t as u64))
+            .unwrap_or_else(|| Duration::from_secs(600));
+
         // Route to appropriate handler based on command type
-        let result = match &request.command_type {
+        let dispatch = async {
+            match &request.command_type {
             SafeCommandType::SystemInfo => self.get_system_info().await,
             SafeCommandType::OsInfo => self.get_os_info().await,
             
@@ -546,8 +552,33 @@ impl SafeCommandExecutor {
                 )
                 .await
             }
+            }
         };
-        
+
+        // Enforce the timeout. On expiry: return a failed response — handlers
+        // are non-elevatable from here (no child process to kill), but at
+        // least the agent loop unblocks so keep-alives and queued scripts
+        // can move forward.
+        let result = match tokio::time::timeout(timeout, dispatch).await {
+            Ok(inner) => inner,
+            Err(_) => {
+                warn!(
+                    "Safe command timed out after {:?}: {:?}",
+                    timeout, request.command_type
+                );
+                return Ok(create_response(
+                    request.id,
+                    false,
+                    String::new(),
+                    format!("Safe command timed out after {:?}", timeout),
+                    Some(124),
+                    "safe",
+                    start_time.elapsed(),
+                    None,
+                ));
+            }
+        };
+
         // Build response
         match result {
             Ok((stdout, stderr, data)) => {
