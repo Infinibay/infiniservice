@@ -52,6 +52,7 @@
 
 pub mod apt_manager;
 pub mod flatpak_manager;
+pub mod golden_image;
 pub mod rpm_manager;
 pub mod snap_manager;
 pub mod system_operations;

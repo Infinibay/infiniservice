@@ -126,7 +126,7 @@ fn test_os_detection() -> Result<()> {
             LinuxDistro::Debian => println!("   -> Debian detected (apt/dpkg/ufw)"),
             LinuxDistro::Fedora => println!("   -> Fedora detected (dnf/rpm/firewalld)"),
             LinuxDistro::CentOS => println!("   -> CentOS detected (yum/rpm/firewalld)"),
-            LinuxDistro::RHEL => println!("   -> RHEL detected (yum/rpm/firewalld)"),
+            LinuxDistro::RedHat => println!("   -> RHEL detected (yum/rpm/firewalld)"),
             LinuxDistro::Arch => println!("   -> Arch detected (pacman)"),
             LinuxDistro::OpenSUSE => println!("   -> OpenSUSE detected (zypper/rpm)"),
             LinuxDistro::Unknown => println!("   -> Unknown Linux distribution"),
@@ -480,7 +480,7 @@ async fn test_health_checks() -> Result<()> {
 /// - CheckLinuxUpdates: No sudo required (read-only)
 /// - GetLinuxSecurityStatus: No sudo required (read-only)
 /// - CheckFirewallStatus: No sudo required (read-only)
-/// - GetInstalledApplications: No sudo required (read-only)
+/// - GetInstalledApplicationsWMI: No sudo required (read-only, Windows only)
 #[cfg(target_os = "linux")]
 async fn test_safe_command_api() -> Result<()> {
     println!("   Demonstrating SafeCommandRequest API...");
@@ -559,53 +559,74 @@ async fn test_safe_command_api() -> Result<()> {
         }
         Err(e) => println!("      Error: {}", e),
     }
-    println!();
-
-    // -------------------------------------------------------------------------
-    // 4. GetInstalledApplications via SafeCommandRequest
-    // -------------------------------------------------------------------------
-    println!("   4) GetInstalledApplications via SafeCommandRequest:");
-
-    let request = SafeCommandRequest {
-        id: "example-apps-001".to_string(),
-        command_type: SafeCommandType::GetInstalledApplications,
-        params: None,
-        timeout: Some(120),
-    };
-
-    println!("      Request: {:?}", serde_json::to_string(&request).unwrap_or_default());
-
-    match executor.execute(request).await {
-        Ok(response) => {
-            print_command_response("GetInstalledApplications", &response);
-
-            // Show sample of installed apps if available
-            if response.success {
-                if let Some(data) = &response.data {
-                    if let Some(apps) = data.as_array() {
-                        println!("      Sample applications (first 5):");
-                        for app in apps.iter().take(5) {
-                            if let Some(name) = app.get("name").and_then(|n| n.as_str()) {
-                                let version = app.get("version")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                let install_type = app.get("install_type")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("unknown");
-                                println!("         - {} v{} ({})", name, version, install_type);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) => println!("      Error: {}", e),
-    }
 
     println!("\n   Safe Command API demonstration complete.");
     println!("   All commands used structured SafeCommandRequest/CommandResponse API.");
 
     Ok(())
+}
+
+/// Helper to print command response details
+#[cfg(target_os = "linux")]
+fn print_command_response(cmd_name: &str, response: &CommandResponse) {
+    println!("      Response ID: {}", response.id);
+    println!("      Success: {}", response.success);
+    println!("      Execution Time: {} ms", response.execution_time_ms);
+    println!("      Command Type: {}", response.command_type);
+
+    if !response.success {
+        if !response.stderr.is_empty() {
+            println!("      Error: {}", response.stderr);
+        }
+    } else {
+        if let Some(data) = &response.data {
+            // Pretty print a summary of the data
+            match cmd_name {
+                "CheckLinuxUpdates" => {
+                    if let Some(count) = data.get("total_pending_count").and_then(|v| v.as_u64()) {
+                        println!("      Pending Updates: {}", count);
+                    }
+                    if let Some(security) = data.get("security_updates_count").and_then(|v| v.as_u64()) {
+                        println!("      Security Updates: {}", security);
+                    }
+                    if let Some(pm) = data.get("package_manager").and_then(|v| v.as_str()) {
+                        println!("      Package Manager: {}", pm);
+                    }
+                }
+                "GetLinuxSecurityStatus" => {
+                    if let Some(fw) = data.get("firewall") {
+                        if let Some(enabled) = fw.get("enabled").and_then(|v| v.as_bool()) {
+                            let status = if enabled { "Enabled" } else { "Disabled" };
+                            println!("      Firewall: {}", status);
+                        }
+                        if let Some(fw_type) = fw.get("firewall_type").and_then(|v| v.as_str()) {
+                            println!("      Firewall Type: {}", fw_type);
+                        }
+                    }
+                    if let Some(sm) = data.get("security_module") {
+                        if let Some(sm_type) = sm.get("module_type").and_then(|v| v.as_str()) {
+                            println!("      Security Module: {}", sm_type);
+                        }
+                    }
+                }
+                "CheckFirewallStatus" => {
+                    if let Some(enabled) = data.get("enabled").and_then(|v| v.as_bool()) {
+                        let status = if enabled { "Enabled" } else { "Disabled" };
+                        println!("      Status: {}", status);
+                    }
+                    if let Some(fw_type) = data.get("firewall_type").and_then(|v| v.as_str()) {
+                        println!("      Type: {}", fw_type);
+                    }
+                    if let Some(rules) = data.get("rules_count").and_then(|v| v.as_u64()) {
+                        println!("      Rules: {}", rules);
+                    }
+                }
+                _ => {
+                    println!("      Data: {:?}", data);
+                }
+            }
+        }
+    }
 }
 
 /// Helper to print command response details

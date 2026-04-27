@@ -533,6 +533,19 @@ impl SafeCommandExecutor {
             },
 
             SafeCommandType::UserList => self.list_users().await,
+
+            SafeCommandType::PrepareGoldenImage {
+                cleanup_level,
+                sanitize_user_data,
+                shutdown_after,
+            } => {
+                self.prepare_golden_image(
+                    *cleanup_level,
+                    *sanitize_user_data,
+                    *shutdown_after,
+                )
+                .await
+            }
         };
         
         // Build response
@@ -1092,6 +1105,49 @@ impl SafeCommandExecutor {
         #[cfg(not(target_os = "windows"))]
         {
             self.list_users_linux().await
+        }
+    }
+
+    /// Prepare the guest for golden-image capture. Dispatched per-OS;
+    /// see `commands/windows/golden_image.rs` and
+    /// `commands/linux/golden_image.rs` for the actual cleanup steps.
+    async fn prepare_golden_image(
+        &self,
+        cleanup_level: super::CleanupLevel,
+        sanitize_user_data: bool,
+        shutdown_after: bool,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        match self.os_info.os_type {
+            #[cfg(target_os = "windows")]
+            OsType::Windows => {
+                super::windows::golden_image::prepare(
+                    cleanup_level,
+                    sanitize_user_data,
+                    shutdown_after,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "windows"))]
+            OsType::Linux => {
+                let distro = self
+                    .os_info
+                    .linux_distro
+                    .clone()
+                    .unwrap_or(crate::os_detection::LinuxDistro::Unknown(
+                        "unknown".to_string(),
+                    ));
+                super::linux::golden_image::prepare(
+                    &distro,
+                    cleanup_level,
+                    sanitize_user_data,
+                    shutdown_after,
+                )
+                .await
+            }
+            _ => Err(anyhow!(
+                "PrepareGoldenImage not supported on this OS: {:?}",
+                self.os_info.os_type
+            )),
         }
     }
 

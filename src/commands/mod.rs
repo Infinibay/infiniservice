@@ -207,6 +207,42 @@ pub enum SafeCommandType {
 
     // User listing
     UserList,
+
+    // Prepare guest for golden-image capture: runs per-OS cleanup
+    // (logs, machine-id, SSH host keys, cloud-init, event logs), writes
+    // a minimal sysprep unattend on Windows, triggers sysprep /generalize,
+    // and optionally powers off when done so the host can promote the
+    // disk. See commands/{windows,linux}/golden_image.rs.
+    PrepareGoldenImage {
+        #[serde(default)]
+        cleanup_level: CleanupLevel,
+        /// Remove user home directories and profiles (non-system users).
+        /// Default true — preserves the "default ON with toggle" policy
+        /// from the capture flow.
+        #[serde(default = "default_true")]
+        sanitize_user_data: bool,
+        /// Power off the guest after cleanup. Required for capture flows.
+        #[serde(default = "default_true")]
+        shutdown_after: bool,
+    },
+}
+
+fn default_true() -> bool { true }
+
+/// How aggressive the cleanup pass should be. `Standard` is the right
+/// choice for all normal seal flows; `Minimal` skips non-essential
+/// steps (useful for re-running after a partial seal); `Deep` also
+/// wipes caches that would otherwise be rebuilt on first boot.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CleanupLevel {
+    Minimal,
+    Standard,
+    Deep,
+}
+
+impl Default for CleanupLevel {
+    fn default() -> Self { CleanupLevel::Standard }
 }
 
 /// Service control parameters
