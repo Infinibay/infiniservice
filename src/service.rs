@@ -975,12 +975,28 @@ impl InfiniService {
                         },
                         Err(e) => {
                             error!("Failed to send script completion: {}", e);
+                            // Best-effort: report up so the host knows the script
+                            // ran but the result couldn't be delivered.
+                            let _ = self.communication.send_agent_event(
+                                "error",
+                                "script",
+                                &format!("Failed to send script completion: {}", e),
+                                Some(&completion.execution_id),
+                                None,
+                            ).await;
                         }
                     }
                 },
                 Err(e) => {
                     error!("Script execution failed: execution_id={}, error={}",
                            script.execution_id, e);
+                    let _ = self.communication.send_agent_event(
+                        "error",
+                        "script",
+                        &format!("Script execution failed: {}", e),
+                        Some(&script.execution_id),
+                        None,
+                    ).await;
 
                     // Send failure completion
                     let completion = crate::commands::ScriptCompletionMessage {

@@ -289,6 +289,28 @@ pub struct VirtioSerial {
     linux_buffer_overflows: Arc<AtomicU64>,
 }
 
+/// Build the JSON payload for an `agent_event` message.
+///
+/// Pure helper so the shape can be unit-tested without spinning up a real
+/// virtio-serial transport.
+pub(crate) fn build_agent_event_payload(
+    severity: &str,
+    source: &str,
+    message: &str,
+    execution_id: Option<&str>,
+    context: Option<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "agent_event",
+        "severity": severity,
+        "source": source,
+        "message": message,
+        "executionId": execution_id,
+        "context": context,
+        "timestamp": Utc::now().to_rfc3339(),
+    })
+}
+
 impl VirtioSerial {
     pub fn new<P: AsRef<Path>>(device_path: P) -> Self {
         Self::with_timeout(device_path, 500) // Default 500ms timeout
@@ -2139,6 +2161,37 @@ impl VirtioSerial {
             .with_context(|| "Failed to serialize handshake message")?;
 
         self.send_raw_message(&message_str, true).await
+    }
+
+    /// Send a structured agent event to the host.
+    ///
+    /// `severity` is one of "debug" | "info" | "warn" | "error".
+    /// `source` is a free-form short tag (e.g. "agent", "script", "transport").
+    /// `execution_id` ties the event to a specific ScriptExecution when relevant.
+    /// `context` is an optional JSON blob with extra fields (do NOT put secrets here).
+    ///
+    /// Errors are swallowed — like send_error — to avoid cascading failures when
+    /// the very thing we're trying to report on is the broken transport.
+    pub async fn send_agent_event(
+        &self,
+        severity: &str,
+        source: &str,
+        message: &str,
+        execution_id: Option<&str>,
+        context: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let payload = build_agent_event_payload(severity, source, message, execution_id, context);
+
+        let message_str = serde_json::to_string(&payload)
+            .with_context(|| "Failed to serialize agent_event")?;
+
+        match self.send_raw_message(&message_str, false).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                debug!("Failed to send agent_event (suppressed): {}", e);
+                Ok(())
+            }
+        }
     }
 
     /// Send error message to host
@@ -4718,6 +4771,39 @@ mod tests {
     use std::path::PathBuf;
 
 
+
+    #[test]
+    fn test_agent_event_payload_shape() {
+        let v = build_agent_event_payload(
+            "error",
+            "script",
+            "boom",
+            Some("exec-123"),
+            Some(serde_json::json!({ "k": 1 })),
+        );
+        assert_eq!(v["type"], "agent_event");
+        assert_eq!(v["severity"], "error");
+        assert_eq!(v["source"], "script");
+        assert_eq!(v["message"], "boom");
+        assert_eq!(v["executionId"], "exec-123");
+        assert_eq!(v["context"]["k"], 1);
+        assert!(v["timestamp"].is_string());
+    }
+
+    #[test]
+    fn test_agent_event_payload_optional_fields_null() {
+        let v = build_agent_event_payload("info", "agent", "hello", None, None);
+        assert_eq!(v["executionId"], serde_json::Value::Null);
+        assert_eq!(v["context"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_agent_event_payload_serializes() {
+        let v = build_agent_event_payload("warn", "transport", "msg", None, None);
+        let s = serde_json::to_string(&v).expect("serialize");
+        assert!(s.contains("\"type\":\"agent_event\""));
+        assert!(s.contains("\"severity\":\"warn\""));
+    }
 
     #[test]
     fn test_virtio_serial_initialization() {
