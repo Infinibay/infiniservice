@@ -432,7 +432,14 @@ impl SafeCommandExecutor {
     pub async fn execute(&self, request: SafeCommandRequest) -> Result<CommandResponse> {
         let start_time = Instant::now();
 
-        debug!("Executing safe command: {:?}", request.command_type);
+        match &request.command_type {
+        // Never Debug-print JoinDomain: it carries the plaintext bind password.
+        SafeCommandType::JoinDomain { domain, username, .. } => debug!(
+            "Executing safe command: JoinDomain {{ domain: {:?}, username: {:?}, .. (secrets redacted) }}",
+            domain, username
+        ),
+        other => debug!("Executing safe command: {:?}", other),
+    }
 
         // Apply timeout: use the request's value when present, otherwise default
         // to 600s (10 min). Without this guard a hanging handler blocks the
@@ -549,6 +556,24 @@ impl SafeCommandExecutor {
                     *cleanup_level,
                     *sanitize_user_data,
                     *shutdown_after,
+                )
+                .await
+            }
+            SafeCommandType::JoinDomain {
+                domain,
+                username,
+                password,
+                ou,
+                computer_name,
+                restart_after,
+            } => {
+                self.join_domain(
+                    domain,
+                    username,
+                    password,
+                    ou.as_deref(),
+                    computer_name.as_deref(),
+                    *restart_after,
                 )
                 .await
             }
@@ -1177,6 +1202,58 @@ impl SafeCommandExecutor {
             }
             _ => Err(anyhow!(
                 "PrepareGoldenImage not supported on this OS: {:?}",
+                self.os_info.os_type
+            )),
+        }
+    }
+
+    /// Join the guest to an Active Directory / LDAP domain. Dispatched
+    /// per-OS; see `commands/windows/domain_join.rs` and
+    /// `commands/linux/domain_join.rs`.
+    async fn join_domain(
+        &self,
+        domain: &str,
+        username: &str,
+        password: &str,
+        ou: Option<&str>,
+        computer_name: Option<&str>,
+        restart_after: bool,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        match self.os_info.os_type {
+            #[cfg(target_os = "windows")]
+            OsType::Windows => {
+                super::windows::domain_join::join(
+                    domain,
+                    username,
+                    password,
+                    ou,
+                    computer_name,
+                    restart_after,
+                )
+                .await
+            }
+            #[cfg(not(target_os = "windows"))]
+            OsType::Linux => {
+                let distro = self
+                    .os_info
+                    .linux_distro
+                    .clone()
+                    .unwrap_or(crate::os_detection::LinuxDistro::Unknown(
+                        "unknown".to_string(),
+                    ));
+                super::linux::domain_join::join(
+                    &distro,
+                    domain,
+                    username,
+                    password,
+                    ou,
+                    computer_name,
+                    restart_after,
+                )
+                .await
+            }
+            _ => Err(anyhow!(
+                "JoinDomain not supported on this OS: {:?}",
                 self.os_info.os_type
             )),
         }

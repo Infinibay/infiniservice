@@ -51,6 +51,7 @@
 //! ```
 
 pub mod apt_manager;
+pub mod domain_join;
 pub mod flatpak_manager;
 pub mod golden_image;
 pub mod rpm_manager;

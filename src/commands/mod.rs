@@ -225,6 +225,32 @@ pub enum SafeCommandType {
         #[serde(default = "default_true")]
         shutdown_after: bool,
     },
+
+    // Join the guest to an Active Directory / LDAP domain.
+    // Windows: `Add-Computer` (netdom-equivalent) via PowerShell.
+    // Linux: `realm join` (sssd backend), with realmd/sssd installed first.
+    // A reboot is typically required afterwards for the join to take effect;
+    // the host decides whether to restart the VM. See
+    // commands/{windows,linux}/domain_join.rs.
+    JoinDomain {
+        /// Fully-qualified domain name, e.g. "corp.example.com".
+        domain: String,
+        /// Account with permission to join machines, e.g.
+        /// "admin@corp.example.com" (Windows) or "Administrator" (realm).
+        username: String,
+        /// Plaintext password for the join account. Sent over the trusted
+        /// virtio serial channel only; never logged by the agent.
+        password: String,
+        /// Optional OU/container DN to place the computer object in.
+        #[serde(default)]
+        ou: Option<String>,
+        /// Optional explicit computer/hostname to use for the account.
+        #[serde(default)]
+        computer_name: Option<String>,
+        /// Reboot the guest after a successful join.
+        #[serde(default)]
+        restart_after: bool,
+    },
 }
 
 fn default_true() -> bool { true }
@@ -454,7 +480,14 @@ pub fn log_command_execution(message: &IncomingMessage) {
     match message {
         IncomingMessage::SafeCommand(cmd) => {
             info!("Executing safe command: id={}, type={:?}", cmd.id, cmd.command_type);
-            debug!("Safe command details: {:?}", cmd);
+            match &cmd.command_type {
+        // Never Debug-print JoinDomain: it carries the plaintext bind password.
+        SafeCommandType::JoinDomain { domain, username, .. } => debug!(
+            "Safe command details: JoinDomain {{ domain: {:?}, username: {:?}, .. (secrets redacted) }}",
+            domain, username
+        ),
+        other => debug!("Safe command details: {:?}", other),
+    }
         },
         IncomingMessage::UnsafeCommand(cmd) => {
             warn!("⚠️ UNSAFE COMMAND EXECUTION: id={}, command={}", cmd.id, cmd.raw_command);

@@ -825,53 +825,265 @@ impl VirtioSerial {
 
     #[cfg(target_os = "windows")]
     fn try_ioctl_connection(device_info: &crate::windows_com::ComPortInfo) -> Result<String, String> {
-        // Implementation for IOCTL-based VirtIO communication
-        debug!("🔧 Implementing IOCTL connection for {}", device_info.instance_id);
+        // IOCTL-based VirtIO communication using DeviceIoControl
+        use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
+        use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+        use winapi::um::ioapiset::DeviceIoControl;
+        use winapi::um::errhandlingapi::GetLastError;
+        use winapi::shared::minwindef::DWORD;
+        use std::ffi::CString;
+        use std::ptr;
 
-        // Try to open device with IOCTL access
+        // IOCTL_SERIAL_GET_MODEMSTATUS = CTL_CODE(FILE_DEVICE_SERIAL_PORT, 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
+        // FILE_DEVICE_SERIAL_PORT = 0x1B, Function = 6, METHOD_BUFFERED = 0, FILE_ANY_ACCESS = 0
+        // = (0x1B << 16) | (0 << 14) | (6 << 2) | 0 = 0x001B0018
+        const IOCTL_SERIAL_GET_MODEMSTATUS: DWORD = 0x001B0018;
+
+        debug!("🔧 Trying IOCTL-based VirtIO connection for {}", device_info.instance_id);
+
         for interface_path in &device_info.interface_paths {
-            if let Ok(_) = Self::try_open_windows_device_simple(interface_path) {
-                // TODO: Implement actual IOCTL communication
-                debug!("✅ IOCTL connection established via {}", interface_path);
-                return Ok(interface_path.clone());
+            let c_path = match CString::new(interface_path.as_str()) {
+                Ok(p) => p,
+                Err(_) => {
+                    debug!("IOCTL: Invalid path encoding for {}", interface_path);
+                    continue;
+                }
+            };
+
+            unsafe {
+                // Open device with read/write access for IOCTL communication
+                let handle = CreateFileA(
+                    c_path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    ptr::null_mut(),
+                );
+
+                if handle == INVALID_HANDLE_VALUE {
+                    let err = GetLastError();
+                    debug!("IOCTL: CreateFileA failed for {} with Win32 error {}", interface_path, err);
+                    continue;
+                }
+
+                // Verify driver responsiveness with a test IOCTL (query modem status line)
+                let mut modem_status: DWORD = 0;
+                let mut bytes_returned: DWORD = 0;
+
+                let ioctl_result = DeviceIoControl(
+                    handle,
+                    IOCTL_SERIAL_GET_MODEMSTATUS,
+                    ptr::null_mut(),
+                    0,
+                    &mut modem_status as *mut _ as *mut _,
+                    std::mem::size_of::<DWORD>() as DWORD,
+                    &mut bytes_returned,
+                    ptr::null_mut(),
+                );
+
+                CloseHandle(handle);
+
+                if ioctl_result != 0 {
+                    debug!("✅ IOCTL connection verified via {} (modem status: 0x{:08X}, {} bytes returned)",
+                           interface_path, modem_status, bytes_returned);
+                    return Ok(interface_path.clone());
+                } else {
+                    let err = GetLastError();
+                    debug!("IOCTL: DeviceIoControl failed with Win32 error {} for {}", err, interface_path);
+                    // Strict: don't fall back to "device opened" — other connection methods
+                    // (overlapped, mmap, fallback paths) will attempt this device independently.
+                }
             }
         }
 
-        Err("IOCTL connection failed".to_string())
+        Err("IOCTL connection failed - no device responded to DeviceIoControl".to_string())
     }
 
     #[cfg(target_os = "windows")]
+    #[cfg(target_os = "windows")]
     fn try_overlapped_connection(device_info: &crate::windows_com::ComPortInfo) -> Result<String, String> {
-        // Implementation for overlapped I/O VirtIO communication
-        debug!("⏱️ Implementing overlapped I/O connection for {}", device_info.instance_id);
+        // Verify the device can be opened with FILE_FLAG_OVERLAPPED for async I/O.
+        //
+        // IMPORTANT: this must be a *non-destructive* probe. We previously wrote a
+        // literal `OVERLAPPED_PING\n` byte sequence, which corrupts the JSON
+        // framing the host uses on the virtio-serial channel — any host parser
+        // that frames messages by newline would see garbage before the first
+        // real message. Instead, we just confirm the handle can be opened with
+        // FILE_FLAG_OVERLAPPED and that an event handle for OVERLAPPED bookkeeping
+        // can be created. No bytes are sent.
+        use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
+        use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+        use winapi::um::synchapi::CreateEventW;
+        use winapi::um::errhandlingapi::GetLastError;
+        use winapi::shared::minwindef::DWORD;
+        use std::ffi::CString;
+        use std::ptr;
 
-        // Try overlapped I/O on interface paths
+        // FILE_FLAG_OVERLAPPED = 0x40000000
+        const FILE_FLAG_OVERLAPPED: DWORD = 0x40000000;
+
+        debug!("⏱️ Trying overlapped I/O VirtIO connection for {}", device_info.instance_id);
+
         for interface_path in &device_info.interface_paths {
-            if let Ok(_) = Self::try_open_windows_device_simple(interface_path) {
-                // TODO: Implement actual overlapped I/O
-                debug!("✅ Overlapped I/O connection established via {}", interface_path);
+            let c_path = match CString::new(interface_path.as_str()) {
+                Ok(p) => p,
+                Err(_) => {
+                    debug!("Overlapped I/O: Invalid path encoding for {}", interface_path);
+                    continue;
+                }
+            };
+
+            unsafe {
+                let handle = CreateFileA(
+                    c_path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    ptr::null_mut(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    ptr::null_mut(),
+                );
+
+                if handle == INVALID_HANDLE_VALUE {
+                    let err = GetLastError();
+                    debug!("Overlapped I/O: CreateFileA failed for {} with Win32 error {}", interface_path, err);
+                    continue;
+                }
+
+                let event_handle = CreateEventW(
+                    ptr::null_mut(),
+                    1, // Manual-reset
+                    0, // Initial state: non-signaled
+                    ptr::null_mut(),
+                );
+
+                if event_handle.is_null() {
+                    let err = GetLastError();
+                    CloseHandle(handle);
+                    debug!("Overlapped I/O: CreateEventW failed with Win32 error {}", err);
+                    continue;
+                }
+
+                CloseHandle(event_handle);
+                CloseHandle(handle);
+
+                debug!("✅ Overlapped I/O capability verified via {} (no bytes sent)", interface_path);
                 return Ok(interface_path.clone());
             }
         }
 
-        Err("Overlapped I/O connection failed".to_string())
+        Err("Overlapped I/O connection failed - no device accepted overlapped open".to_string())
     }
 
     #[cfg(target_os = "windows")]
     fn try_memory_mapped_connection(device_info: &crate::windows_com::ComPortInfo) -> Result<String, String> {
-        // Implementation for memory-mapped I/O VirtIO communication
-        debug!("🗺️ Implementing memory-mapped I/O connection for {}", device_info.instance_id);
+        // Memory-mapped I/O for VirtIO communication
+        //
+        // VirtIO serial ports are byte-stream devices (named pipes) and do not expose
+        // memory-mapped BARs. However, some VirtIO configurations expose a shared memory
+        // region alongside the serial channel (e.g., ivshmem devices). We attempt to open
+        // such a region via CreateFileMapping/MapViewOfFile and verify it is usable.
+        use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
+        use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+        use winapi::um::memoryapi::{CreateFileMappingA, MapViewOfFile, UnmapViewOfFile};
+        use winapi::um::errhandlingapi::GetLastError;
+        use winapi::shared::minwindef::DWORD;
+        use winapi::um::winnt::PAGE_READWRITE;
+        use winapi::um::memoryapi::{FILE_MAP_READ, FILE_MAP_WRITE};
+        use std::ffi::CString;
+        use std::ptr;
 
-        // Try memory-mapped access
+        // Minimum mapping size for verification (1 page)
+        const VERIFY_MAPPING_SIZE: usize = 4096;
+
+        debug!("🗺️ Trying memory-mapped I/O VirtIO connection for {}", device_info.instance_id);
+
         for interface_path in &device_info.interface_paths {
-            if let Ok(_) = Self::try_open_windows_device_simple(interface_path) {
-                // TODO: Implement actual memory-mapped I/O
-                debug!("✅ Memory-mapped I/O connection established via {}", interface_path);
+            let c_path = match CString::new(interface_path.as_str()) {
+                Ok(p) => p,
+                Err(_) => {
+                    debug!("Mmap: Invalid path encoding for {}", interface_path);
+                    continue;
+                }
+            };
+
+            unsafe {
+                // Open the device with read/write access
+                let handle = CreateFileA(
+                    c_path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    ptr::null_mut(),
+                );
+
+                if handle == INVALID_HANDLE_VALUE {
+                    let err = GetLastError();
+                    debug!("Mmap: CreateFileA failed for {} with Win32 error {}", interface_path, err);
+                    continue;
+                }
+
+                // Attempt to create a file mapping backed by the device
+                let mapping_handle = CreateFileMappingA(
+                    handle,
+                    ptr::null_mut(),
+                    PAGE_READWRITE,
+                    0,
+                    VERIFY_MAPPING_SIZE as DWORD,
+                    ptr::null_mut(),
+                );
+
+                if mapping_handle.is_null() {
+                    let err = GetLastError();
+                    CloseHandle(handle);
+                    // ERROR_NOT_SUPPORTED (50) or ERROR_INVALID_PARAMETER (87) are expected
+                    // for byte-stream serial ports — this is a probe, not a hard failure.
+                    debug!("Mmap: CreateFileMappingA failed for {} with Win32 error {} (device may not support MMIO)", interface_path, err);
+                    continue;
+                }
+
+                // Map a view of the file mapping
+                let base_addr = MapViewOfFile(
+                    mapping_handle,
+                    FILE_MAP_READ | FILE_MAP_WRITE,
+                    0,
+                    0,
+                    VERIFY_MAPPING_SIZE,
+                );
+
+                if base_addr.is_null() {
+                    let err = GetLastError();
+                    CloseHandle(mapping_handle);
+                    CloseHandle(handle);
+                    debug!("Mmap: MapViewOfFile failed for {} with Win32 error {}", interface_path, err);
+                    continue;
+                }
+
+                // Do NOT dereference base_addr. The mapping is over a device handle
+                // that may not have valid backing storage; an unconditional read can
+                // fault the process. Successfully obtaining a non-null view is enough
+                // to consider the mapping verified.
+                debug!("Mmap: Mapping created at {} (no read probe)", interface_path);
+
+                // Clean up mapping resources (connection will be re-opened by send_raw_message)
+                UnmapViewOfFile(base_addr);
+                CloseHandle(mapping_handle);
+                CloseHandle(handle);
+
+                debug!("✅ Memory-mapped I/O connection verified via {} ({} bytes mapped)",
+                       interface_path, VERIFY_MAPPING_SIZE);
                 return Ok(interface_path.clone());
             }
         }
 
-        Err("Memory-mapped I/O connection failed".to_string())
+        Err("Memory-mapped I/O connection failed - no device supported CreateFileMapping".to_string())
     }
 
     #[cfg(target_os = "windows")]
@@ -4449,16 +4661,19 @@ impl VirtioSerial {
     }
 
     async fn transition_circuit_breaker_to_closed(&self) {
-        let mut state = self.circuit_breaker_state.write().unwrap();
-        let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+        {
+            let mut state = self.circuit_breaker_state.write().unwrap();
+            let mut metrics = self.circuit_breaker_metrics.write().unwrap();
 
-        *state = CircuitBreakerState::Closed;
-        metrics.state_change_time = SystemTime::now();
-        metrics.failure_count = 0;
-        metrics.success_count = 0;
-        metrics.half_open_calls = 0;
+            *state = CircuitBreakerState::Closed;
+            metrics.state_change_time = SystemTime::now();
+            metrics.failure_count = 0;
+            metrics.success_count = 0;
+            metrics.half_open_calls = 0;
 
-        info!("Circuit breaker CLOSED - normal operation resumed");
+            info!("Circuit breaker CLOSED - normal operation resumed");
+        } // Locks dropped here — send_circuit_breaker_state_change takes
+          // metrics.read() and would deadlock on the same thread otherwise.
 
         // Send circuit breaker state change to backend
         self.send_circuit_breaker_state_change(CircuitBreakerState::Closed).await;
@@ -4466,7 +4681,12 @@ impl VirtioSerial {
 
     async fn send_circuit_breaker_state_change(&self, new_state: CircuitBreakerState) {
         let metrics = self.circuit_breaker_metrics.read().unwrap();
-        let _state_message = serde_json::json!({
+
+        // Send state change via fire-and-forget channel to avoid recursion.
+        // send_raw_message → record_circuit_breaker_failure → transition_circuit_breaker_to_open
+        // would re-enter send_raw_message. Instead, we log locally and enqueue for the
+        // keep-alive loop to transmit when the channel recovers.
+        let state_message = serde_json::json!({
             "type": "circuit_breaker_state",
             "state": match new_state {
                 CircuitBreakerState::Closed => "Closed",
@@ -4485,14 +4705,19 @@ impl VirtioSerial {
             "timestamp": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
         });
 
-        // TODO: Fix recursion - temporarily disabled to allow compilation
-        // if let Err(e) = self.send_raw_message(&state_message.to_string()).await {
-        //     debug!("Failed to send circuit breaker state change: {}", e);
-        //     // Queue the message for later if connection is down
-        //     let mut queue = self.queued_error_reports.write().unwrap();
-        //     queue.push(state_message);
-        // }
-        debug!("Circuit breaker state change: {:?}", new_state);
+        // Enqueue for deferred delivery — the keep-alive / reconnect loop will flush.
+        // Keep the queue bounded (same 10-item cap used by the error-report enqueue
+        // path) so a flapping breaker can't grow this vector without limit.
+        if let Ok(mut queue) = self.queued_error_reports.write() {
+            queue.push(state_message);
+            while queue.len() > 10 {
+                queue.remove(0);
+            }
+            debug!("Circuit breaker state change enqueued ({} items pending): {:?}",
+                   queue.len(), new_state);
+        } else {
+            debug!("Circuit breaker state change (queue unavailable): {:?}", new_state);
+        }
     }
 
     // Keep-Alive Methods

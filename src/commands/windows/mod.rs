@@ -61,6 +61,7 @@
 //! 2. **PowerShell** - Windows Updates for MSI packages, security update detection
 //! 3. **Registry** - Fallback for known apps (Chrome, Firefox, Edge, Java, Adobe)
 
+pub mod domain_join;
 pub mod golden_image;
 pub mod registry_manager;
 pub mod store_manager;
