@@ -4109,9 +4109,12 @@ impl VirtioSerial {
                 Ok(Some(msg))
             }
             Err(e) => {
-                // Authenticated but unparseable. Do NOT log the payload — it is
-                // host-signed content that may include secrets.
-                warn!("Failed to parse authenticated inner message: {}", e);
+                // Authenticated but unparseable: the source is trusted (HMAC), so
+                // this is a benign protocol mismatch — e.g. a host→agent control
+                // message this agent has no handler for (keep_alive_request and
+                // other orphan types). Log at DEBUG, not WARN, to avoid periodic
+                // spam, and never log the payload (host-signed, may carry secrets).
+                debug!("Ignoring authenticated message with no handler: {}", e);
                 Ok(None)
             }
         }
@@ -4779,10 +4782,14 @@ impl VirtioSerial {
             time_since_last_received
         );
 
+        // Wire timestamp is RFC3339 to match the backend's `BaseMessage.timestamp:
+        // string` (every other agent message already does this); the local
+        // `timestamp` u64 stays for internal last_sent bookkeeping. Previously
+        // this field went out as a numeric u64 and mismatched the TS type.
         let keep_alive_message = serde_json::json!({
             "type": "keep_alive",
             "sequence_number": sequence,
-            "timestamp": timestamp
+            "timestamp": chrono::Utc::now().to_rfc3339()
         });
 
         match self.send_raw_message(&keep_alive_message.to_string(), false).await {
