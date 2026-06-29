@@ -5,6 +5,7 @@
 //! - Communicate with the host via virtio-serial
 //! - Execute safe and unsafe commands from the host
 
+pub mod auth;
 pub mod config;
 pub mod collector;
 pub mod communication;

@@ -4040,9 +4040,24 @@ impl VirtioSerial {
 
     /// Parse incoming message and log appropriately
     fn parse_incoming_message(&self, trimmed: &str) -> Result<Option<IncomingMessage>> {
-        debug!("Received message: {}", trimmed);
+        // SECURITY: the virtio-serial channel is untrusted. Every inbound line
+        // must be a valid HMAC-signed envelope (see crate::auth). Fail-closed:
+        // anything unsigned, stale, replayed, or wrongly-signed is dropped here,
+        // before it can be parsed into a command and executed as root/SYSTEM.
+        let payload = match crate::auth::verify_and_extract(trimmed) {
+            Ok(payload) => payload,
+            Err(e) => {
+                // Never log the raw line: a stale-but-genuine command could
+                // carry secrets. Log only the rejection reason.
+                warn!("Rejected inbound message: {}", e);
+                return Ok(None);
+            }
+        };
 
-        match serde_json::from_str::<IncomingMessage>(trimmed) {
+        // From here on `payload` is the host-authenticated inner message.
+        debug!("Accepted authenticated message ({} bytes)", payload.len());
+
+        match serde_json::from_str::<IncomingMessage>(&payload) {
             Ok(msg) => {
                 match &msg {
                     IncomingMessage::SafeCommand(cmd) => {
@@ -4067,8 +4082,9 @@ impl VirtioSerial {
                 Ok(Some(msg))
             }
             Err(e) => {
-                warn!("Failed to parse incoming message: {}", e);
-                debug!("Raw message was: {}", trimmed);
+                // Authenticated but unparseable. Do NOT log the payload — it is
+                // host-signed content that may include secrets.
+                warn!("Failed to parse authenticated inner message: {}", e);
                 Ok(None)
             }
         }

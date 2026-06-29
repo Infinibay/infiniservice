@@ -293,7 +293,18 @@ impl InfiniService {
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting Infiniservice main loop with command support");
         info!("Service will collect metrics every {} seconds", self.config.collection_interval);
-        info!("Command execution is ENABLED - both safe and unsafe commands supported");
+
+        // SECURITY: report the inbound-channel authentication posture loudly and
+        // exactly once. Without INFINISERVICE_SHARED_SECRET the agent is locked:
+        // metrics still flow, but every host command is rejected (fail-closed).
+        if crate::auth::is_authentication_configured() {
+            info!("Command execution is ENABLED - inbound messages are HMAC-authenticated (fail-closed)");
+        } else {
+            error!(
+                "INFINISERVICE_SHARED_SECRET is not set: the inbound command channel is LOCKED. \
+                 All host commands will be rejected. Provision the per-VM shared secret to enable command execution."
+            );
+        }
 
         // Clone shutdown flag for use in the loop
         let shutdown_flag = self.shutdown_requested.clone();
