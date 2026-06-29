@@ -475,23 +475,51 @@ pub fn create_response(
     }
 }
 
+/// Safe, secret-free label for a command type.
+///
+/// Returns only the serde `action` tag (the variant name) and never any
+/// field values. Several command variants carry secrets in their fields —
+/// `JoinDomain.password`, `ExecutePowerShellScript.script`/`environment_vars`,
+/// and arbitrary user input elsewhere — so the previous `{:?}` Debug logging
+/// of `command_type` leaked plaintext credentials to INFO/WARN logs
+/// (journald/syslog/EventLog and any log shipper). This helper is the only
+/// sanctioned way to log *which* command is running. The full value is built
+/// transiently to read its tag and then dropped; it is never emitted.
+pub fn action_name(command_type: &SafeCommandType) -> String {
+    serde_json::to_value(command_type)
+        .ok()
+        .and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+/// First whitespace-delimited token of a raw command (the program name),
+/// for audit logging without dumping the full command line, which may embed
+/// credentials (e.g. `mysql -psecret`). Truncated defensively.
+pub fn command_program(raw_command: &str) -> String {
+    let prog = raw_command.split_whitespace().next().unwrap_or("");
+    let mut prog = prog.chars().take(64).collect::<String>();
+    if prog.is_empty() {
+        prog.push_str("<empty>");
+    }
+    prog
+}
+
 /// Log command execution
 pub fn log_command_execution(message: &IncomingMessage) {
     match message {
         IncomingMessage::SafeCommand(cmd) => {
-            info!("Executing safe command: id={}, type={:?}", cmd.id, cmd.command_type);
-            match &cmd.command_type {
-        // Never Debug-print JoinDomain: it carries the plaintext bind password.
-        SafeCommandType::JoinDomain { domain, username, .. } => debug!(
-            "Safe command details: JoinDomain {{ domain: {:?}, username: {:?}, .. (secrets redacted) }}",
-            domain, username
-        ),
-        other => debug!("Safe command details: {:?}", other),
-    }
+            // Log only the action tag — NEVER the command_type fields, which
+            // may contain plaintext secrets (see `action_name`).
+            info!("Executing safe command: id={}, action={}", cmd.id, action_name(&cmd.command_type));
         },
         IncomingMessage::UnsafeCommand(cmd) => {
-            warn!("⚠️ UNSAFE COMMAND EXECUTION: id={}, command={}", cmd.id, cmd.raw_command);
-            warn!("Unsafe command shell: {:?}, working_dir: {:?}", cmd.shell, cmd.working_dir);
+            // The raw command line may embed credentials; log the program and
+            // length at WARN for audit, and keep the full string at DEBUG only.
+            warn!(
+                "⚠️ UNSAFE COMMAND EXECUTION: id={}, program={}, len={}, shell={:?}",
+                cmd.id, command_program(&cmd.raw_command), cmd.raw_command.len(), cmd.shell
+            );
+            debug!("Unsafe command full line: id={}, command={}, working_dir={:?}", cmd.id, cmd.raw_command, cmd.working_dir);
         },
         _ => {}
     }

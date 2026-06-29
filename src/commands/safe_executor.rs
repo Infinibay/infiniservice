@@ -588,8 +588,8 @@ impl SafeCommandExecutor {
             Ok(inner) => inner,
             Err(_) => {
                 warn!(
-                    "Safe command timed out after {:?}: {:?}",
-                    timeout, request.command_type
+                    "Safe command timed out after {:?}: id={}, action={}",
+                    timeout, request.id, crate::commands::action_name(&request.command_type)
                 );
                 return Ok(create_response(
                     request.id,

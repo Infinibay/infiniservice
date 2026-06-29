@@ -4046,10 +4046,12 @@ impl VirtioSerial {
             Ok(msg) => {
                 match &msg {
                     IncomingMessage::SafeCommand(cmd) => {
-                        info!("Received safe command: id={}, type={:?}", cmd.id, cmd.command_type);
+                        // Never log command_type fields — they may carry secrets
+                        // (JoinDomain password, PowerShell script/env). Log the action tag only.
+                        info!("Received safe command: id={}, action={}", cmd.id, crate::commands::action_name(&cmd.command_type));
                     }
                     IncomingMessage::UnsafeCommand(cmd) => {
-                        warn!("⚠️ Received UNSAFE command: id={}, command={}", cmd.id, cmd.raw_command);
+                        warn!("⚠️ Received UNSAFE command: id={}, program={}, len={}", cmd.id, crate::commands::command_program(&cmd.raw_command), cmd.raw_command.len());
                     }
                     IncomingMessage::Metrics => {
                         debug!("Received metrics request");
