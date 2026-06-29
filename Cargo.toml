@@ -79,7 +79,7 @@ winapi = { version = "0.3", features = [
     "psapi", "winnt", "handleapi", "fileapi", "errhandlingapi",
     "setupapi", "devguid", "winreg", "winbase", "commapi",
     "ioapiset", "synchapi", "minwinbase", "winerror",
-    "securitybaseapi"
+    "securitybaseapi", "memoryapi"
 ] }
 
 # Windows service management

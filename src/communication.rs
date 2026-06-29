@@ -284,6 +284,12 @@ pub struct VirtioSerial {
     // This accumulates partial reads until a complete newline-delimited message is received
     #[cfg(target_os = "linux")]
     linux_read_buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+    // Windows: accumulates partial OVERLAPPED reads until a complete
+    // newline-delimited message is available (parity with linux_read_buffer).
+    // Without it, a read that contained multiple messages dropped everything
+    // past the first newline, and a message split across reads was lost.
+    #[cfg(target_os = "windows")]
+    windows_read_buffer: Arc<std::sync::Mutex<String>>,
     // Counter for buffer overflow events (for monitoring and debugging)
     #[cfg(target_os = "linux")]
     linux_buffer_overflows: Arc<AtomicU64>,
@@ -442,6 +448,9 @@ impl VirtioSerial {
             // Linux read buffer initialization (handles O_NONBLOCK message framing)
             #[cfg(target_os = "linux")]
             linux_read_buffer: Arc::new(std::sync::Mutex::new(Vec::with_capacity(8192))),
+            // Windows read buffer initialization (handles OVERLAPPED message framing)
+            #[cfg(target_os = "windows")]
+            windows_read_buffer: Arc::new(std::sync::Mutex::new(String::new())),
             // Linux buffer overflow counter initialization
             #[cfg(target_os = "linux")]
             linux_buffer_overflows: Arc::new(AtomicU64::new(0)),
@@ -990,7 +999,8 @@ impl VirtioSerial {
         use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
         use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE};
         use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-        use winapi::um::memoryapi::{CreateFileMappingA, MapViewOfFile, UnmapViewOfFile};
+        use winapi::um::winbase::CreateFileMappingA;
+        use winapi::um::memoryapi::{MapViewOfFile, UnmapViewOfFile};
         use winapi::um::errhandlingapi::GetLastError;
         use winapi::shared::minwindef::DWORD;
         use winapi::um::winnt::PAGE_READWRITE;
@@ -3752,27 +3762,41 @@ impl VirtioSerial {
                 // Step 9: Process read result in outer context
                 match read_result {
                     Ok(Ok(Ok((0, _)))) => return Ok(None), // No data available
-                    Ok(Ok(Ok((bytes_read, line)))) => {
+                    Ok(Ok(Ok((bytes_read, chunk)))) => {
                         self.update_bytes_received(bytes_read as u64);
 
-                        // Handle line-based protocol: look for newline
-                        // Note: We already waited up to read_timeout_ms for ReadFile to complete.
-                        // If the received data doesn't contain a newline, we return Ok(None) to
-                        // allow the service loop to poll again. This follows the "Simple OVERLAPPED
-                        // Read" pattern and avoids CPU spinning since the outer loop controls polling.
-                        if let Some(newline_pos) = line.find('\n') {
-                            let message_line = &line[..newline_pos];
-                            let trimmed = message_line.trim();
+                        // Accumulate into the persistent buffer so that messages spanning
+                        // multiple reads — and multiple messages in a single read — are not
+                        // lost. Previously anything after the first newline (a second message)
+                        // was discarded, and a message without a newline yet was dropped.
+                        let mut buffer = self.windows_read_buffer.lock().unwrap_or_else(|e| e.into_inner());
+                        buffer.push_str(&chunk);
+
+                        // Bound growth: a peer that floods without ever sending a newline
+                        // must not grow the buffer without limit (matches the Linux cap).
+                        const MAX_WIN_BUFFER: usize = 1024 * 1024;
+                        if buffer.len() > MAX_WIN_BUFFER {
+                            warn!("Windows read buffer exceeded {} bytes without a newline; discarding", MAX_WIN_BUFFER);
+                            buffer.clear();
+                            return Ok(None);
+                        }
+
+                        // Extract exactly one complete newline-delimited message and leave
+                        // the remainder buffered for the next poll. ('\n' is ASCII, so the
+                        // inclusive drain range lands on a char boundary.)
+                        if let Some(newline_pos) = buffer.find('\n') {
+                            let line: String = buffer.drain(..=newline_pos).collect();
+                            drop(buffer);
+                            let trimmed = line.trim();
                             if trimmed.is_empty() {
                                 return Ok(None);
                             }
                             return self.parse_incoming_message(trimmed);
-                        } else {
-                            // No newline found, incomplete message - no pending I/O to cancel
-                            // (ReadFile already completed successfully)
-                            debug!("Incomplete message (no newline), waiting for more data");
-                            return Ok(None);
                         }
+
+                        // No complete message yet; keep what we have and poll again.
+                        debug!("Incomplete message buffered ({} bytes), waiting for more data", buffer.len());
+                        return Ok(None);
                     }
                     Ok(Ok(Err(e))) => {
                         match e.kind() {
@@ -3998,8 +4022,11 @@ impl VirtioSerial {
             };
 
             let read_result = if let Some(file) = file_handle {
-                use std::io::{BufReader, BufRead};
-                let mut reader = BufReader::new(file.as_ref());
+                use std::io::{BufReader, BufRead, Read};
+                // N-06: cap the read so a host that never sends a newline cannot
+                // grow `line` without bound (OOM). 1 MB matches the Linux path.
+                const MAX_LINE_BYTES: u64 = 1024 * 1024;
+                let mut reader = BufReader::new(file.as_ref().take(MAX_LINE_BYTES));
                 let mut line = String::new();
                 reader.read_line(&mut line).map(|n| (n, line))
             } else {
@@ -4993,6 +5020,8 @@ impl Clone for VirtioSerial {
             keep_alive_sequence: Arc::clone(&self.keep_alive_sequence),
             #[cfg(target_os = "windows")]
             windows_handle: Arc::clone(&self.windows_handle),
+            #[cfg(target_os = "windows")]
+            windows_read_buffer: Arc::clone(&self.windows_read_buffer),
             #[cfg(target_os = "linux")]
             linux_read_buffer: Arc::clone(&self.linux_read_buffer),
             #[cfg(target_os = "linux")]
