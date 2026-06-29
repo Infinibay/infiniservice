@@ -712,11 +712,10 @@ impl SafeCommandExecutor {
     
     /// Control a system service
     async fn control_service(&self, service: &str, operation: &ServiceOperation) -> Result<(String, String, Option<serde_json::Value>)> {
-        // Validate service name (basic sanitization)
-        if service.contains("&") || service.contains("|") || service.contains(";") || service.contains("$") {
-            return Err(anyhow!("Invalid service name"));
-        }
-        
+        // Strict allowlist: rejects quotes/backtick/newline/metacharacters, so the
+        // PowerShell `-Name '{}'` interpolation below cannot be broken out of.
+        crate::commands::validation::validate_service_name(service)?;
+
         match self.os_info.os_type {
             OsType::Windows => {
                 let ps_cmd = match operation {
@@ -849,11 +848,9 @@ impl SafeCommandExecutor {
     
     /// Install a package
     async fn install_package(&self, package: &str) -> Result<(String, String, Option<serde_json::Value>)> {
-        // Validate package name
-        if package.contains("&") || package.contains("|") || package.contains(";") || package.contains("$") {
-            return Err(anyhow!("Invalid package name"));
-        }
-        
+        // Strict allowlist (rejects quotes/backtick/metacharacters).
+        crate::commands::validation::validate_package_name(package)?;
+
         match self.os_info.os_type {
             OsType::Windows => {
                 let output = Command::new("winget")
@@ -906,11 +903,9 @@ impl SafeCommandExecutor {
     
     /// Remove a package
     async fn remove_package(&self, package: &str) -> Result<(String, String, Option<serde_json::Value>)> {
-        // Validate package name
-        if package.contains("&") || package.contains("|") || package.contains(";") || package.contains("$") {
-            return Err(anyhow!("Invalid package name"));
-        }
-        
+        // Strict allowlist (rejects quotes/backtick/metacharacters).
+        crate::commands::validation::validate_package_name(package)?;
+
         match self.os_info.os_type {
             OsType::Windows => {
                 // Note: uninstall uses --disable-interactivity instead of accept-agreements flags
@@ -964,11 +959,9 @@ impl SafeCommandExecutor {
     
     /// Update a package
     async fn update_package(&self, package: &str) -> Result<(String, String, Option<serde_json::Value>)> {
-        // Validate package name
-        if package.contains("&") || package.contains("|") || package.contains(";") || package.contains("$") {
-            return Err(anyhow!("Invalid package name"));
-        }
-        
+        // Strict allowlist (rejects quotes/backtick/metacharacters).
+        crate::commands::validation::validate_package_name(package)?;
+
         match self.os_info.os_type {
             OsType::Windows => {
                 let output = Command::new("winget")
@@ -1025,11 +1018,12 @@ impl SafeCommandExecutor {
     /// --accept-package-agreements flags to prevent interactive prompts that would hang
     /// the InfiniService since it runs non-interactively via virtio-serial.
     async fn search_packages(&self, query: &str) -> Result<(String, String, Option<serde_json::Value>)> {
-        // Validate query
-        if query.contains("&") || query.contains("|") || query.contains(";") || query.contains("$") {
-            return Err(anyhow!("Invalid search query"));
-        }
-        
+        // Strict allowlist. N-04: on Windows the query is interpolated into a
+        // PowerShell `-Command` string (winget template), so quotes/backtick/`$`
+        // must never reach it. The allowlist permits only alnum, space and a few
+        // separators.
+        crate::commands::validation::validate_search_query(query)?;
+
         match self.os_info.os_type {
             OsType::Windows => {
                 // Escape query for safe use in PowerShell
@@ -1219,6 +1213,12 @@ impl SafeCommandExecutor {
         computer_name: Option<&str>,
         restart_after: bool,
     ) -> Result<(String, String, Option<serde_json::Value>)> {
+        // Defense in depth on top of the per-OS shell escaping: strictly
+        // validate the constrained identity fields. (ou/computer_name are left
+        // to the per-OS quoting since DNs legitimately contain '=', ',', spaces.)
+        crate::commands::validation::validate_domain(domain)?;
+        crate::commands::validation::validate_account_name(username)?;
+
         match self.os_info.os_type {
             #[cfg(target_os = "windows")]
             OsType::Windows => {
@@ -2347,6 +2347,38 @@ impl SafeCommandExecutor {
         }
     }
 
+    /// Best-effort lock-down of a staging directory so only the service can
+    /// read/replace its contents. Failure is logged, not fatal — the random
+    /// path already makes prediction/pre-creation impractical.
+    #[cfg(target_os = "windows")]
+    fn secure_directory(dir: &std::path::Path) {
+        // Well-known SIDs avoid locale-dependent account names:
+        //   S-1-5-18      = LocalSystem
+        //   S-1-5-32-544  = BUILTIN\Administrators
+        let dir_str = dir.to_string_lossy().to_string();
+        match std::process::Command::new("icacls")
+            .args(&[
+                dir_str.as_str(),
+                "/inheritance:r",
+                "/grant:r", "*S-1-5-18:(OI)(CI)F",
+                "/grant:r", "*S-1-5-32-544:(OI)(CI)F",
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => warn!("icacls hardening of {:?} returned non-zero: {}", dir, String::from_utf8_lossy(&o.stderr)),
+            Err(e) => warn!("Failed to run icacls to harden {:?}: {}", dir, e),
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn secure_directory(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            warn!("Failed to chmod 700 staging dir {:?}: {}", dir, e);
+        }
+    }
+
     /// Execute PowerShell script with elevation using Start-Process -Verb RunAs
     ///
     /// Since Start-Process -Verb RunAs cannot directly capture stdout/stderr,
@@ -2363,12 +2395,19 @@ impl SafeCommandExecutor {
         let ps_command = self.get_powershell_command()
             .ok_or_else(|| anyhow!("PowerShell is not available on this system. Tried 'pwsh.exe' and 'powershell.exe' but neither was found."))?;
 
-        // Generate unique temporary file paths
-        let temp_dir = std::env::temp_dir();
+        // N-05: stage into a per-execution subdirectory locked down to SYSTEM +
+        // Administrators. std::env::temp_dir() is C:\Windows\Temp for a SYSTEM
+        // service — world-traversable — so a local unprivileged user could read
+        // the (possibly secret-bearing) script or race-replace the .ps1 before
+        // the elevated process reads it. A private ACL'd directory removes both.
         let unique_id = uuid::Uuid::new_v4().to_string();
-        let temp_script_path = temp_dir.join(format!("infinibay_ps_{}.ps1", unique_id));
-        let temp_stdout_path = temp_dir.join(format!("infinibay_ps_{}_stdout.txt", unique_id));
-        let temp_stderr_path = temp_dir.join(format!("infinibay_ps_{}_stderr.txt", unique_id));
+        let staging_dir = std::env::temp_dir().join(format!("infinibay_elevated_{}", unique_id));
+        tokio::fs::create_dir_all(&staging_dir).await
+            .context("Failed to create elevated staging directory")?;
+        Self::secure_directory(&staging_dir);
+        let temp_script_path = staging_dir.join("script.ps1");
+        let temp_stdout_path = staging_dir.join("stdout.txt");
+        let temp_stderr_path = staging_dir.join("stderr.txt");
 
         debug!("Elevated execution using temp files: script={:?}, stdout={:?}, stderr={:?}",
             temp_script_path, temp_stdout_path, temp_stderr_path);
@@ -2473,9 +2512,7 @@ exit $process.ExitCode
 
                     if is_uac_cancelled {
                         // Cleanup temp files before returning error
-                        let _ = tokio::fs::remove_file(&temp_script_path).await;
-                        let _ = tokio::fs::remove_file(&temp_stdout_path).await;
-                        let _ = tokio::fs::remove_file(&temp_stderr_path).await;
+                        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
 
                         return Err(anyhow!(
                             "Elevated execution failed: UAC prompt was cancelled or elevation was denied (exit code: {})",
@@ -2507,9 +2544,7 @@ exit $process.ExitCode
                 };
 
                 // Cleanup temp files (always cleanup after read attempts)
-                let _ = tokio::fs::remove_file(&temp_script_path).await;
-                let _ = tokio::fs::remove_file(&temp_stdout_path).await;
-                let _ = tokio::fs::remove_file(&temp_stderr_path).await;
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
 
                 // Build the result with capture status
                 let capture_failed = stdout_read_failed || stderr_read_failed;
@@ -2527,9 +2562,7 @@ exit $process.ExitCode
             },
             Ok(Err(e)) => {
                 // Cleanup temp files before returning error
-                let _ = tokio::fs::remove_file(&temp_script_path).await;
-                let _ = tokio::fs::remove_file(&temp_stdout_path).await;
-                let _ = tokio::fs::remove_file(&temp_stderr_path).await;
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
 
                 error!("Elevated PowerShell execution error: {}", e);
                 return Err(e);
@@ -2545,9 +2578,7 @@ exit $process.ExitCode
                 }
 
                 // Cleanup temp files
-                let _ = tokio::fs::remove_file(&temp_script_path).await;
-                let _ = tokio::fs::remove_file(&temp_stdout_path).await;
-                let _ = tokio::fs::remove_file(&temp_stderr_path).await;
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
 
                 return Err(anyhow!("Elevated PowerShell script timed out after {:?}", timeout));
             }
@@ -2810,8 +2841,20 @@ Do you agree to all the source agreements terms?
             let result = rt.block_on(executor.search_packages(query));
             assert!(result.is_err(), "Should reject query: {}", query);
             if let Err(e) = result {
-                assert!(e.to_string().contains("Invalid search query"));
+                // The allowlist validator rejects on the offending character.
+                assert!(
+                    e.to_string().contains("search query"),
+                    "unexpected error for {:?}: {}", query, e
+                );
             }
+        }
+
+        // Single quote and backtick — the bypasses the old blacklist missed.
+        for query in ["test'; whoami", "test`whoami`"] {
+            assert!(
+                rt.block_on(executor.search_packages(query)).is_err(),
+                "Should reject query: {}", query
+            );
         }
     }
 

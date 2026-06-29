@@ -82,18 +82,10 @@ impl LinuxSystemOperations {
         Ok((stdout, stderr))
     }
 
-    /// Validate service/package names for injection attacks
+    /// Validate service/package names for injection attacks.
+    /// Strict allowlist (rejects quotes, backtick, whitespace, metacharacters).
     fn validate_name(name: &str, entity_type: &str) -> Result<()> {
-        if name.contains('&')
-            || name.contains('|')
-            || name.contains(';')
-            || name.contains('$')
-            || name.contains('`')
-            || name.contains('\n')
-        {
-            return Err(anyhow!("Invalid {} name: contains forbidden characters", entity_type));
-        }
-        Ok(())
+        crate::commands::validation::validate_entity_name(name, entity_type)
     }
 
     /// Parse dpkg -l output

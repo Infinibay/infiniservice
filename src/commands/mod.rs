@@ -19,6 +19,9 @@ pub mod process_control;
 // Common utilities
 pub mod common;
 
+// Strict allowlist validation of host-supplied command parameters
+pub mod validation;
+
 // Trait abstractions for package managers and platform operations
 pub mod traits;
 
