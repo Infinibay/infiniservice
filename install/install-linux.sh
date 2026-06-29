@@ -92,6 +92,30 @@ if [ "$SERVICE_MODE" = "ping-pong" ]; then
     echo "✅ Set service mode to ping-pong"
 fi
 
+# SECURITY: the per-VM HMAC shared secret authenticates host→agent commands.
+# It MUST stay readable only by root — the agent runs as root, but any other
+# guest process that could read it could forge commands. So it is written to a
+# 0600 root-only EnvironmentFile, NEVER to world-readable /etc/environment.
+# The backend passes the derived secret in this installer's environment
+# (INFINISERVICE_SHARED_SECRET), not on the command line, so it never appears
+# in `ps`/argv. Without it, the agent runs locked (rejects all commands).
+SECRET_DIR="/etc/infiniservice"
+SECRET_FILE="$SECRET_DIR/agent.env"
+mkdir -p "$SECRET_DIR"
+chown root:root "$SECRET_DIR"
+chmod 700 "$SECRET_DIR"
+if [ -n "${INFINISERVICE_SHARED_SECRET:-}" ]; then
+    umask 077
+    printf 'INFINISERVICE_SHARED_SECRET=%s\n' "$INFINISERVICE_SHARED_SECRET" > "$SECRET_FILE"
+    chown root:root "$SECRET_FILE"
+    chmod 600 "$SECRET_FILE"
+    echo "✅ Installed per-VM agent secret (root-only): $SECRET_FILE"
+else
+    # Do not leave a stale secret from a previous install in place.
+    rm -f "$SECRET_FILE"
+    echo "⚠️  INFINISERVICE_SHARED_SECRET not provided — agent will run LOCKED (commands rejected)."
+fi
+
 # Create systemd service file
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME.service"
 SERVICE_ARGS=""
@@ -129,6 +153,9 @@ ProtectHome=false
 # Environment
 Environment=RUST_LOG=info
 EnvironmentFile=-/etc/environment
+# Per-VM HMAC secret (root-only 0600 file). Optional (-) so the service still
+# starts without it, in which case the agent runs locked and rejects commands.
+EnvironmentFile=-/etc/infiniservice/agent.env
 
 [Install]
 WantedBy=multi-user.target
@@ -176,6 +203,9 @@ systemctl daemon-reload
 # Remove environment variables
 sed -i '/INFINIBAY_VM_ID/d' /etc/environment 2>/dev/null || true
 sed -i '/INFINISERVICE_MODE/d' /etc/environment 2>/dev/null || true
+
+# Remove the per-VM secret
+rm -rf /etc/infiniservice 2>/dev/null || true
 
 # Remove user
 userdel "$USER_NAME" 2>/dev/null || true

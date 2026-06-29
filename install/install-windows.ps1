@@ -462,6 +462,56 @@ Write-Log "Configuring service recovery options..." "INFO"
 $RecoveryResult = sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/10000/restart/30000 2>&1
 Write-Log "Recovery configuration result: $RecoveryResult" "INFO"
 
+# === SECURITY: per-VM HMAC shared secret (service-private) ===
+# The secret authenticates host->agent commands. It must reach ONLY the
+# service's process and no unprivileged guest user. We therefore:
+#   * read it from THIS installer's environment ($env:INFINISERVICE_SHARED_SECRET),
+#     not a -param, so it never appears in the process command line / argv;
+#   * write it to the service's own Environment (REG_MULTI_SZ under the service
+#     key) which the SCM injects into the service process — NOT a machine-wide
+#     env var (those are world-readable);
+#   * harden the service key ACL so Users/Authenticated Users cannot read it.
+# Without it the agent runs LOCKED (rejects every command).
+Write-Log "Configuring per-VM agent secret..." "INFO"
+$SharedSecret = $env:INFINISERVICE_SHARED_SECRET
+if ($SharedSecret) {
+    try {
+        $SvcKeyPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        # Per-service environment block consumed by the SCM at service start.
+        New-ItemProperty -Path $SvcKeyPath -Name "Environment" -PropertyType MultiString `
+            -Value @("INFINISERVICE_SHARED_SECRET=$SharedSecret") -Force | Out-Null
+        Write-Log "[OK] Installed per-VM agent secret into service environment" "SUCCESS"
+
+        # Best-effort ACL hardening: keep SYSTEM + Administrators full control,
+        # drop read for Users / Authenticated Users so the secret can't be read
+        # out of the registry by an unprivileged guest process. SCM runs as
+        # SYSTEM and is unaffected.
+        try {
+            $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+                "SYSTEM\CurrentControlSet\Services\$ServiceName",
+                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+                [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+            $Acl = $RegKey.GetAccessControl()
+            $Acl.SetAccessRuleProtection($true, $false)  # break inheritance, drop inherited ACEs
+            $System = New-Object System.Security.AccessControl.RegistryAccessRule(
+                "NT AUTHORITY\SYSTEM", "FullControl", "ContainerInherit", "None", "Allow")
+            $Admins = New-Object System.Security.AccessControl.RegistryAccessRule(
+                "BUILTIN\Administrators", "FullControl", "ContainerInherit", "None", "Allow")
+            $Acl.AddAccessRule($System)
+            $Acl.AddAccessRule($Admins)
+            $RegKey.SetAccessControl($Acl)
+            $RegKey.Close()
+            Write-Log "[OK] Restricted service key ACL to SYSTEM + Administrators" "SUCCESS"
+        } catch {
+            Write-Log "[WARNING] Could not harden service key ACL: $_" "WARNING"
+        }
+    } catch {
+        Write-Log "[ERROR] Failed to install per-VM agent secret: $_" "ERROR"
+    }
+} else {
+    Write-Log "[WARNING] INFINISERVICE_SHARED_SECRET not provided — agent will run LOCKED (commands rejected)." "WARNING"
+}
+
 # Start the service
 Write-Log "[START] Attempting to start Infiniservice..." "INFO"
 

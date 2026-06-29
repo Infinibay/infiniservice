@@ -364,4 +364,19 @@ mod tests {
         let bare = r#"{"type":"UnsafeCommand","id":"x","raw_command":"rm -rf /"}"#;
         assert_eq!(verify_with_secret(bare, KEY), Err(AuthError::Malformed));
     }
+
+    #[test]
+    fn cross_language_signature_matches_node_backend() {
+        // Reference vector computed by the TS backend signer (Node crypto) over
+        // the SAME canonical input. If the byte format (newline separators,
+        // decimal number formatting, UTF-8 key) ever diverges from the host
+        // signer in AgentMessageSigner.ts, this fails and the channel breaks.
+        let key = b"cross-lang-test-key";
+        let (v, ts, nonce, payload) = (1u32, 1_700_000_000_000u64, "fixed-nonce-123", r#"{"type":"Metrics"}"#);
+        let expected = "417f2b895d7dd56461af56b07525ca476532ac795f8b92aab6c78a560686bdf5";
+
+        let mut mac = HmacSha256::new_from_slice(key).unwrap();
+        mac.update(&signing_input(v, ts, nonce, payload));
+        assert_eq!(hex::encode(mac.finalize().into_bytes()), expected);
+    }
 }
