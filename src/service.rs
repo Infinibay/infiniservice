@@ -717,7 +717,7 @@ impl InfiniService {
         // Intelligent Reconnection: Check circuit breaker state before attempting reconnection
         let circuit_breaker_arc = self.communication.circuit_breaker_state();
         let circuit_state = {
-            let state = circuit_breaker_arc.read().unwrap();
+            let state = circuit_breaker_arc.read().unwrap_or_else(|e| e.into_inner());
             state.clone()
         };
 

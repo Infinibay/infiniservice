@@ -458,7 +458,7 @@ impl VirtioSerial {
     }
 
     pub fn connection_quality(&self) -> ConnectionQuality {
-        let metrics = self.connection_metrics.read().unwrap();
+        let metrics = self.connection_metrics.read().unwrap_or_else(|e| e.into_inner());
         metrics.connection_quality.clone()
     }
 
@@ -1787,7 +1787,7 @@ impl VirtioSerial {
 
                 // Idempotency guard: check if already connected
                 {
-                    let win_handle = self.windows_handle.read().unwrap();
+                    let win_handle = self.windows_handle.read().unwrap_or_else(|e| e.into_inner());
                     if win_handle.is_some() {
                         debug!("Global VirtIO device already connected, returning early");
                         return Ok(());
@@ -1816,7 +1816,7 @@ impl VirtioSerial {
                 // Check for success and store handle
                 if handle != INVALID_HANDLE_VALUE {
                     // Store the handle in windows_handle
-                    let mut win_handle = self.windows_handle.write().unwrap();
+                    let mut win_handle = self.windows_handle.write().unwrap_or_else(|e| e.into_inner());
                     *win_handle = Some(SendableHandle(handle));
 
                     // Mark as connected
@@ -1907,11 +1907,11 @@ impl VirtioSerial {
 
                 // Store persistent handles
                 {
-                    let mut write_handle = self.write_handle.write().unwrap();
+                    let mut write_handle = self.write_handle.write().unwrap_or_else(|e| e.into_inner());
                     *write_handle = Some(Arc::new(write_file));
                 }
                 {
-                    let mut read_handle = self.read_handle.write().unwrap();
+                    let mut read_handle = self.read_handle.write().unwrap_or_else(|e| e.into_inner());
                     *read_handle = Some(Arc::new(read_file));
                 }
 
@@ -1949,11 +1949,11 @@ impl VirtioSerial {
 
                 // Store persistent handles
                 {
-                    let mut write_handle = self.write_handle.write().unwrap();
+                    let mut write_handle = self.write_handle.write().unwrap_or_else(|e| e.into_inner());
                     *write_handle = Some(Arc::new(write_file));
                 }
                 {
-                    let mut read_handle = self.read_handle.write().unwrap();
+                    let mut read_handle = self.read_handle.write().unwrap_or_else(|e| e.into_inner());
                     *read_handle = Some(Arc::new(read_file));
                 }
 
@@ -1996,12 +1996,12 @@ impl VirtioSerial {
 
             // Store the shared handle for write operations
             {
-                let mut write_handle = self.write_handle.write().unwrap();
+                let mut write_handle = self.write_handle.write().unwrap_or_else(|e| e.into_inner());
                 *write_handle = Some(Arc::clone(&file_arc));
             }
             // Store the same shared handle for read operations
             {
-                let mut read_handle = self.read_handle.write().unwrap();
+                let mut read_handle = self.read_handle.write().unwrap_or_else(|e| e.into_inner());
                 *read_handle = Some(file_arc);
             }
 
@@ -2024,11 +2024,11 @@ impl VirtioSerial {
 
             // Store persistent handles
             {
-                let mut write_handle = self.write_handle.write().unwrap();
+                let mut write_handle = self.write_handle.write().unwrap_or_else(|e| e.into_inner());
                 *write_handle = Some(Arc::new(write_file));
             }
             {
-                let mut read_handle = self.read_handle.write().unwrap();
+                let mut read_handle = self.read_handle.write().unwrap_or_else(|e| e.into_inner());
                 *read_handle = Some(Arc::new(read_file));
             }
 
@@ -2044,7 +2044,7 @@ impl VirtioSerial {
 
         // Clear write handle
         {
-            let mut write_handle = self.write_handle.write().unwrap();
+            let mut write_handle = self.write_handle.write().unwrap_or_else(|e| e.into_inner());
             if write_handle.take().is_some() {
                 debug!("Write handle disconnected");
             }
@@ -2052,7 +2052,7 @@ impl VirtioSerial {
 
         // Clear read handle
         {
-            let mut read_handle = self.read_handle.write().unwrap();
+            let mut read_handle = self.read_handle.write().unwrap_or_else(|e| e.into_inner());
             if read_handle.take().is_some() {
                 debug!("Read handle disconnected");
             }
@@ -2061,7 +2061,7 @@ impl VirtioSerial {
         // Close Windows handle for Global objects
         #[cfg(target_os = "windows")]
         {
-            let mut win_handle = self.windows_handle.write().unwrap();
+            let mut win_handle = self.windows_handle.write().unwrap_or_else(|e| e.into_inner());
             if let Some(handle) = win_handle.take() {
                 unsafe {
                     use winapi::um::handleapi::CloseHandle;
@@ -2114,12 +2114,12 @@ impl VirtioSerial {
 
         // For other device types, check if handles are still valid
         let write_valid = {
-            let write_handle = self.write_handle.read().unwrap();
+            let write_handle = self.write_handle.read().unwrap_or_else(|e| e.into_inner());
             write_handle.is_some()
         };
 
         let read_valid = {
-            let read_handle = self.read_handle.read().unwrap();
+            let read_handle = self.read_handle.read().unwrap_or_else(|e| e.into_inner());
             read_handle.is_some()
         };
 
@@ -2554,7 +2554,7 @@ impl VirtioSerial {
     fn send_control_message(&self, value: serde_json::Value) -> Result<()> {
         // Check if we have a write handle available
         let file_handle = {
-            let write_handle = self.write_handle.read().unwrap();
+            let write_handle = self.write_handle.read().unwrap_or_else(|e| e.into_inner());
             if let Some(ref file) = *write_handle {
                 Some(Arc::clone(file))
             } else {
@@ -2578,7 +2578,7 @@ impl VirtioSerial {
 
     /// Flush queued error reports when connection becomes available
     fn flush_queued_error_reports(&self) -> Result<()> {
-        let mut queued_reports = self.queued_error_reports.write().unwrap();
+        let mut queued_reports = self.queued_error_reports.write().unwrap_or_else(|e| e.into_inner());
         if queued_reports.is_empty() {
             return Ok(());
         }
@@ -2662,7 +2662,7 @@ impl VirtioSerial {
 
         // If not connected or send failed, queue the report
         {
-            let mut queued_reports = self.queued_error_reports.write().unwrap();
+            let mut queued_reports = self.queued_error_reports.write().unwrap_or_else(|e| e.into_inner());
             queued_reports.push(error_message.clone());
 
             // Keep ring buffer small (max 10 reports)
@@ -2874,7 +2874,7 @@ impl VirtioSerial {
 
         // Circuit Breaker: Check state before attempting transmission
         let circuit_state = {
-            let state = self.circuit_breaker_state.read().unwrap();
+            let state = self.circuit_breaker_state.read().unwrap_or_else(|e| e.into_inner());
             state.clone()
         };
 
@@ -2882,7 +2882,7 @@ impl VirtioSerial {
             CircuitBreakerState::Open => {
                 // Check if circuit should transition to Half-Open
                 let time_since_open = {
-                    let metrics = self.circuit_breaker_metrics.read().unwrap();
+                    let metrics = self.circuit_breaker_metrics.read().unwrap_or_else(|e| e.into_inner());
                     SystemTime::now()
                         .duration_since(metrics.state_change_time)
                         .unwrap_or_default()
@@ -2902,7 +2902,7 @@ impl VirtioSerial {
             },
             CircuitBreakerState::HalfOpen => {
                 // Allow limited calls in half-open state
-                let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+                let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
                 if metrics.half_open_calls >= self.circuit_breaker_config.half_open_max_calls {
                     let latency_ms = start.elapsed().as_millis() as u64;
                     self.update_transmission_stats(message.len() as u64, latency_ms, false);
@@ -2944,7 +2944,7 @@ impl VirtioSerial {
 
                 // Retrieve persistent handle
                 let handle_opt = {
-                    let handle_guard = self.windows_handle.read().unwrap();
+                    let handle_guard = self.windows_handle.read().unwrap_or_else(|e| e.into_inner());
                     handle_guard.as_ref().map(|h| h.0)
                 }; // guard dropped here
 
@@ -3357,7 +3357,7 @@ impl VirtioSerial {
         // Use persistent write handle for other device types
         // Clone Arc<File> to avoid blocking I/O under locks
         let file_handle = {
-            let write_handle = self.write_handle.read().unwrap();
+            let write_handle = self.write_handle.read().unwrap_or_else(|e| e.into_inner());
             if let Some(ref file) = *write_handle {
                 Some(Arc::clone(file))
             } else {
@@ -3483,7 +3483,7 @@ impl VirtioSerial {
 
                             // Re-attempt the write
                             let file_handle = {
-                                let write_handle = self.write_handle.read().unwrap();
+                                let write_handle = self.write_handle.read().unwrap_or_else(|e| e.into_inner());
                                 if let Some(ref file) = *write_handle {
                                     Some(Arc::clone(file))
                                 } else {
@@ -3588,7 +3588,7 @@ impl VirtioSerial {
                 let read_result = timeout(timeout_duration, task::spawn_blocking(move || {
                     unsafe {
                         // Step 3: Retrieve persistent handle
-                        let handle_guard = windows_handle.read().unwrap();
+                        let handle_guard = windows_handle.read().unwrap_or_else(|e| e.into_inner());
                         let handle = match handle_guard.as_ref() {
                             Some(h) => h.0,
                             None => {
@@ -3831,7 +3831,7 @@ impl VirtioSerial {
 
             // Get file handle without holding lock during I/O
             let file_handle = {
-                let read_handle = self.read_handle.read().unwrap();
+                let read_handle = self.read_handle.read().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref file) = *read_handle {
                     Some(Arc::clone(file))
                 } else {
@@ -3875,7 +3875,7 @@ impl VirtioSerial {
             match read_result {
                 Ok(0) => {
                     // EOF or no data - check buffer for any pending complete messages
-                    let mut buffer = self.linux_read_buffer.lock().unwrap();
+                    let mut buffer = self.linux_read_buffer.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
                         let message_bytes: Vec<u8> = buffer.drain(..=newline_pos).collect();
                         if let Ok(message_str) = String::from_utf8(message_bytes) {
@@ -3891,7 +3891,7 @@ impl VirtioSerial {
                     self.update_bytes_received(bytes_read as u64);
 
                     // Append to persistent buffer
-                    let mut buffer = self.linux_read_buffer.lock().unwrap();
+                    let mut buffer = self.linux_read_buffer.lock().unwrap_or_else(|e| e.into_inner());
 
                     // Buffer overflow protection
                     if buffer.len() + bytes_read > MAX_BUFFER_SIZE {
@@ -3935,7 +3935,7 @@ impl VirtioSerial {
                         std::io::ErrorKind::WouldBlock |
                         std::io::ErrorKind::TimedOut => {
                             // Normal for non-blocking - check buffer for pending messages
-                            let mut buffer = self.linux_read_buffer.lock().unwrap();
+                            let mut buffer = self.linux_read_buffer.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(newline_pos) = buffer.iter().position(|&b| b == b'\n') {
                                 let message_bytes: Vec<u8> = buffer.drain(..=newline_pos).collect();
                                 if let Ok(message_str) = String::from_utf8(message_bytes) {
@@ -3989,7 +3989,7 @@ impl VirtioSerial {
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             let file_handle = {
-                let read_handle = self.read_handle.read().unwrap();
+                let read_handle = self.read_handle.read().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref file) = *read_handle {
                     Some(Arc::clone(file))
                 } else {
@@ -4481,12 +4481,12 @@ impl VirtioSerial {
 
         // For other device types, check if handles are still valid
         let write_valid = {
-            let write_handle = self.write_handle.read().unwrap();
+            let write_handle = self.write_handle.read().unwrap_or_else(|e| e.into_inner());
             write_handle.is_some()
         };
 
         let read_valid = {
-            let read_handle = self.read_handle.read().unwrap();
+            let read_handle = self.read_handle.read().unwrap_or_else(|e| e.into_inner());
             read_handle.is_some()
         };
 
@@ -4584,8 +4584,8 @@ impl VirtioSerial {
     // Circuit Breaker Helper Methods
     async fn transition_circuit_breaker_to_half_open(&self) {
         {
-            let mut state = self.circuit_breaker_state.write().unwrap();
-            let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+            let mut state = self.circuit_breaker_state.write().unwrap_or_else(|e| e.into_inner());
+            let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
 
             *state = CircuitBreakerState::HalfOpen;
             metrics.state_change_time = SystemTime::now();
@@ -4600,12 +4600,12 @@ impl VirtioSerial {
 
     async fn record_circuit_breaker_failure(&self) {
         let (should_transition_from_closed, should_transition_from_half_open) = {
-            let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+            let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
             metrics.failure_count += 1;
             metrics.last_failure_time = Some(SystemTime::now());
 
             let current_state = {
-                let state = self.circuit_breaker_state.read().unwrap();
+                let state = self.circuit_breaker_state.read().unwrap_or_else(|e| e.into_inner());
                 state.clone()
             };
 
@@ -4633,13 +4633,13 @@ impl VirtioSerial {
 
     async fn record_circuit_breaker_success(&self) {
         let current_state = {
-            let state = self.circuit_breaker_state.read().unwrap();
+            let state = self.circuit_breaker_state.read().unwrap_or_else(|e| e.into_inner());
             state.clone()
         };
 
         match current_state {
             CircuitBreakerState::HalfOpen => {
-                let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+                let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
                 metrics.success_count += 1;
 
                 // Check if we should close the circuit
@@ -4650,7 +4650,7 @@ impl VirtioSerial {
             },
             CircuitBreakerState::Closed => {
                 // Reset failure count on success
-                let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+                let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
                 metrics.failure_count = 0;
                 metrics.success_count += 1;
             },
@@ -4663,8 +4663,8 @@ impl VirtioSerial {
 
     async fn transition_circuit_breaker_to_open(&self) {
         {
-            let mut state = self.circuit_breaker_state.write().unwrap();
-            let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+            let mut state = self.circuit_breaker_state.write().unwrap_or_else(|e| e.into_inner());
+            let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
 
             *state = CircuitBreakerState::Open;
             metrics.state_change_time = SystemTime::now();
@@ -4680,8 +4680,8 @@ impl VirtioSerial {
 
     async fn transition_circuit_breaker_to_closed(&self) {
         {
-            let mut state = self.circuit_breaker_state.write().unwrap();
-            let mut metrics = self.circuit_breaker_metrics.write().unwrap();
+            let mut state = self.circuit_breaker_state.write().unwrap_or_else(|e| e.into_inner());
+            let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
 
             *state = CircuitBreakerState::Closed;
             metrics.state_change_time = SystemTime::now();
@@ -4698,7 +4698,7 @@ impl VirtioSerial {
     }
 
     async fn send_circuit_breaker_state_change(&self, new_state: CircuitBreakerState) {
-        let metrics = self.circuit_breaker_metrics.read().unwrap();
+        let metrics = self.circuit_breaker_metrics.read().unwrap_or_else(|e| e.into_inner());
 
         // Send state change via fire-and-forget channel to avoid recursion.
         // send_raw_message → record_circuit_breaker_failure → transition_circuit_breaker_to_open
