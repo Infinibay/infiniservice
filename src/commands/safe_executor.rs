@@ -464,8 +464,8 @@ impl SafeCommandExecutor {
             SafeCommandType::PackageInstall { package } => self.install_package(package).await,
             SafeCommandType::PackageRemove { package } => self.remove_package(package).await,
             SafeCommandType::PackageUpdate { package } => self.update_package(package).await,
-            SafeCommandType::UpdateSystemSoftware { params } => {
-                self.update_system_software(params.package.as_deref()).await
+            SafeCommandType::UpdateSystemSoftware { package } => {
+                self.update_system_software(package.as_deref()).await
             },
             SafeCommandType::PackageSearch { query } => self.search_packages(query).await,
             

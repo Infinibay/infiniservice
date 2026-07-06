@@ -261,8 +261,14 @@ pub enum SafeCommandType {
     // CommandDispatcher.sendUpdateSystemSoftware helper. Fixes the OS_UPDATE
     // recommendation, which previously sent a command the guest could not decode.
     UpdateSystemSoftware {
+        // The backend's CommandDispatcher.formatCommandType emits `package`
+        // FLATTENED at the top level ({action, package?}) — like every other
+        // maintenance action, NOT nested under a `params` object. Read it flat
+        // so a targeted single-package update isn't silently dropped (an unknown
+        // nested field would fall back to the default) and quietly promoted to a
+        // full-system upgrade. Absent `package` means "apply all updates".
         #[serde(default)]
-        params: UpdateSystemSoftwareParams,
+        package: Option<String>,
     },
 
     // ── Maintenance / remediation actions dispatched by the backend
@@ -328,14 +334,6 @@ pub enum SafeCommandType {
 }
 
 fn default_true() -> bool { true }
-
-/// Parameters for `UpdateSystemSoftware`. `package` is optional — absent means
-/// "apply all available updates".
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct UpdateSystemSoftwareParams {
-    #[serde(default)]
-    pub package: Option<String>,
-}
 
 /// How aggressive the cleanup pass should be. `Standard` is the right
 /// choice for all normal seal flows; `Minimal` skips non-essential
@@ -919,6 +917,123 @@ mod tests {
             assert!(matches!(cmd.command_type, SafeCommandType::CheckLinuxUpdates));
         } else {
             panic!("Should be SafeCommand variant");
+        }
+    }
+
+    // ===== Backend↔agent wire-contract tests =====
+    // These pin the exact `action` strings and FLATTENED field shapes emitted by
+    // the backend CommandDispatcher.formatCommandType
+    // (backend/app/services/socket-watcher/CommandDispatcher.ts). If either side
+    // drifts, these fail loudly instead of the command silently no-op'ing or
+    // decoding with empty/default params.
+
+    /// The six remediation/maintenance actions must decode from the exact
+    /// flattened wire shape the backend emits, carrying their payload fields —
+    /// not silently falling back to defaults or `Unknown`.
+    #[test]
+    fn test_remediation_commands_decode_from_backend_wire_shape() {
+        // UpdateSystemSoftware: backend sends `package` FLATTENED, not nested.
+        let cmd: SafeCommandType =
+            serde_json::from_str(r#"{"action":"UpdateSystemSoftware","package":"firefox"}"#).unwrap();
+        match cmd {
+            SafeCommandType::UpdateSystemSoftware { package } => assert_eq!(
+                package.as_deref(),
+                Some("firefox"),
+                "package must survive decode, else a targeted update silently becomes a full upgrade"
+            ),
+            other => panic!("expected UpdateSystemSoftware, got {:?}", other),
+        }
+        // ...absent package => "apply all updates".
+        let cmd: SafeCommandType =
+            serde_json::from_str(r#"{"action":"UpdateSystemSoftware"}"#).unwrap();
+        assert!(matches!(cmd, SafeCommandType::UpdateSystemSoftware { package: None }));
+
+        // RestartServices: backend sends flattened `service_name`.
+        let cmd: SafeCommandType =
+            serde_json::from_str(r#"{"action":"RestartServices","service_name":"nginx"}"#).unwrap();
+        match cmd {
+            SafeCommandType::RestartServices { service_name, services } => {
+                assert_eq!(service_name.as_deref(), Some("nginx"));
+                assert!(services.is_empty());
+            }
+            other => panic!("expected RestartServices, got {:?}", other),
+        }
+
+        // CleanTemporaryFiles: optional flattened `targets`.
+        let cmd: SafeCommandType =
+            serde_json::from_str(r#"{"action":"CleanTemporaryFiles","targets":["cache","logs"]}"#).unwrap();
+        match cmd {
+            SafeCommandType::CleanTemporaryFiles { targets } => {
+                assert_eq!(targets, Some(vec!["cache".to_string(), "logs".to_string()]));
+            }
+            other => panic!("expected CleanTemporaryFiles, got {:?}", other),
+        }
+
+        // RunMaintenanceTask: flattened task fields.
+        let cmd: SafeCommandType = serde_json::from_str(
+            r#"{"action":"RunMaintenanceTask","task_type":"cleanup","task_name":"weekly","validate_before":false,"validate_after":true}"#,
+        )
+        .unwrap();
+        match cmd {
+            SafeCommandType::RunMaintenanceTask { task_type, task_name, validate_after, .. } => {
+                assert_eq!(task_type, "cleanup");
+                assert_eq!(task_name, "weekly");
+                assert!(validate_after);
+            }
+            other => panic!("expected RunMaintenanceTask, got {:?}", other),
+        }
+
+        // ValidateSystemHealth: optional flattened `check_name`.
+        let cmd: SafeCommandType =
+            serde_json::from_str(r#"{"action":"ValidateSystemHealth","check_name":"disk"}"#).unwrap();
+        match cmd {
+            SafeCommandType::ValidateSystemHealth { check_name } => {
+                assert_eq!(check_name.as_deref(), Some("disk"));
+            }
+            other => panic!("expected ValidateSystemHealth, got {:?}", other),
+        }
+
+        // CheckSystemIntegrity: no params.
+        let cmd: SafeCommandType =
+            serde_json::from_str(r#"{"action":"CheckSystemIntegrity"}"#).unwrap();
+        assert!(matches!(cmd, SafeCommandType::CheckSystemIntegrity));
+    }
+
+    /// An unrecognized or newer `action` must decode to `Unknown` (never a hard
+    /// serde error, which would drop the whole NDJSON line and stall the host on
+    /// the command timeout), and extra unknown fields must be ignored.
+    #[test]
+    fn test_unknown_action_decodes_to_unknown_variant() {
+        let cmd: SafeCommandType =
+            serde_json::from_str(r#"{"action":"SomeFutureCommandTheAgentDoesNotKnow"}"#).unwrap();
+        assert!(matches!(cmd, SafeCommandType::Unknown));
+
+        // Extra payload fields on an unknown action are ignored; still Unknown.
+        let cmd: SafeCommandType = serde_json::from_str(
+            r#"{"action":"BrandNewThing","some_field":123,"nested":{"a":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(cmd, SafeCommandType::Unknown));
+    }
+
+    /// End-to-end: a full IncomingMessage::SafeCommand carrying a remediation
+    /// command, serialized the way the backend builds it, decodes cleanly with
+    /// its payload intact.
+    #[test]
+    fn test_incoming_update_system_software_end_to_end() {
+        let json = r#"{"type":"SafeCommand","id":"cmd-1","command_type":{"action":"UpdateSystemSoftware","package":"vim"},"params":null,"timeout":180}"#;
+        let msg: IncomingMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            IncomingMessage::SafeCommand(req) => {
+                assert_eq!(req.id, "cmd-1");
+                match req.command_type {
+                    SafeCommandType::UpdateSystemSoftware { package } => {
+                        assert_eq!(package.as_deref(), Some("vim"));
+                    }
+                    other => panic!("expected UpdateSystemSoftware, got {:?}", other),
+                }
+            }
+            other => panic!("expected SafeCommand, got {:?}", other),
         }
     }
 }
