@@ -322,6 +322,16 @@ pub enum SafeCommandType {
     /// Degrades gracefully when the integrity tool is not installed.
     CheckSystemIntegrity,
 
+    /// Reboot the guest OS from inside the agent. Preferred over a cold QMP/ACPI
+    /// restart (which can hang and orphan QEMU): the guest reboots in place, QEMU
+    /// stays up and emits a QMP RESET. The handler acks immediately and schedules
+    /// the actual reboot a few seconds later so the response flushes over virtio
+    /// before the OS goes down. `force` closes apps blocking shutdown (Windows /f).
+    RebootSystem {
+        #[serde(default)]
+        force: bool,
+    },
+
     /// Catch-all for any `action` string this agent does not recognise. Lets an
     /// unknown/newer command decode into a well-formed request that the executor
     /// answers with a clean "unsupported command" response, instead of failing
@@ -997,6 +1007,15 @@ mod tests {
         let cmd: SafeCommandType =
             serde_json::from_str(r#"{"action":"CheckSystemIntegrity"}"#).unwrap();
         assert!(matches!(cmd, SafeCommandType::CheckSystemIntegrity));
+
+        // RebootSystem: backend sends flattened `force` (formatCommandType).
+        let cmd: SafeCommandType =
+            serde_json::from_str(r#"{"action":"RebootSystem","force":true}"#).unwrap();
+        assert!(matches!(cmd, SafeCommandType::RebootSystem { force: true }));
+        // ...force defaults to false when the backend omits it.
+        let cmd: SafeCommandType =
+            serde_json::from_str(r#"{"action":"RebootSystem"}"#).unwrap();
+        assert!(matches!(cmd, SafeCommandType::RebootSystem { force: false }));
     }
 
     /// An unrecognized or newer `action` must decode to `Unknown` (never a hard

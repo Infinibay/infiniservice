@@ -598,6 +598,7 @@ impl SafeCommandExecutor {
                 }
             }
             SafeCommandType::CheckSystemIntegrity => self.check_system_integrity().await,
+            SafeCommandType::RebootSystem { force } => self.reboot_system(*force).await,
 
             // Unrecognised action string (decoded via #[serde(other)]). Answer with
             // a clean, non-fatal "unsupported" error so the host gets a response
@@ -1146,8 +1147,65 @@ impl SafeCommandExecutor {
         false
     }
 
+    /// Reboot the guest OS from inside the agent. Returns immediately (the actual
+    /// reboot is delayed a few seconds and, on Linux, backgrounded) so the ack
+    /// reaches the host over virtio-serial before the OS goes down. The host
+    /// (VMOperationsService.restartMachine) prefers this over a cold QMP/ACPI
+    /// restart and only falls back to the cold path when no agent is reachable.
+    async fn reboot_system(&self, force: bool) -> Result<(String, String, Option<serde_json::Value>)> {
+        const DELAY_SECONDS: u32 = 5;
+        match self.os_info.os_type {
+            OsType::Windows => {
+                let delay = DELAY_SECONDS.to_string();
+                let mut args: Vec<&str> = vec!["/r", "/t", &delay];
+                if force {
+                    // /f force-closes apps blocking the shutdown (avoids the "an app is
+                    // preventing shutdown" hang that also plagues the cold ACPI path).
+                    args.push("/f");
+                }
+                let output = Command::new("shutdown")
+                    .args(&args)
+                    .output()
+                    .context("Failed to invoke shutdown /r")?;
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                if output.status.success() {
+                    Ok((
+                        format!("Guest reboot scheduled in {DELAY_SECONDS}s"),
+                        stderr,
+                        Some(json!({ "rebooting": true, "delay_seconds": DELAY_SECONDS, "force": force })),
+                    ))
+                } else {
+                    let msg = if stderr.trim().is_empty() { stdout } else { stderr };
+                    Err(anyhow!("shutdown /r failed: {}", msg.trim()))
+                }
+            }
+            OsType::Linux => {
+                // Background + short delay so this call returns (and its ack is sent)
+                // before the OS goes down. Try systemctl, then the classic tools.
+                let script = "(sleep 3 && (systemctl reboot || shutdown -r now || reboot)) >/dev/null 2>&1 &";
+                let output = Command::new("sh")
+                    .arg("-c")
+                    .arg(script)
+                    .output()
+                    .context("Failed to schedule guest reboot")?;
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                if output.status.success() {
+                    Ok((
+                        "Guest reboot scheduled in 3s".to_string(),
+                        stderr,
+                        Some(json!({ "rebooting": true, "delay_seconds": 3, "force": force })),
+                    ))
+                } else {
+                    Err(anyhow!("Failed to schedule guest reboot: {}", stderr.trim()))
+                }
+            }
+            _ => Err(anyhow!("Reboot not supported on this OS")),
+        }
+    }
+
     /// Search for packages
-    /// 
+    ///
     /// IMPORTANT: Windows winget commands must include --accept-source-agreements and 
     /// --accept-package-agreements flags to prevent interactive prompts that would hang
     /// the InfiniService since it runs non-interactively via virtio-serial.
