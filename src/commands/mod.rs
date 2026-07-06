@@ -254,9 +254,88 @@ pub enum SafeCommandType {
         #[serde(default)]
         restart_after: bool,
     },
+
+    // Apply OS package updates. When `params.package` is set, upgrade just that
+    // package; otherwise apply all available system updates (dnf/yum/apt/winget).
+    // The wire shape ({action, params:{package?}}) matches the backend
+    // CommandDispatcher.sendUpdateSystemSoftware helper. Fixes the OS_UPDATE
+    // recommendation, which previously sent a command the guest could not decode.
+    UpdateSystemSoftware {
+        #[serde(default)]
+        params: UpdateSystemSoftwareParams,
+    },
+
+    // ── Maintenance / remediation actions dispatched by the backend
+    // socket-watcher CommandDispatcher. Field shapes mirror the flattened
+    // params emitted by CommandDispatcher.formatCommandType exactly, so the
+    // internally-tagged {action, ...} wire form deserializes here. These were
+    // previously absent, so the backend's OS_UPDATE-adjacent remediation
+    // actions decoded to a hard serde error that dropped the whole NDJSON line
+    // (no reply → host times out). See the `Unknown` catch-all below.
+
+    /// Restart system service(s). The backend sends a single optional
+    /// `service_name` (see sendRestartServices); `services` is also accepted for
+    /// forward-compat with a list. At least one must be non-empty.
+    RestartServices {
+        #[serde(default)]
+        service_name: Option<String>,
+        #[serde(default)]
+        services: Vec<String>,
+    },
+
+    /// Remove temporary files (and package caches). Optional `targets` selects
+    /// cleanup categories; when omitted a safe per-OS default is used.
+    CleanTemporaryFiles {
+        #[serde(default)]
+        targets: Option<Vec<String>>,
+    },
+
+    /// Orchestration wrapper: runs update-check + temp-cleanup + health-check and
+    /// returns an aggregated result. Fields mirror sendMaintenanceTask.
+    RunMaintenanceTask {
+        #[serde(default)]
+        task_type: String,
+        #[serde(default)]
+        task_name: String,
+        #[serde(default)]
+        parameters: Option<serde_json::Value>,
+        #[serde(default)]
+        validate_before: bool,
+        #[serde(default)]
+        validate_after: bool,
+    },
+
+    /// Run the guest health checks and return a summary. Optional `check_name`
+    /// narrows to a single check; omitted runs all.
+    ValidateSystemHealth {
+        #[serde(default)]
+        check_name: Option<String>,
+    },
+
+    /// Verify OS integrity (Windows DISM/sfc, Debian debsums, RHEL rpm -Va).
+    /// Degrades gracefully when the integrity tool is not installed.
+    CheckSystemIntegrity,
+
+    /// Catch-all for any `action` string this agent does not recognise. Lets an
+    /// unknown/newer command decode into a well-formed request that the executor
+    /// answers with a clean "unsupported command" response, instead of failing
+    /// the whole NDJSON line decode (which would silently drop it — no reply, so
+    /// the host waits out the full command timeout). Must stay a unit variant:
+    /// serde only permits `#[serde(other)]` on a unit variant of an
+    /// internally-tagged enum.
+    #[serde(other)]
+    Unknown,
 }
 
 fn default_true() -> bool { true }
+
+/// Parameters for `UpdateSystemSoftware`. `package` is optional — absent means
+/// "apply all available updates".
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct UpdateSystemSoftwareParams {
+    #[serde(default)]
+    pub package: Option<String>,
+}
 
 /// How aggressive the cleanup pass should be. `Standard` is the right
 /// choice for all normal seal flows; `Minimal` skips non-essential

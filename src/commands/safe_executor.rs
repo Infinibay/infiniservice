@@ -464,6 +464,9 @@ impl SafeCommandExecutor {
             SafeCommandType::PackageInstall { package } => self.install_package(package).await,
             SafeCommandType::PackageRemove { package } => self.remove_package(package).await,
             SafeCommandType::PackageUpdate { package } => self.update_package(package).await,
+            SafeCommandType::UpdateSystemSoftware { params } => {
+                self.update_system_software(params.package.as_deref()).await
+            },
             SafeCommandType::PackageSearch { query } => self.search_packages(query).await,
             
             SafeCommandType::ProcessList { limit } => self.list_processes(*limit).await,
@@ -577,6 +580,31 @@ impl SafeCommandExecutor {
                 )
                 .await
             }
+
+            // Maintenance / remediation actions (per-OS branching inside each helper).
+            SafeCommandType::RestartServices { service_name, services } => {
+                self.restart_services(service_name.as_deref(), services).await
+            }
+            SafeCommandType::CleanTemporaryFiles { targets } => {
+                self.clean_temporary_files(targets.as_deref()).await
+            }
+            SafeCommandType::RunMaintenanceTask { task_type, task_name, .. } => {
+                self.run_maintenance_task(task_type, task_name).await
+            }
+            SafeCommandType::ValidateSystemHealth { check_name } => {
+                match check_name.as_deref() {
+                    Some(name) if !name.trim().is_empty() => self.run_health_check(name).await,
+                    _ => self.run_all_health_checks().await,
+                }
+            }
+            SafeCommandType::CheckSystemIntegrity => self.check_system_integrity().await,
+
+            // Unrecognised action string (decoded via #[serde(other)]). Answer with
+            // a clean, non-fatal "unsupported" error so the host gets a response
+            // instead of a dropped line.
+            SafeCommandType::Unknown => Err(anyhow!(
+                "Unsupported command: this agent has no handler for the requested action"
+            )),
             }
         };
 
@@ -1011,7 +1039,113 @@ impl SafeCommandExecutor {
             _ => Err(anyhow!("Unsupported OS for package update")),
         }
     }
-    
+
+    /// Apply OS updates. With `package` set, upgrade just that package (reuses the
+    /// validated single-package path); otherwise apply all available system updates
+    /// via the host's package manager. Returns combined stdout/stderr plus a
+    /// `data` object carrying `reboot_required` so the backend can surface
+    /// REQUIRES_REBOOT and show real output in the resolution log.
+    async fn update_system_software(
+        &self,
+        package: Option<&str>,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        if let Some(pkg) = package {
+            let (stdout, stderr, _) = self.update_package(pkg).await?;
+            return Ok((stdout, stderr, Some(json!({ "reboot_required": self.reboot_required() }))));
+        }
+
+        match self.os_info.os_type {
+            OsType::Windows => {
+                let output = Command::new("winget")
+                    .args(&[
+                        "upgrade", "--all",
+                        "--accept-source-agreements", "--accept-package-agreements",
+                        "--silent",
+                    ])
+                    .env("NO_COLOR", "1")
+                    .env("TERM", "dumb")
+                    .env("WINGET_DISABLE_INTERACTIVITY", "1")
+                    .output()
+                    .context("Failed to run winget upgrade")?;
+
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                if output.status.success() {
+                    Ok((stdout, stderr, Some(json!({ "reboot_required": false }))))
+                } else {
+                    Err(anyhow!("System update failed: {}", stderr))
+                }
+            },
+            OsType::Linux => {
+                use crate::os_detection::PackageManager;
+                let pms = &self.os_info.available_package_managers;
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+
+                // Each entry is one command to run in sequence (apt needs update+upgrade).
+                let commands: Vec<(&str, Vec<&str>)> =
+                    if pms.iter().any(|p| matches!(p, PackageManager::Apt)) {
+                        // `full-upgrade` (= dist-upgrade) installs held-back kernels and
+                        // pulls in new dependencies that plain `upgrade` refuses; `--with-new-pkgs`
+                        // makes the intent explicit. Detection counts these via
+                        // `apt list --upgradable`, so a plain `upgrade` left them pending and the
+                        // OS_UPDATE recommendation kept re-firing after a "successful" update.
+                        // DEBIAN_FRONTEND=noninteractive is injected in the exec loop below.
+                        vec![
+                            ("apt-get", vec!["update"]),
+                            ("apt-get", vec!["full-upgrade", "-y", "--with-new-pkgs"]),
+                        ]
+                    } else if pms.iter().any(|p| matches!(p, PackageManager::Dnf)) {
+                        vec![("dnf", vec!["upgrade", "-y", "--refresh"])]
+                    } else if pms.iter().any(|p| matches!(p, PackageManager::Yum)) {
+                        vec![("yum", vec!["update", "-y"])]
+                    } else {
+                        return Err(anyhow!("No supported package manager found for system update"));
+                    };
+
+                for (bin, args) in commands {
+                    let output = Command::new(bin)
+                        .args(&args)
+                        .env("DEBIAN_FRONTEND", "noninteractive")
+                        .output()
+                        .with_context(|| format!("Failed to run {}", bin))?;
+                    stdout.push_str(&String::from_utf8_lossy(&output.stdout));
+                    stderr.push_str(&String::from_utf8_lossy(&output.stderr));
+                    if !output.status.success() {
+                        return Err(anyhow!(
+                            "System update failed ({}): {}",
+                            bin,
+                            String::from_utf8_lossy(&output.stderr)
+                        ));
+                    }
+                }
+
+                Ok((stdout, stderr, Some(json!({ "reboot_required": self.reboot_required() }))))
+            },
+            _ => Err(anyhow!("Unsupported OS for system update")),
+        }
+    }
+
+    /// Best-effort check for whether the last update needs a reboot to take effect.
+    /// Debian/Ubuntu drop a marker file; dnf/yum expose `needs-restarting -r`
+    /// (exit code 1 = reboot needed). Unknown/unavailable → false.
+    fn reboot_required(&self) -> bool {
+        if !matches!(self.os_info.os_type, OsType::Linux) {
+            return false;
+        }
+        if std::path::Path::new("/run/reboot-required").exists()
+            || std::path::Path::new("/var/run/reboot-required").exists()
+        {
+            return true;
+        }
+        if let Ok(status) = Command::new("needs-restarting").arg("-r").status() {
+            if status.code() == Some(1) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Search for packages
     /// 
     /// IMPORTANT: Windows winget commands must include --accept-source-agreements and 
@@ -2177,6 +2311,324 @@ impl SafeCommandExecutor {
                 Ok((message, String::new(), Some(response_data)))
             }
             Err(e) => Err(anyhow!("Failed to run health checks: {}", e))
+        }
+    }
+
+    /// Restart one or more services. Reuses SystemOperations::control_service so
+    /// per-OS behaviour (Linux `systemctl restart`, Windows `Restart-Service`) and
+    /// name validation are shared. Returns per-service success/failure; the overall
+    /// command succeeds if at least one service restarts.
+    async fn restart_services(
+        &self,
+        service_name: Option<&str>,
+        services: &[String],
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        let mut targets: Vec<String> = Vec::new();
+        if let Some(s) = service_name {
+            if !s.trim().is_empty() {
+                targets.push(s.to_string());
+            }
+        }
+        for s in services {
+            if !s.trim().is_empty() && !targets.iter().any(|t| t == s) {
+                targets.push(s.clone());
+            }
+        }
+        if targets.is_empty() {
+            return Err(anyhow!("RestartServices requires at least one service name"));
+        }
+
+        let mut results = Vec::new();
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        for svc in &targets {
+            // A service name carries no secrets, but log the action tag style.
+            debug!("RestartServices: restarting service '{}'", svc);
+            match self
+                .system_ops
+                .control_service(svc, &ServiceOperation::Restart)
+                .await
+            {
+                Ok((stdout, stderr, _)) => {
+                    succeeded += 1;
+                    results.push(json!({
+                        "service": svc,
+                        "success": true,
+                        "output": stdout,
+                        "error": stderr,
+                    }));
+                }
+                Err(e) => {
+                    failed += 1;
+                    results.push(json!({
+                        "service": svc,
+                        "success": false,
+                        "error": e.to_string(),
+                    }));
+                }
+            }
+        }
+
+        let data = json!({
+            "services": results,
+            "succeeded": succeeded,
+            "failed": failed,
+            "total": targets.len(),
+        });
+
+        if succeeded > 0 {
+            Ok((
+                format!("Restarted {}/{} service(s)", succeeded, targets.len()),
+                String::new(),
+                Some(data),
+            ))
+        } else {
+            // All failed: surface which services and why in the error (the outer
+            // response builder drops `data` on Err), so the host still sees detail.
+            let errs: Vec<String> = results
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}: {}",
+                        r.get("service").and_then(|v| v.as_str()).unwrap_or("?"),
+                        r.get("error").and_then(|v| v.as_str()).unwrap_or("")
+                    )
+                })
+                .collect();
+            Err(anyhow!(
+                "Failed to restart {} service(s): {}",
+                targets.len(),
+                errs.join("; ")
+            ))
+        }
+    }
+
+    /// Remove temporary files (and package caches). Linux reuses
+    /// SystemOperations::disk_cleanup (temp-files + cache targets); Windows clears
+    /// %TEMP% and C:\Windows\Temp via PowerShell.
+    async fn clean_temporary_files(
+        &self,
+        targets: Option<&[String]>,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        match self.os_info.os_type {
+            OsType::Linux => {
+                // disk_cleanup validates targets against this same allowlist.
+                const VALID: &[&str] = &["cache", "old-kernels", "temp-files", "logs"];
+                let mut chosen: Vec<String> = targets
+                    .map(|t| {
+                        t.iter()
+                            .filter(|s| VALID.contains(&s.as_str()))
+                            .cloned()
+                            .collect::<Vec<String>>()
+                    })
+                    .unwrap_or_default();
+                if chosen.is_empty() {
+                    // Safe default: temp files + package cache (never old-kernels).
+                    chosen = vec!["temp-files".to_string(), "cache".to_string()];
+                }
+                self.system_ops.disk_cleanup("/", &chosen).await
+            }
+            OsType::Windows => self.clean_temp_files_windows().await,
+            _ => Err(anyhow!("CleanTemporaryFiles not supported on this OS")),
+        }
+    }
+
+    /// Windows temp cleanup: clears the user %TEMP% and C:\Windows\Temp trees.
+    /// Static paths only — no untrusted interpolation into the PowerShell script.
+    async fn clean_temp_files_windows(
+        &self,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        let powershell = self
+            .get_powershell_command()
+            .ok_or_else(|| anyhow!("PowerShell is not available"))?;
+
+        let ps_script = r#"$ErrorActionPreference = 'SilentlyContinue'
+$paths = @($env:TEMP, "$env:SystemRoot\Temp")
+$removed = 0
+foreach ($p in $paths) {
+    if ([string]::IsNullOrWhiteSpace($p)) { continue }
+    if (Test-Path -LiteralPath $p) {
+        Get-ChildItem -LiteralPath $p -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop; $removed++ } catch {}
+        }
+    }
+}
+Write-Output ("Removed {0} entries from TEMP and Windows\Temp" -f $removed)"#;
+
+        let output = Command::new(powershell)
+            .args(&["-NoProfile", "-NonInteractive", "-Command", ps_script])
+            .output()
+            .context("Failed to execute Windows temp cleanup")?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if output.status.success() {
+            let msg = if stdout.trim().is_empty() {
+                "Temporary files cleaned".to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            Ok((
+                msg,
+                stderr,
+                Some(json!({ "targets": ["%TEMP%", "C:\\Windows\\Temp"] })),
+            ))
+        } else {
+            Err(anyhow!("Windows temp cleanup failed: {}", stderr))
+        }
+    }
+
+    /// Orchestration wrapper: runs update-check → temp-cleanup → health-check and
+    /// returns an aggregated result. Composed entirely of existing helpers; a
+    /// failing step is recorded but does not abort the others.
+    async fn run_maintenance_task(
+        &self,
+        task_type: &str,
+        task_name: &str,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        // Task metadata carries no secrets — safe to log the tags.
+        debug!("RunMaintenanceTask: type='{}', name='{}'", task_type, task_name);
+
+        let mut steps: Vec<serde_json::Value> = Vec::new();
+        let mut succeeded = 0usize;
+        let mut record =
+            |label: &str, res: Result<(String, String, Option<serde_json::Value>)>| match res {
+                Ok((msg, _stderr, data)) => {
+                    succeeded += 1;
+                    steps.push(json!({ "step": label, "success": true, "message": msg, "data": data }));
+                }
+                Err(e) => {
+                    steps.push(json!({ "step": label, "success": false, "error": e.to_string() }));
+                }
+            };
+
+        record("update_check", self.system_ops.check_updates().await);
+        record("clean_temporary_files", self.clean_temporary_files(None).await);
+        record("health_check", self.run_all_health_checks().await);
+
+        let total = steps.len();
+        let data = json!({
+            "task_type": task_type,
+            "task_name": task_name,
+            "steps": steps,
+            "steps_succeeded": succeeded,
+            "steps_total": total,
+        });
+
+        Ok((
+            format!(
+                "Maintenance task '{}' completed: {}/{} steps succeeded",
+                if task_name.is_empty() { "default" } else { task_name },
+                succeeded,
+                total
+            ),
+            String::new(),
+            Some(data),
+        ))
+    }
+
+    /// Verify OS integrity. Windows: DISM CheckHealth (fast, non-destructive).
+    /// Debian/Ubuntu: debsums. Fedora/RHEL: rpm -Va. When the integrity tool is
+    /// missing the command degrades gracefully (reports "tool not available")
+    /// rather than erroring the whole command.
+    async fn check_system_integrity(
+        &self,
+    ) -> Result<(String, String, Option<serde_json::Value>)> {
+        match self.os_info.os_type {
+            OsType::Windows => {
+                // DISM /CheckHealth reports previously-detected corruption quickly;
+                // `sfc /verifyonly` would be a full (slow) scan and risk the timeout.
+                match Command::new("DISM")
+                    .args(&["/Online", "/Cleanup-Image", "/CheckHealth"])
+                    .output()
+                {
+                    Ok(out) => Ok((
+                        String::from_utf8_lossy(&out.stdout).to_string(),
+                        String::from_utf8_lossy(&out.stderr).to_string(),
+                        Some(json!({
+                            "tool": "DISM /CheckHealth",
+                            "tool_available": true,
+                            "exit_code": out.status.code(),
+                        })),
+                    )),
+                    Err(e) => Ok((
+                        "System integrity tool (DISM) is not available".to_string(),
+                        e.to_string(),
+                        Some(json!({ "tool": "DISM", "tool_available": false })),
+                    )),
+                }
+            }
+            OsType::Linux => {
+                use crate::os_detection::PackageManager;
+                let pms = &self.os_info.available_package_managers;
+                if pms.iter().any(|p| matches!(p, PackageManager::Apt)) {
+                    if !Self::is_executable_available("debsums", None) {
+                        return Ok((
+                            "debsums is not installed; cannot verify package integrity. Install it with 'apt-get install debsums'.".to_string(),
+                            String::new(),
+                            Some(json!({ "tool": "debsums", "tool_available": false })),
+                        ));
+                    }
+                    // -s: report only errors (silent on unchanged files).
+                    let out = Command::new("debsums")
+                        .arg("-s")
+                        .output()
+                        .context("Failed to run debsums")?;
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    let msg = if stdout.trim().is_empty() && stderr.trim().is_empty() {
+                        "Package integrity OK (debsums found no changed files)".to_string()
+                    } else {
+                        stdout.clone()
+                    };
+                    Ok((
+                        msg,
+                        stderr,
+                        Some(json!({
+                            "tool": "debsums -s",
+                            "tool_available": true,
+                            "exit_code": out.status.code(),
+                        })),
+                    ))
+                } else if pms.iter().any(|p| matches!(p, PackageManager::Dnf | PackageManager::Yum)) {
+                    if !Self::is_executable_available("rpm", None) {
+                        return Ok((
+                            "rpm is not available; cannot verify package integrity.".to_string(),
+                            String::new(),
+                            Some(json!({ "tool": "rpm", "tool_available": false })),
+                        ));
+                    }
+                    // A non-zero exit from `rpm -Va` just means discrepancies were
+                    // found — a valid result, not a command failure.
+                    let out = Command::new("rpm")
+                        .arg("-Va")
+                        .output()
+                        .context("Failed to run rpm -Va")?;
+                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    let msg = if stdout.trim().is_empty() {
+                        "Package integrity OK (rpm -Va reported no discrepancies)".to_string()
+                    } else {
+                        stdout.clone()
+                    };
+                    Ok((
+                        msg,
+                        stderr,
+                        Some(json!({
+                            "tool": "rpm -Va",
+                            "tool_available": true,
+                            "exit_code": out.status.code(),
+                        })),
+                    ))
+                } else {
+                    Ok((
+                        "No supported package manager detected; cannot verify system integrity.".to_string(),
+                        String::new(),
+                        Some(json!({ "tool_available": false })),
+                    ))
+                }
+            }
+            _ => Err(anyhow!("CheckSystemIntegrity not supported on this OS")),
         }
     }
 
