@@ -153,24 +153,52 @@ pub async fn prepare(
     Ok((log, warnings, Some(data)))
 }
 
+/// Per-step hard cap (seconds). Each seal step shells out to a blocking cleanup
+/// command; a single wedged step (a hung `cloud-init clean`, `dnf clean all`,
+/// `fstrim -a`, or a `userdel` on a still-logged-in user) would otherwise hang
+/// `prepare()` FOREVER — the async dispatch timeout in safe_executor can't
+/// interrupt a synchronous `Command::output()`, so the whole seal (and its
+/// poweroff) never completes and the host waits out its 10-min command timeout.
+/// Bounding each step means a stuck step is killed and the seal continues.
+const STEP_TIMEOUT_SECS: u32 = 120;
+
 fn run_sh(cmd: &str) -> Result<String> {
-    let output = Command::new("sh")
+    // Wrap the step in the coreutils `timeout` so a wedged cleanup command can't
+    // hang the whole seal. `-k 5` sends SIGKILL 5s after the initial SIGTERM if
+    // the command ignores it. Fall back to a bare `sh -c` only if `timeout` is
+    // absent (it ships with coreutils on every supported distro).
+    let output = match Command::new("timeout")
+        .arg("-k")
+        .arg("5")
+        .arg(STEP_TIMEOUT_SECS.to_string())
+        .arg("sh")
         .arg("-c")
         .arg(cmd)
         .output()
-        .with_context(|| "failed to spawn sh")?;
+    {
+        Ok(o) => o,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .with_context(|| "failed to spawn sh")?,
+        Err(e) => return Err(anyhow::Error::new(e).context("failed to spawn timeout")),
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     // Non-zero exit is surfaced as a warning, not an error — cleanup
-    // scripts intentionally tolerate partial failures.
+    // scripts intentionally tolerate partial failures. `timeout` exits 124 when
+    // it had to kill a wedged step; call that out explicitly in the seal log.
     let mut combined = stdout;
     if !output.status.success() {
-        combined.push_str(&format!(
-            "\n[exit {}] {}\n",
-            output.status.code().unwrap_or(-1),
-            stderr
-        ));
+        let code = output.status.code().unwrap_or(-1);
+        let note = if code == 124 {
+            " (step timed out and was killed)"
+        } else {
+            ""
+        };
+        combined.push_str(&format!("\n[exit {}{}] {}\n", code, note, stderr));
     } else if !stderr.trim().is_empty() {
         combined.push_str("\n[stderr]\n");
         combined.push_str(&stderr);
