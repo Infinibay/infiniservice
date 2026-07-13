@@ -29,6 +29,11 @@ pub struct ConnectionDiagnostics {
     pub total_state_changes: u64,
     pub connection_stability_score: f64,
     pub last_successful_metrics_transmission: Option<SystemTime>,
+    /// Monotonic twin of `last_successful_metrics_transmission`, used only to pace
+    /// reconnect backoff. Wall-clock `SystemTime` there collapses to 0 on a backward
+    /// step (`duration_since` → `Err` → `unwrap_or_default`) and jams reconnection
+    /// shut for the whole skew; monotonic elapsed is step-immune.
+    pub last_metrics_tx_at: Option<std::time::Instant>,
     pub consecutive_failures: u64,
 }
 
@@ -137,6 +142,7 @@ impl InfiniService {
                 total_state_changes: 0,
                 connection_stability_score: 1.0,
                 last_successful_metrics_transmission: None,
+                last_metrics_tx_at: None,
                 consecutive_failures: 0,
             },
             state_change_history: Vec::new(),
@@ -804,8 +810,11 @@ impl InfiniService {
             debug!("Using adaptive backoff: base={}s, failures={}, multiplier={}x, final={}s",
                    base_delay, consecutive_failures, backoff_multiplier, adjusted_delay);
 
-            if let Some(last_attempt) = self.connection_diagnostics.last_successful_metrics_transmission {
-                let time_since_last = SystemTime::now().duration_since(last_attempt).unwrap_or_default();
+            // Monotonic elapsed since the last successful metrics transmission — a
+            // backward wall-clock step (NTP correcting a boot-time RTC skew) must not
+            // collapse this to 0 and jam reconnection shut for the whole skew.
+            if let Some(last_attempt) = self.connection_diagnostics.last_metrics_tx_at {
+                let time_since_last = last_attempt.elapsed();
                 if time_since_last.as_secs() < adjusted_delay {
                     debug!("Adaptive backoff not satisfied yet, skipping reconnection attempt");
                     return Ok(false);
@@ -1234,6 +1243,7 @@ impl InfiniService {
                 self.update_collection_metrics(collection_time_ms, true, transmitted);
                 if transmitted {
                     self.connection_diagnostics.last_successful_metrics_transmission = Some(SystemTime::now());
+                    self.connection_diagnostics.last_metrics_tx_at = Some(std::time::Instant::now());
                 }
                 Ok(transmitted)
             }
@@ -1648,6 +1658,7 @@ impl InfiniService {
             ConnectionState::Connected => {
                 self.connection_diagnostics.consecutive_failures = 0;
                 self.connection_diagnostics.last_successful_metrics_transmission = Some(SystemTime::now());
+                self.connection_diagnostics.last_metrics_tx_at = Some(std::time::Instant::now());
             }
             ConnectionState::Disconnected => {
                 self.connection_diagnostics.consecutive_failures += 1;

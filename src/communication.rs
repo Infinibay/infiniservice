@@ -10,13 +10,33 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicU32};
 use std::path::Path;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::{Arc, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use chrono::Utc;
 use std::collections::HashMap;
 use async_recursion::async_recursion;
+
+/// Monotonic "seconds" clock for internal interval/timeout bookkeeping.
+///
+/// Returns whole seconds elapsed since the first call (≈ process start), **+1** so
+/// a stored value is never `0` — `0` stays the "never set" sentinel the keep-alive
+/// startup path relies on (`last_sent == 0`). All deltas are `now − stored`, so the
+/// `+1` cancels and thresholds are unaffected.
+///
+/// Unlike `SystemTime`, this is immune to wall-clock steps. A guest whose RTC boots
+/// hours ahead has its clock stepped **backward** by NTP/chrony once it settles; any
+/// interval derived from wall-clock `SystemTime` then either saturates to `0`
+/// (`saturating_sub`) or errors to `0` (`duration_since().unwrap_or_default()`) for
+/// the whole skew (~hours), freezing keep-alive emission/timeout detection and pinning
+/// the circuit breaker Open. Measuring elapsed time monotonically keeps those timers
+/// correct across such a correction. Wire timestamps (RFC3339) and the HMAC freshness
+/// check intentionally stay on wall-clock time and must NOT use this.
+fn monotonic_secs() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs() + 1
+}
 
 // Windows-specific: Thread-safe wrapper for HANDLE
 #[cfg(target_os = "windows")]
@@ -90,7 +110,9 @@ pub struct CircuitBreakerMetrics {
     pub failure_count: u32,
     pub success_count: u32,
     pub last_failure_time: Option<SystemTime>,
-    pub state_change_time: SystemTime,
+    // Monotonic: gates the Open→HalfOpen transition, so it must not be perturbed by
+    // wall-clock steps (a backward NTP correction otherwise pins the breaker Open).
+    pub state_change_time: Instant,
     pub half_open_calls: u32,
 }
 
@@ -434,7 +456,7 @@ impl VirtioSerial {
                 failure_count: 0,
                 success_count: 0,
                 last_failure_time: None,
-                state_change_time: SystemTime::now(),
+                state_change_time: Instant::now(),
                 half_open_calls: 0,
             })),
             circuit_breaker_config,
@@ -2155,10 +2177,7 @@ impl VirtioSerial {
 
         // Enhanced health check with ping test (rate-limited to avoid spam)
         // Rate limit: configurable interval (default 60 seconds)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = monotonic_secs();
 
         let last_ping = self.last_ping_test_time.load(Ordering::SeqCst);
 
@@ -2254,10 +2273,7 @@ impl VirtioSerial {
         match self.send_raw_message(&serialized, true).await {
             Ok(()) => {
                 // Update transmission tracking
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let now = monotonic_secs();
                 self.last_transmission_time.store(now, std::sync::atomic::Ordering::SeqCst);
                 self.consecutive_failures.store(0, std::sync::atomic::Ordering::SeqCst);
 
@@ -2893,10 +2909,9 @@ impl VirtioSerial {
                 // Check if circuit should transition to Half-Open
                 let time_since_open = {
                     let metrics = self.circuit_breaker_metrics.read().unwrap_or_else(|e| e.into_inner());
-                    SystemTime::now()
-                        .duration_since(metrics.state_change_time)
-                        .unwrap_or_default()
-                        .as_secs()
+                    // Monotonic elapsed — never errors and never freezes across a
+                    // backward wall-clock step (which would otherwise pin the breaker Open).
+                    metrics.state_change_time.elapsed().as_secs()
                 }; // metrics guard dropped here
 
                 if time_since_open >= self.circuit_breaker_config.open_duration_secs {
@@ -4248,10 +4263,7 @@ impl VirtioSerial {
 
         // Calculate time since last transmission
         if last_transmission > 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let now = monotonic_secs();
             let time_since_last = now.saturating_sub(last_transmission);
             stats.insert("seconds_since_last_transmission".to_string(), time_since_last.to_string());
         } else {
@@ -4546,10 +4558,7 @@ impl VirtioSerial {
 
         // Enhanced health check with ping test (rate-limited to avoid spam)
         // Rate limit: configurable interval (default 60 seconds)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = monotonic_secs();
 
         let last_ping = self.last_ping_test_time.load(Ordering::SeqCst);
 
@@ -4618,7 +4627,7 @@ impl VirtioSerial {
             let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
 
             *state = CircuitBreakerState::HalfOpen;
-            metrics.state_change_time = SystemTime::now();
+            metrics.state_change_time = Instant::now();
             metrics.half_open_calls = 0;
 
             info!("Circuit breaker transitioned to HALF-OPEN state - testing recovery");
@@ -4697,7 +4706,7 @@ impl VirtioSerial {
             let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
 
             *state = CircuitBreakerState::Open;
-            metrics.state_change_time = SystemTime::now();
+            metrics.state_change_time = Instant::now();
             metrics.half_open_calls = 0;
 
             warn!("Circuit breaker OPENED - blocking all calls for {} seconds",
@@ -4714,7 +4723,7 @@ impl VirtioSerial {
             let mut metrics = self.circuit_breaker_metrics.write().unwrap_or_else(|e| e.into_inner());
 
             *state = CircuitBreakerState::Closed;
-            metrics.state_change_time = SystemTime::now();
+            metrics.state_change_time = Instant::now();
             metrics.failure_count = 0;
             metrics.success_count = 0;
             metrics.half_open_calls = 0;
@@ -4771,7 +4780,7 @@ impl VirtioSerial {
     // Keep-Alive Methods
     pub async fn send_keep_alive(&self) -> Result<()> {
         let sequence = self.keep_alive_sequence.fetch_add(1, Ordering::SeqCst);
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let timestamp = monotonic_secs();
         let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
         let time_since_last_received = timestamp.saturating_sub(last_received);
 
@@ -4814,7 +4823,7 @@ impl VirtioSerial {
     }
 
     pub fn handle_keep_alive_response(&self, sequence_number: u32) {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let timestamp = monotonic_secs();
         self.keep_alive_last_received.store(timestamp, Ordering::SeqCst);
 
         // Calculate round-trip time (RTT)
@@ -4845,7 +4854,7 @@ impl VirtioSerial {
         let last_sent = self.keep_alive_last_sent.load(Ordering::SeqCst);
         let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
         let last_transmission = self.last_transmission_time.load(Ordering::SeqCst);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = monotonic_secs();
 
         // If we've sent a keep-alive but haven't received a response within the timeout
         if last_sent > 0 && last_received < last_sent {
@@ -4873,7 +4882,7 @@ impl VirtioSerial {
     }
 
     pub fn should_send_keep_alive(&self, keep_alive_interval_secs: u64, connection_idle_timeout_secs: u64) -> bool {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = monotonic_secs();
         let last_sent = self.keep_alive_last_sent.load(Ordering::SeqCst);
         let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
         let last_transmission = self.last_transmission_time.load(Ordering::SeqCst);
@@ -4936,7 +4945,7 @@ impl VirtioSerial {
 
     /// Log a comprehensive summary of the keep-alive state for diagnostics
     pub fn log_keep_alive_state_summary(&self, keep_alive_interval_secs: u64, connection_idle_timeout_secs: u64) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = monotonic_secs();
         let last_sent = self.keep_alive_last_sent.load(Ordering::SeqCst);
         let last_received = self.keep_alive_last_received.load(Ordering::SeqCst);
         let last_transmission = self.last_transmission_time.load(Ordering::SeqCst);
